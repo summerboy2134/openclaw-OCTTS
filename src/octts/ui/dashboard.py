@@ -30,10 +30,7 @@ def render_dashboard_html() -> str:
                 <input id="stockCodeInput" name="stock_code" type="text" placeholder="例如 600000.SH" autocomplete="off" />
               </label>
               <input id="phaseSelect" name="phase" type="hidden" value="review" />
-              <label class="checkbox-field">
-                <input id="notifyToggle" name="notify" type="checkbox" checked />
-                <span>分析完成后发送企业微信通知</span>
-              </label>
+              <input id="notifyToggle" name="notify" type="hidden" value="false" />
               <label class="checkbox-field">
                 <input id="persistToggle" name="persist" type="checkbox" />
                 <span>把这只股票加入默认股票池</span>
