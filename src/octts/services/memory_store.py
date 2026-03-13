@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Protocol
+from typing import Optional, Protocol
 
 from octts.config import Settings
 from octts.schemas.report import MemorySummary
 
 
 class MemoryStore(Protocol):
-    def get(self, ts_code: str) -> MemorySummary | None:
+    def get(self, ts_code: str) -> Optional[MemorySummary]:
         ...
 
     def set(self, summary: MemorySummary) -> None:
@@ -31,7 +31,7 @@ class RedisMemoryStore:
         self._client = Redis.from_url(redis_url, decode_responses=True)
         self._prefix = prefix
 
-    def get(self, ts_code: str) -> MemorySummary | None:
+    def get(self, ts_code: str) -> Optional[MemorySummary]:
         payload = self._client.get(self._key(ts_code))
         if not payload:
             return None
@@ -57,7 +57,7 @@ class FileMemoryStore:
         self._path = Path(file_path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
 
-    def get(self, ts_code: str) -> MemorySummary | None:
+    def get(self, ts_code: str) -> Optional[MemorySummary]:
         payload = self._load()
         record = payload.get(ts_code)
         if not record:

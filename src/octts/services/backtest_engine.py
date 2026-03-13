@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Optional, Protocol
 
 from octts.schemas.backtest import (
     BacktestDailyPosition,
@@ -43,8 +43,8 @@ class OpenPosition:
     quantity: float
     gross_value: float
     commission_paid: float
-    stop_loss: float | None
-    take_profit: float | None
+    stop_loss: Optional[float]
+    take_profit: Optional[float]
     max_holding_days: int
 
 
@@ -244,8 +244,8 @@ class BacktestEngine:
             if bar is None or bar.close is None:
                 continue
 
-            exit_price: float | None = None
-            exit_reason: str | None = None
+            exit_price: Optional[float] = None
+            exit_reason: Optional[str] = None
             low = bar.low if bar.low is not None else bar.close
             high = bar.high if bar.high is not None else bar.close
 

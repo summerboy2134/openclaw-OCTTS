@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 UTC = timezone.utc
+from typing import Optional
 from uuid import uuid4
 
 from octts.clients.llm_client import LLMClient
@@ -61,7 +62,7 @@ class AnalysisPipeline:
         llm_client: LLMClient,
         memory_store: MemoryStore,
         history_store: FileHistoryStore,
-        wecom_client: WeComClient | None = None,
+        wecom_client: Optional[WeComClient] = None,
     ) -> None:
         self._settings = settings
         self._tushare_client = tushare_client
@@ -160,7 +161,7 @@ class AnalysisPipeline:
         *,
         phase: AnalysisPhase,
         snapshot: PriceSnapshot,
-        previous_memory: MemorySummary | None,
+        previous_memory: Optional[MemorySummary],
     ) -> tuple[str, str, StructuredAnalysis]:
         system_prompt, user_prompt = build_report_prompt(
             phase=phase,

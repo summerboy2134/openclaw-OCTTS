@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+from typing import Optional
+
 from octts.schemas.report import AnalysisPhase, MemorySummary, PriceSnapshot
 
 
@@ -9,7 +11,7 @@ def build_report_prompt(
     *,
     phase: AnalysisPhase,
     snapshot: PriceSnapshot,
-    previous_memory: MemorySummary | None,
+    previous_memory: Optional[MemorySummary],
 ) -> tuple[str, str]:
     system_prompt = (
         "你是一名严谨的 A 股量化复盘分析助手。"

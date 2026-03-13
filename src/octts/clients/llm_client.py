@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from json_repair import repair_json
 
@@ -32,7 +32,7 @@ class LLMClient:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        last_error: Exception | None = None
+        last_error: Optional[Exception] = None
         use_json_mode = self._settings.llm_json_mode
         total_attempts = 1 + max(0, self._settings.llm_retry_attempts)
         max_tokens = self._settings.llm_max_tokens
@@ -72,7 +72,7 @@ class LLMClient:
         messages: list[dict[str, str]],
         use_json_mode: bool,
         max_tokens: int,
-    ) -> tuple[str, str | None]:
+    ) -> tuple[str, Optional[str]]:
         request_kwargs: dict[str, Any] = {
             "model": self._settings.llm_model,
             "temperature": self._settings.llm_temperature,
@@ -259,7 +259,7 @@ def _safe_float_list(value: Any) -> list[float]:
     return result
 
 
-def _bias_from_signal(signal: Any) -> str | None:
+def _bias_from_signal(signal: Any) -> Optional[str]:
     mapping = {
         "buy": "bullish",
         "hold": "neutral",

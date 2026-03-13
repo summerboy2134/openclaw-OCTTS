@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -17,11 +17,11 @@ class Settings(BaseSettings):
     app_name: str = "OCTTS"
     app_env: str = "development"
 
-    tushare_token: str | None = Field(
+    tushare_token: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices("TINYSHARE_TOKEN", "TUSHARE_TOKEN"),
     )
-    llm_api_key: str | None = Field(
+    llm_api_key: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices("LLM_API_KEY", "DEEPSEEK_API_KEY"),
     )
@@ -33,9 +33,9 @@ class Settings(BaseSettings):
         default="https://api.modelverse.cn/v1",
         validation_alias=AliasChoices("LLM_BASE_URL", "DEEPSEEK_BASE_URL"),
     )
-    wecom_webhook_url: str | None = Field(default=None, alias="WECOM_WEBHOOK_URL")
-    redis_url: str | None = Field(default=None, alias="REDIS_URL")
-    openclaw_gateway_url: str | None = Field(default=None, alias="OPENCLAW_GATEWAY_URL")
+    wecom_webhook_url: Optional[str] = Field(default=None, alias="WECOM_WEBHOOK_URL")
+    redis_url: Optional[str] = Field(default=None, alias="REDIS_URL")
+    openclaw_gateway_url: Optional[str] = Field(default=None, alias="OPENCLAW_GATEWAY_URL")
     openclaw_agent_id: str = Field(default="octts", alias="OPENCLAW_AGENT_ID")
     openclaw_hooks_enabled: bool = Field(default=False, alias="OPENCLAW_HOOKS_ENABLED")
 
@@ -76,7 +76,7 @@ class Settings(BaseSettings):
         return valid_phases or ["review"]
 
     @property
-    def deepseek_api_key(self) -> str | None:
+    def deepseek_api_key(self) -> Optional[str]:
         return self.llm_api_key
 
     @property

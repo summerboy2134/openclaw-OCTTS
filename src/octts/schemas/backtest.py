@@ -4,23 +4,25 @@ from datetime import datetime, timezone
 
 UTC = timezone.utc
 
+from typing import Optional
+
 from pydantic import BaseModel, Field
 
 
 class DailyBar(BaseModel):
     ts_code: str
     trade_date: str
-    open: float | None = None
-    high: float | None = None
-    low: float | None = None
-    close: float | None = None
-    pct_chg: float | None = None
-    vol: float | None = None
-    amount: float | None = None
+    open: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+    close: Optional[float] = None
+    pct_chg: Optional[float] = None
+    vol: Optional[float] = None
+    amount: Optional[float] = None
 
 
 class BacktestRequest(BaseModel):
-    stock_pool: list[str] | None = None
+    stock_pool: Optional[list[str]] = None
     start_date: str
     end_date: str
     initial_cash: float = Field(default=100000.0, gt=0)
@@ -58,7 +60,7 @@ class BacktestMetrics(BaseModel):
     win_rate: float = 0.0
     avg_win: float = 0.0
     avg_loss: float = 0.0
-    profit_factor: float | None = None
+    profit_factor: Optional[float] = None
     trade_count: int = 0
 
 

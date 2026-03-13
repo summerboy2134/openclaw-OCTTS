@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from typing import Optional
+
 from octts.schemas.report import (
     DecisionValidation,
     HistoricalAnalysisRecord,
@@ -39,7 +41,7 @@ class FileHistoryStore:
             [item.model_dump(mode="json") for item in existing[-self._limit_per_symbol :]],
         )
 
-    def list_records(self, ts_code: str, limit: int | None = None) -> list[HistoricalAnalysisRecord]:
+    def list_records(self, ts_code: str, limit: Optional[int] = None) -> list[HistoricalAnalysisRecord]:
         records = self._load_symbol(ts_code)
         if limit is not None:
             records = records[-limit:]
@@ -147,7 +149,7 @@ def evaluate_decision_validation(
     *,
     decision: TradingDecision,
     current_snapshot: PriceSnapshot,
-    previous_validation: DecisionValidation | None,
+    previous_validation: Optional[DecisionValidation],
     generated_at,
 ) -> DecisionValidation:
     close = current_snapshot.close
@@ -291,7 +293,7 @@ def _entry_triggered(decision: TradingDecision, snapshot: PriceSnapshot) -> bool
     return low <= upper and high >= lower
 
 
-def _is_expired(holding_horizon: str, generated_at, trade_date: str | None) -> bool:
+def _is_expired(holding_horizon: str, generated_at, trade_date: Optional[str]) -> bool:
     if not trade_date:
         return False
 

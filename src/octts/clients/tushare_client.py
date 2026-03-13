@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Optional
 
 from octts.config import Settings
 from octts.schemas.backtest import DailyBar
@@ -31,7 +31,7 @@ class TushareClient:
         *,
         ts_code: str,
         phase: AnalysisPhase,
-        trade_date: str | None = None,
+        trade_date: Optional[str] = None,
     ) -> PriceSnapshot:
         return self._build_snapshot(
             ts_code=ts_code,
@@ -93,7 +93,7 @@ class TushareClient:
         *,
         ts_code: str,
         phase: AnalysisPhase,
-        trade_date: str | None,
+        trade_date: Optional[str],
         include_minute_summary: bool,
     ) -> PriceSnapshot:
         daily = self._fetch_daily(ts_code=ts_code, trade_date=trade_date)
@@ -125,7 +125,7 @@ class TushareClient:
             },
         )
 
-    def _fetch_daily(self, *, ts_code: str, trade_date: str | None) -> dict[str, Any]:
+    def _fetch_daily(self, *, ts_code: str, trade_date: Optional[str]) -> dict[str, Any]:
         df = self._pro.daily(ts_code=ts_code, trade_date=trade_date)
         if df.empty:
             # Fallback to a recent bar if same-day daily data is not ready yet.
@@ -146,7 +146,7 @@ class TushareClient:
 
         return df.iloc[0].to_dict()
 
-    def _fetch_daily_basic(self, *, ts_code: str, trade_date: str | None) -> dict[str, Any]:
+    def _fetch_daily_basic(self, *, ts_code: str, trade_date: Optional[str]) -> dict[str, Any]:
         df = self._pro.daily_basic(ts_code=ts_code, trade_date=trade_date)
         if df.empty:
             return {}
@@ -180,7 +180,7 @@ class TushareClient:
         subset = df.head(16)
         return [row for row in subset.to_dict(orient="records")]
 
-    def _fetch_daily_summary(self, *, ts_code: str, trade_date: str | None) -> list[dict[str, Any]]:
+    def _fetch_daily_summary(self, *, ts_code: str, trade_date: Optional[str]) -> list[dict[str, Any]]:
         end_date = trade_date or datetime.now().strftime("%Y%m%d")
         anchor_date = datetime.strptime(end_date, "%Y%m%d")
         start_date = (anchor_date - timedelta(days=max(self._settings.default_lookback_days, 20) * 2)).strftime(
@@ -203,7 +203,7 @@ class TushareClient:
             return []
         return [row for row in df.head(max(self._settings.default_lookback_days, 20)).to_dict(orient="records")]
 
-    def _fetch_weekly_summary(self, *, ts_code: str, trade_date: str | None) -> list[dict[str, Any]]:
+    def _fetch_weekly_summary(self, *, ts_code: str, trade_date: Optional[str]) -> list[dict[str, Any]]:
         end_date = trade_date or datetime.now().strftime("%Y%m%d")
         anchor_date = datetime.strptime(end_date, "%Y%m%d")
         start_date = (anchor_date - timedelta(days=120)).strftime("%Y%m%d")
@@ -224,7 +224,7 @@ class TushareClient:
             return []
         return [row for row in df.head(12).to_dict(orient="records")]
 
-    def _fetch_moneyflow_summary(self, *, ts_code: str, trade_date: str | None) -> dict[str, Any]:
+    def _fetch_moneyflow_summary(self, *, ts_code: str, trade_date: Optional[str]) -> dict[str, Any]:
         try:
             df = self._pro.moneyflow(ts_code=ts_code, trade_date=trade_date)
         except Exception:
@@ -247,7 +247,7 @@ class TushareClient:
         ]
         return {key: record.get(key) for key in keys if key in record}
 
-    def _fetch_stock_name(self, ts_code: str) -> str | None:
+    def _fetch_stock_name(self, ts_code: str) -> Optional[str]:
         try:
             df = self._pro.stock_basic(ts_code=ts_code)
         except Exception:
@@ -258,7 +258,7 @@ class TushareClient:
         return df.iloc[0].get("name")
 
 
-def _safe_float(value: Any) -> float | None:
+def _safe_float(value: Any) -> Optional[float]:
     if value is None:
         return None
     try:

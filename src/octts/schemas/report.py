@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 UTC = timezone.utc
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -25,16 +25,16 @@ ValidationStatus = Literal[
 
 class PriceSnapshot(BaseModel):
     ts_code: str
-    name: str | None = None
-    trade_date: str | None = None
-    open: float | None = None
-    close: float | None = None
-    pct_chg: float | None = None
-    vol_ratio: float | None = None
-    turnover_rate: float | None = None
-    amount: float | None = None
-    high: float | None = None
-    low: float | None = None
+    name: Optional[str] = None
+    trade_date: Optional[str] = None
+    open: Optional[float] = None
+    close: Optional[float] = None
+    pct_chg: Optional[float] = None
+    vol_ratio: Optional[float] = None
+    turnover_rate: Optional[float] = None
+    amount: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
     minute_summary: list[dict[str, Any]] = Field(default_factory=list)
     daily_summary: list[dict[str, Any]] = Field(default_factory=list)
     weekly_summary: list[dict[str, Any]] = Field(default_factory=list)
@@ -46,9 +46,9 @@ class MemorySummary(BaseModel):
     generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     phase: AnalysisPhase
     trend_bias: TrendBias
-    short_term_bias: TrendBias | None = None
-    mid_term_bias: TrendBias | None = None
-    long_term_bias: TrendBias | None = None
+    short_term_bias: Optional[TrendBias] = None
+    mid_term_bias: Optional[TrendBias] = None
+    long_term_bias: Optional[TrendBias] = None
     support_levels: list[float] = Field(default_factory=list)
     resistance_levels: list[float] = Field(default_factory=list)
     capital_flow_view: str
@@ -75,20 +75,20 @@ class PredictionWindow(BaseModel):
 
 
 class PriceZone(BaseModel):
-    low: float | None = None
-    high: float | None = None
+    low: Optional[float] = None
+    high: Optional[float] = None
 
 
 class TradingDecision(BaseModel):
     signal: SignalType
     rationale: str
-    entry_zone: PriceZone | None = None
-    stop_loss: float | None = None
+    entry_zone: Optional[PriceZone] = None
+    stop_loss: Optional[float] = None
     take_profit: list[float] = Field(default_factory=list)
     invalidation_condition: str
     holding_horizon: HoldingHorizon
     confidence_score: float = Field(ge=0, le=1)
-    risk_reward_ratio: float | None = None
+    risk_reward_ratio: Optional[float] = None
     evidence: list[str] = Field(default_factory=list)
 
 
@@ -97,11 +97,11 @@ class DecisionValidation(BaseModel):
     checked_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     note: str
     entry_triggered: bool = False
-    target_hit_level: float | None = None
+    target_hit_level: Optional[float] = None
     stop_loss_hit: bool = False
-    current_close: float | None = None
-    current_high: float | None = None
-    current_low: float | None = None
+    current_close: Optional[float] = None
+    current_high: Optional[float] = None
+    current_low: Optional[float] = None
 
 
 class StructuredAnalysis(BaseModel):
@@ -139,8 +139,8 @@ class ValidationUpdate(BaseModel):
 
 class AnalysisRequest(BaseModel):
     phase: AnalysisPhase
-    stock_pool: list[str] | None = None
-    trade_date: str | None = None
+    stock_pool: Optional[list[str]] = None
+    trade_date: Optional[str] = None
     notify: bool = True
     force_refresh: bool = False
 

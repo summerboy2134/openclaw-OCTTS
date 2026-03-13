@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -18,7 +19,7 @@ def create_automation_scheduler(
     *,
     settings: Settings,
     pipeline_factory: Callable[[], AnalysisPipeline],
-) -> BackgroundScheduler | None:
+) -> Optional[BackgroundScheduler]:
     if not settings.automation_enabled:
         return None
 
