@@ -29,14 +29,7 @@ def render_dashboard_html() -> str:
                 <span class="mini-label">股票代码</span>
                 <input id="stockCodeInput" name="stock_code" type="text" placeholder="例如 600000.SH" autocomplete="off" />
               </label>
-              <label class="field">
-                <span class="mini-label">分析阶段</span>
-                <select id="phaseSelect" name="phase">
-                  <option value="morning">早盘</option>
-                  <option value="afternoon">尾盘</option>
-                  <option value="review" selected>复盘</option>
-                </select>
-              </label>
+              <input id="phaseSelect" name="phase" type="hidden" value="review" />
               <label class="checkbox-field">
                 <input id="notifyToggle" name="notify" type="checkbox" checked />
                 <span>分析完成后发送企业微信通知</span>
