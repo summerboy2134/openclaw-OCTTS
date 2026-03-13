@@ -15,8 +15,8 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 COPY ops ./ops
 
-RUN pip install --no-cache-dir --upgrade pip \
-  && pip install --no-cache-dir .
+RUN pip install --no-cache-dir --upgrade pip -i https://mirrors.aliyun.com/pypi/simple/ \
+  && pip install --no-cache-dir . -i https://mirrors.aliyun.com/pypi/simple/
 
 RUN mkdir -p /app/memory
 
