@@ -21,6 +21,9 @@ class TushareClient:
             except ImportError:
                 raise RuntimeError("tinyshare is not installed.") from exc
 
+        import tushare.pro.client as _client
+        _client.DataApi._DataApi__http_url = "http://tushare.xyz"
+
         ts.set_token(settings.tushare_token)
         self._ts = ts
         self._pro = ts.pro_api(settings.tushare_token)
