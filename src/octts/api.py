@@ -12,9 +12,11 @@ from octts.clients.llm_client import LLMClient
 from octts.clients.tushare_client import TushareClient
 from octts.clients.wecom_client import WeComClient
 from octts.config import Settings, get_settings
+from octts.schemas.backtest import BacktestRequest, BacktestResult
 from octts.schemas.report import AnalysisRequest, AnalysisResult
 from octts.services.analysis_pipeline import AnalysisPipeline
 from octts.services.automation_scheduler import build_automation_slots, create_automation_scheduler
+from octts.services.backtest_engine import BacktestEngine
 from octts.services.history_store import FileHistoryStore
 from octts.services.memory_store import create_memory_store
 from octts.ui.dashboard import render_dashboard_html, render_stock_detail_html
@@ -74,6 +76,17 @@ def analyze(request: AnalysisRequest) -> AnalysisResult:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Analysis failed: {exc}") from exc
+
+
+@app.post("/backtest", response_model=BacktestResult)
+def backtest(request: BacktestRequest) -> BacktestResult:
+    try:
+        engine = _build_backtest_engine()
+        return engine.run(request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Backtest failed: {exc}") from exc
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -181,17 +194,37 @@ def clear_symbol_analysis_data(ts_code: str) -> AnalysisActionResponse:
 
 def _build_pipeline() -> AnalysisPipeline:
     settings = get_settings()
+    tushare_client = TushareClient(settings)
+    llm_client = LLMClient(settings)
     wecom_client = None
     if settings.wecom_webhook_url:
         wecom_client = WeComClient(settings)
 
     return AnalysisPipeline(
         settings=settings,
-        tushare_client=TushareClient(settings),
+        tushare_client=tushare_client,
+        llm_client=llm_client,
+        memory_store=create_memory_store(settings),
+        history_store=_build_history_store(settings),
+        wecom_client=wecom_client,
+    )
+
+
+def _build_backtest_engine() -> BacktestEngine:
+    settings = get_settings()
+    tushare_client = TushareClient(settings)
+    wecom_client = WeComClient(settings) if settings.wecom_webhook_url else None
+    pipeline = AnalysisPipeline(
+        settings=settings,
+        tushare_client=tushare_client,
         llm_client=LLMClient(settings),
         memory_store=create_memory_store(settings),
         history_store=_build_history_store(settings),
         wecom_client=wecom_client,
+    )
+    return BacktestEngine(
+        pipeline=pipeline,
+        market_data_client=tushare_client,
     )
 
 

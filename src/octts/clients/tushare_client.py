@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from octts.config import Settings
+from octts.schemas.backtest import DailyBar
 from octts.schemas.report import AnalysisPhase, PriceSnapshot
 
 
@@ -32,9 +33,72 @@ class TushareClient:
         phase: AnalysisPhase,
         trade_date: str | None = None,
     ) -> PriceSnapshot:
+        return self._build_snapshot(
+            ts_code=ts_code,
+            phase=phase,
+            trade_date=trade_date,
+            include_minute_summary=True,
+        )
+
+    def fetch_historical_snapshot(
+        self,
+        *,
+        ts_code: str,
+        phase: AnalysisPhase = "review",
+        trade_date: str,
+    ) -> PriceSnapshot:
+        return self._build_snapshot(
+            ts_code=ts_code,
+            phase=phase,
+            trade_date=trade_date,
+            include_minute_summary=False,
+        )
+
+    def fetch_trading_dates(self, *, start_date: str, end_date: str) -> list[str]:
+        df = self._pro.trade_cal(
+            exchange="SSE",
+            start_date=start_date,
+            end_date=end_date,
+            is_open="1",
+        )
+        if df is None or df.empty:
+            return []
+        if "cal_date" not in df.columns:
+            return []
+        return sorted(str(item) for item in df["cal_date"].tolist())
+
+    def fetch_daily_bars(self, *, ts_code: str, start_date: str, end_date: str) -> list[DailyBar]:
+        try:
+            df = self._ts.pro_bar(
+                api=self._pro,
+                ts_code=ts_code,
+                asset="E",
+                start_date=start_date,
+                end_date=end_date,
+                freq="D",
+                adj="qfq",
+            )
+        except Exception:
+            return []
+
+        if df is None or df.empty:
+            return []
+
+        records = [DailyBar.model_validate(_serialize_daily_bar(row)) for row in df.to_dict(orient="records")]
+        records.sort(key=lambda item: item.trade_date)
+        return records
+
+    def _build_snapshot(
+        self,
+        *,
+        ts_code: str,
+        phase: AnalysisPhase,
+        trade_date: str | None,
+        include_minute_summary: bool,
+    ) -> PriceSnapshot:
         daily = self._fetch_daily(ts_code=ts_code, trade_date=trade_date)
         daily_basic = self._fetch_daily_basic(ts_code=ts_code, trade_date=trade_date)
-        minute_summary = self._fetch_minute_summary(ts_code=ts_code)
+        minute_summary = self._fetch_minute_summary(ts_code=ts_code) if include_minute_summary else []
         daily_summary = self._fetch_daily_summary(ts_code=ts_code, trade_date=trade_date)
         weekly_summary = self._fetch_weekly_summary(ts_code=ts_code, trade_date=trade_date)
         moneyflow_summary = self._fetch_moneyflow_summary(ts_code=ts_code, trade_date=trade_date)
@@ -44,6 +108,7 @@ class TushareClient:
             ts_code=ts_code,
             name=name,
             trade_date=daily.get("trade_date"),
+            open=_safe_float(daily.get("open")),
             close=_safe_float(daily.get("close")),
             pct_chg=_safe_float(daily.get("pct_chg")),
             vol_ratio=_safe_float(daily_basic.get("volume_ratio")),
@@ -117,7 +182,8 @@ class TushareClient:
 
     def _fetch_daily_summary(self, *, ts_code: str, trade_date: str | None) -> list[dict[str, Any]]:
         end_date = trade_date or datetime.now().strftime("%Y%m%d")
-        start_date = (datetime.now() - timedelta(days=max(self._settings.default_lookback_days, 20) * 2)).strftime(
+        anchor_date = datetime.strptime(end_date, "%Y%m%d")
+        start_date = (anchor_date - timedelta(days=max(self._settings.default_lookback_days, 20) * 2)).strftime(
             "%Y%m%d"
         )
         try:
@@ -139,7 +205,8 @@ class TushareClient:
 
     def _fetch_weekly_summary(self, *, ts_code: str, trade_date: str | None) -> list[dict[str, Any]]:
         end_date = trade_date or datetime.now().strftime("%Y%m%d")
-        start_date = (datetime.now() - timedelta(days=120)).strftime("%Y%m%d")
+        anchor_date = datetime.strptime(end_date, "%Y%m%d")
+        start_date = (anchor_date - timedelta(days=120)).strftime("%Y%m%d")
         try:
             df = self._ts.pro_bar(
                 api=self._pro,
@@ -198,3 +265,17 @@ def _safe_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _serialize_daily_bar(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ts_code": row.get("ts_code"),
+        "trade_date": str(row.get("trade_date")),
+        "open": _safe_float(row.get("open")),
+        "high": _safe_float(row.get("high")),
+        "low": _safe_float(row.get("low")),
+        "close": _safe_float(row.get("close")),
+        "pct_chg": _safe_float(row.get("pct_chg")),
+        "vol": _safe_float(row.get("vol")),
+        "amount": _safe_float(row.get("amount")),
+    }

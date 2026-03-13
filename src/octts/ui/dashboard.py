@@ -10,6 +10,15 @@ def render_dashboard_html() -> str:
       <section class="layout">
         <div class="main-column">
           <section class="summary-grid" id="summaryGrid"></section>
+          <section class="panel">
+            <div class="row">
+              <div class="section-title">策略回测</div>
+              <div class="subtle">最简版回测面板，直接调用 review 回测链路并展示结果。</div>
+            </div>
+            <div id="backtestResults" class="stack">
+              <div class="empty">填写右侧参数后即可运行回测。结果会展示收益指标、资金曲线和成交明细。</div>
+            </div>
+          </section>
           <section class="cards" id="cards"></section>
         </div>
         <aside class="side-column">
@@ -40,6 +49,81 @@ def render_dashboard_html() -> str:
               <button id="defaultPoolAnalyzeButton" class="primary-button secondary-button" type="button">一键分析默认股票池</button>
               <div class="subtle">输入完整 Tushare 代码后即可发起单次分析，例如 `600000.SH` 或 `000001.SZ`。</div>
               <div id="manualAnalyzeStatus" class="subtle"></div>
+            </form>
+          </section>
+          <section class="panel">
+            <div class="section-title">回测参数</div>
+            <form id="backtestForm" class="stack">
+              <label class="field">
+                <span class="mini-label">参数模板名称</span>
+                <input
+                  id="backtestTemplateNameInput"
+                  name="template_name"
+                  type="text"
+                  placeholder="例如：复盘波段基线"
+                  autocomplete="off"
+                />
+              </label>
+              <div class="two-column-fields">
+                <label class="field">
+                  <span class="mini-label">已保存模板</span>
+                  <select id="backtestTemplateSelect" name="template_select">
+                    <option value="">选择一个模板</option>
+                  </select>
+                </label>
+                <div class="field">
+                  <span class="mini-label">模板操作</span>
+                  <div class="button-row">
+                    <button id="saveBacktestTemplateButton" class="secondary-button mini-button" type="button">保存</button>
+                    <button id="applyBacktestTemplateButton" class="secondary-button mini-button" type="button">载入</button>
+                    <button id="deleteBacktestTemplateButton" class="danger-button mini-button" type="button">删除</button>
+                  </div>
+                </div>
+              </div>
+              <label class="field">
+                <span class="mini-label">股票池</span>
+                <input
+                  id="backtestStockPoolInput"
+                  name="stock_pool"
+                  type="text"
+                  placeholder="留空则使用默认股票池；多个代码可用逗号分隔"
+                  autocomplete="off"
+                />
+              </label>
+              <div class="two-column-fields">
+                <label class="field">
+                  <span class="mini-label">开始日期</span>
+                  <input id="backtestStartDateInput" name="start_date" type="date" />
+                </label>
+                <label class="field">
+                  <span class="mini-label">结束日期</span>
+                  <input id="backtestEndDateInput" name="end_date" type="date" />
+                </label>
+              </div>
+              <div class="two-column-fields">
+                <label class="field">
+                  <span class="mini-label">初始资金</span>
+                  <input id="backtestInitialCashInput" name="initial_cash" type="number" min="1" step="1000" value="100000" />
+                </label>
+                <label class="field">
+                  <span class="mini-label">仓位比例</span>
+                  <input id="backtestPositionSizeInput" name="position_size_pct" type="number" min="0.01" max="1" step="0.01" value="0.2" />
+                </label>
+              </div>
+              <div class="two-column-fields">
+                <label class="field">
+                  <span class="mini-label">手续费率</span>
+                  <input id="backtestCommissionInput" name="commission_rate" type="number" min="0" step="0.0001" value="0.0003" />
+                </label>
+                <label class="field">
+                  <span class="mini-label">滑点率</span>
+                  <input id="backtestSlippageInput" name="slippage_rate" type="number" min="0" step="0.0001" value="0.0005" />
+                </label>
+              </div>
+              <button id="backtestButton" class="primary-button" type="submit">运行回测</button>
+              <div class="subtle">当前只接入 `review` 阶段。日期会自动转换成 `YYYYMMDD` 后发送到 `/backtest`。</div>
+              <div id="backtestTemplateStatus" class="subtle"></div>
+              <div id="backtestStatus" class="subtle"></div>
             </form>
           </section>
           <section class="panel">
@@ -405,6 +489,28 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
       gap: 12px;
     }}
 
+    .two-column-fields {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }}
+
+    .button-row {{
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }}
+
+    .button-row button {{
+      width: auto;
+      flex: 1 1 0;
+    }}
+
+    .mini-button {{
+      padding: 10px 12px;
+      font-weight: 600;
+    }}
+
     .title {{
       font-size: 22px;
       font-weight: 800;
@@ -502,8 +608,93 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
       border-radius: 18px;
     }}
 
+    .table-shell {{
+      overflow-x: auto;
+      border: 1px solid rgba(148, 163, 184, 0.12);
+      border-radius: 18px;
+      background: rgba(15, 23, 42, 0.42);
+    }}
+
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 720px;
+    }}
+
+    th, td {{
+      padding: 12px 14px;
+      text-align: left;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+      font-size: 14px;
+    }}
+
+    th {{
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      background: rgba(15, 23, 42, 0.76);
+    }}
+
+    tr:last-child td {{
+      border-bottom: none;
+    }}
+
+    .text-good {{
+      color: var(--good);
+    }}
+
+    .text-bad {{
+      color: var(--bad);
+    }}
+
+    .mono {{
+      font-family: ui-monospace, SFMono-Regular, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }}
+
+    .chart-grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }}
+
+    .chart-shell {{
+      padding: 16px;
+      background: rgba(15, 23, 42, 0.56);
+      border-radius: 18px;
+      border: 1px solid rgba(148, 163, 184, 0.12);
+      display: grid;
+      gap: 10px;
+    }}
+
+    .chart-meta {{
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }}
+
+    .chart-svg {{
+      width: 100%;
+      height: 180px;
+      display: block;
+      border-radius: 14px;
+      background: linear-gradient(180deg, rgba(148, 163, 184, 0.08), rgba(15, 23, 42, 0.04));
+    }}
+
+    .chart-caption {{
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }}
+
     @media (max-width: 1100px) {{
-      .layout, .detail-layout, .chart-and-summary {{
+      .layout, .detail-layout, .chart-and-summary, .chart-grid {{
+        grid-template-columns: 1fr;
+      }}
+
+      .two-column-fields {{
         grid-template-columns: 1fr;
       }}
     }}
@@ -529,7 +720,9 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
       return String(value ?? "")
         .replaceAll("&", "&amp;")
         .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;");
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
     }}
 
     function sparkline(records) {{
@@ -716,6 +909,24 @@ def _overview_script() -> str:
     const defaultStockPoolStatus = document.getElementById("defaultStockPoolStatus");
     const clearAllDataButton = document.getElementById("clearAllDataButton");
     const dataControlStatus = document.getElementById("dataControlStatus");
+    const backtestForm = document.getElementById("backtestForm");
+    const backtestStockPoolInput = document.getElementById("backtestStockPoolInput");
+    const backtestStartDateInput = document.getElementById("backtestStartDateInput");
+    const backtestEndDateInput = document.getElementById("backtestEndDateInput");
+    const backtestInitialCashInput = document.getElementById("backtestInitialCashInput");
+    const backtestPositionSizeInput = document.getElementById("backtestPositionSizeInput");
+    const backtestCommissionInput = document.getElementById("backtestCommissionInput");
+    const backtestSlippageInput = document.getElementById("backtestSlippageInput");
+    const backtestTemplateNameInput = document.getElementById("backtestTemplateNameInput");
+    const backtestTemplateSelect = document.getElementById("backtestTemplateSelect");
+    const saveBacktestTemplateButton = document.getElementById("saveBacktestTemplateButton");
+    const applyBacktestTemplateButton = document.getElementById("applyBacktestTemplateButton");
+    const deleteBacktestTemplateButton = document.getElementById("deleteBacktestTemplateButton");
+    const backtestTemplateStatus = document.getElementById("backtestTemplateStatus");
+    const backtestButton = document.getElementById("backtestButton");
+    const backtestStatus = document.getElementById("backtestStatus");
+    const backtestResults = document.getElementById("backtestResults");
+    const BACKTEST_TEMPLATE_STORAGE_KEY = "octts.backtestTemplates.v1";
 
     function renderSummary(payload) {
       const items = payload.cards || [];
@@ -727,6 +938,172 @@ def _overview_script() -> str:
         renderSummaryCard("止损触发", statuses.stop_loss_hit || 0),
         renderSummaryCard("等待入场", statuses.watching_entry || 0)
       ].join("");
+    }
+
+    function formatCurrency(value) {
+      if (!Number.isFinite(Number(value))) return "—";
+      return Number(value).toLocaleString("zh-CN", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+      });
+    }
+
+    function formatPercent(value) {
+      if (!Number.isFinite(Number(value))) return "—";
+      return `${(Number(value) * 100).toFixed(2)}%`;
+    }
+
+    function formatDateLabel(value) {
+      const text = String(value || "");
+      if (text.length !== 8) return text || "—";
+      return `${text.slice(0, 4)}-${text.slice(4, 6)}-${text.slice(6, 8)}`;
+    }
+
+    function getSignedClass(value) {
+      if (!Number.isFinite(Number(value))) return "";
+      if (Number(value) > 0) return "text-good";
+      if (Number(value) < 0) return "text-bad";
+      return "";
+    }
+
+    function toCompactDate(value) {
+      return String(value || "").replaceAll("-", "");
+    }
+
+    function fromCompactDate(value) {
+      if (!value || String(value).length !== 8) return "";
+      return `${String(value).slice(0, 4)}-${String(value).slice(4, 6)}-${String(value).slice(6, 8)}`;
+    }
+
+    function shiftDate(baseDate, deltaDays) {
+      const shifted = new Date(baseDate);
+      shifted.setDate(shifted.getDate() + deltaDays);
+      return shifted;
+    }
+
+    function formatDateInputValue(date) {
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, "0");
+      const day = String(date.getDate()).padStart(2, "0");
+      return `${year}-${month}-${day}`;
+    }
+
+    function setBacktestDateDefaults() {
+      const today = new Date();
+      const startDate = shiftDate(today, -90);
+      if (!backtestStartDateInput.value) {
+        backtestStartDateInput.value = formatDateInputValue(startDate);
+      }
+      if (!backtestEndDateInput.value) {
+        backtestEndDateInput.value = formatDateInputValue(today);
+      }
+    }
+
+    function normalizeStockPoolInput(value) {
+      return Array.from(
+        new Set(
+          String(value || "")
+            .split(/[\\s,，;；]+/)
+            .map(item => item.trim().toUpperCase())
+            .filter(Boolean)
+        )
+      );
+    }
+
+    function readBacktestTemplates() {
+      try {
+        const payload = JSON.parse(window.localStorage.getItem(BACKTEST_TEMPLATE_STORAGE_KEY) || "[]");
+        if (!Array.isArray(payload)) return [];
+        return payload.filter(item => item && typeof item.name === "string" && item.name.trim());
+      } catch (error) {
+        return [];
+      }
+    }
+
+    function writeBacktestTemplates(templates) {
+      window.localStorage.setItem(BACKTEST_TEMPLATE_STORAGE_KEY, JSON.stringify(templates));
+    }
+
+    function getBacktestFormValues() {
+      return {
+        stock_pool: (backtestStockPoolInput.value || "").trim(),
+        start_date: backtestStartDateInput.value,
+        end_date: backtestEndDateInput.value,
+        initial_cash: String(backtestInitialCashInput.value || ""),
+        position_size_pct: String(backtestPositionSizeInput.value || ""),
+        commission_rate: String(backtestCommissionInput.value || ""),
+        slippage_rate: String(backtestSlippageInput.value || "")
+      };
+    }
+
+    function applyBacktestTemplateValues(template) {
+      if (!template) return;
+      backtestTemplateNameInput.value = template.name || "";
+      backtestStockPoolInput.value = template.stock_pool || "";
+      backtestStartDateInput.value = template.start_date || "";
+      backtestEndDateInput.value = template.end_date || "";
+      backtestInitialCashInput.value = template.initial_cash || "100000";
+      backtestPositionSizeInput.value = template.position_size_pct || "0.2";
+      backtestCommissionInput.value = template.commission_rate || "0.0003";
+      backtestSlippageInput.value = template.slippage_rate || "0.0005";
+    }
+
+    function renderBacktestTemplateOptions(selectedName = "") {
+      const templates = readBacktestTemplates().sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
+      backtestTemplateSelect.innerHTML = [
+        '<option value="">选择一个模板</option>',
+        ...templates.map(item => `<option value="${escapeHtml(item.name)}" ${item.name === selectedName ? "selected" : ""}>${escapeHtml(item.name)}</option>`)
+      ].join("");
+    }
+
+    function loadSelectedBacktestTemplate() {
+      const templateName = backtestTemplateSelect.value;
+      const template = readBacktestTemplates().find(item => item.name === templateName);
+      if (!template) {
+        backtestTemplateStatus.textContent = "请选择一个已保存模板。";
+        return;
+      }
+      applyBacktestTemplateValues(template);
+      backtestTemplateStatus.textContent = `已载入模板：${template.name}`;
+    }
+
+    function saveCurrentBacktestTemplate() {
+      const templateName = (backtestTemplateNameInput.value || "").trim();
+      if (!templateName) {
+        backtestTemplateStatus.textContent = "请先填写模板名称再保存。";
+        backtestTemplateNameInput.focus();
+        return;
+      }
+
+      const templates = readBacktestTemplates().filter(item => item.name !== templateName);
+      templates.push({
+        name: templateName,
+        ...getBacktestFormValues(),
+        saved_at: new Date().toISOString()
+      });
+      writeBacktestTemplates(templates);
+      renderBacktestTemplateOptions(templateName);
+      backtestTemplateStatus.textContent = `模板已保存：${templateName}`;
+    }
+
+    function deleteSelectedBacktestTemplate() {
+      const templateName = backtestTemplateSelect.value || (backtestTemplateNameInput.value || "").trim();
+      if (!templateName) {
+        backtestTemplateStatus.textContent = "请先选择一个模板再删除。";
+        return;
+      }
+      const templates = readBacktestTemplates();
+      const nextTemplates = templates.filter(item => item.name !== templateName);
+      if (nextTemplates.length === templates.length) {
+        backtestTemplateStatus.textContent = `未找到模板：${templateName}`;
+        return;
+      }
+      writeBacktestTemplates(nextTemplates);
+      renderBacktestTemplateOptions("");
+      if (backtestTemplateNameInput.value.trim() === templateName) {
+        backtestTemplateNameInput.value = "";
+      }
+      backtestTemplateStatus.textContent = `模板已删除：${templateName}`;
     }
 
     function renderDefaultStockPool(stockPool) {
@@ -778,6 +1155,223 @@ def _overview_script() -> str:
       </a>`;
     }
 
+    const EXIT_REASON_LABELS = {
+      stop_loss: "止损触发",
+      take_profit: "止盈触发",
+      horizon_exit: "持有周期到期"
+    };
+
+    function formatExitReason(value) {
+      return labelFor(EXIT_REASON_LABELS, value);
+    }
+
+    function buildDrawdownSeries(dailyPositions) {
+      let peak = 0;
+      return (dailyPositions || []).map(item => {
+        const equity = Number(item.equity);
+        peak = Math.max(peak, equity);
+        const drawdown = peak > 0 ? (peak - equity) / peak : 0;
+        return {
+          trade_date: item.trade_date,
+          value: drawdown
+        };
+      });
+    }
+
+    function renderBacktestLineChart(series, options = {}) {
+      if (!series || !series.length) {
+        return '<div class="empty">暂无图表数据。</div>';
+      }
+
+      const width = 640;
+      const height = 180;
+      const paddingX = 18;
+      const paddingY = 18;
+      const values = series.map(item => Number(item.value)).filter(value => Number.isFinite(value));
+      if (!values.length) {
+        return '<div class="empty">暂无图表数据。</div>';
+      }
+
+      const min = options.minValue !== undefined ? Number(options.minValue) : Math.min(...values);
+      const max = options.maxValue !== undefined ? Number(options.maxValue) : Math.max(...values);
+      const range = max === min ? Math.abs(max || 1) : (max - min);
+      const innerWidth = width - paddingX * 2;
+      const innerHeight = height - paddingY * 2;
+      const points = values.map((value, index) => {
+        const x = series.length === 1 ? width / 2 : paddingX + (index / (series.length - 1)) * innerWidth;
+        const y = paddingY + innerHeight - ((value - min) / range) * innerHeight;
+        return { x, y };
+      });
+      const polyline = points.map(point => `${point.x},${point.y}`).join(" ");
+      const areaPoints = `${paddingX},${height - paddingY} ${polyline} ${width - paddingX},${height - paddingY}`;
+      const last = series[series.length - 1];
+      const first = series[0];
+      const lastPoint = points[points.length - 1];
+      const stroke = options.stroke || "#60a5fa";
+      const fill = options.fill || "rgba(96, 165, 250, 0.18)";
+      const baselineValue = Number(options.baselineValue ?? min);
+      const baselineY = paddingY + innerHeight - ((baselineValue - min) / range) * innerHeight;
+      const yTopLabel = options.valueFormatter ? options.valueFormatter(max) : formatValue(max, 2);
+      const yBottomLabel = options.valueFormatter ? options.valueFormatter(min) : formatValue(min, 2);
+      const latestLabel = options.valueFormatter ? options.valueFormatter(last.value) : formatValue(last.value, 2);
+      const startLabel = formatDateLabel(first.trade_date);
+      const endLabel = formatDateLabel(last.trade_date);
+
+      return `
+        <div class="chart-shell">
+          <div class="chart-meta">
+            <div>
+              <div class="section-title">${escapeHtml(options.title || "曲线")}</div>
+              <div class="chart-caption">${escapeHtml(options.caption || "")}</div>
+            </div>
+            <div class="value ${getSignedClass(options.signed ? last.value : 0)}">${escapeHtml(latestLabel)}</div>
+          </div>
+          <svg class="chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+            <line x1="${paddingX}" y1="${paddingY}" x2="${paddingX}" y2="${height - paddingY}" stroke="rgba(148, 163, 184, 0.18)" />
+            <line x1="${paddingX}" y1="${height - paddingY}" x2="${width - paddingX}" y2="${height - paddingY}" stroke="rgba(148, 163, 184, 0.18)" />
+            <line x1="${paddingX}" y1="${baselineY}" x2="${width - paddingX}" y2="${baselineY}" stroke="rgba(148, 163, 184, 0.18)" stroke-dasharray="4 4" />
+            <polyline fill="${fill}" stroke="none" points="${areaPoints}" />
+            <polyline fill="none" stroke="${stroke}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="${polyline}" />
+            <circle cx="${lastPoint.x}" cy="${lastPoint.y}" r="4" fill="${stroke}" />
+            <text x="${paddingX}" y="14" fill="#93a4bf" font-size="11">${escapeHtml(yTopLabel)}</text>
+            <text x="${paddingX}" y="${height - 4}" fill="#93a4bf" font-size="11">${escapeHtml(yBottomLabel)}</text>
+            <text x="${paddingX}" y="${height - 4}" dx="40" fill="#93a4bf" font-size="11">${escapeHtml(startLabel)}</text>
+            <text x="${width - paddingX}" y="${height - 4}" text-anchor="end" fill="#93a4bf" font-size="11">${escapeHtml(endLabel)}</text>
+          </svg>
+        </div>
+      `;
+    }
+
+    function renderBacktestTrades(trades) {
+      if (!trades || !trades.length) {
+        return '<div class="empty">本次回测没有产生平仓交易，可能是区间内没有触发买点，或持仓尚未在区间内退出。</div>';
+      }
+
+      return `
+        <div class="table-shell">
+          <table>
+            <thead>
+              <tr>
+                <th>股票</th>
+                <th>信号日</th>
+                <th>入场日</th>
+                <th>出场日</th>
+                <th>收益率</th>
+                <th>PnL</th>
+                <th>退出原因</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${trades.map(item => `
+                <tr>
+                  <td class="mono">${escapeHtml(item.ts_code)}</td>
+                  <td class="mono">${escapeHtml(item.signal_date)}</td>
+                  <td class="mono">${escapeHtml(item.entry_date)}</td>
+                  <td class="mono">${escapeHtml(item.exit_date)}</td>
+                  <td class="${getSignedClass(item.return_pct)}">${escapeHtml(formatPercent(item.return_pct))}</td>
+                  <td class="${getSignedClass(item.pnl)}">${escapeHtml(formatCurrency(item.pnl))}</td>
+                  <td>${escapeHtml(formatExitReason(item.exit_reason))}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      `;
+    }
+
+    function renderBacktestDailyPositions(dailyPositions) {
+      if (!dailyPositions || !dailyPositions.length) {
+        return '<div class="empty">暂无每日权益数据。</div>';
+      }
+
+      const rows = dailyPositions.slice(-10).reverse();
+      return `
+        <div class="table-shell">
+          <table>
+            <thead>
+              <tr>
+                <th>交易日</th>
+                <th>现金</th>
+                <th>持仓市值</th>
+                <th>总权益</th>
+                <th>持仓数</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows.map(item => `
+                <tr>
+                  <td class="mono">${escapeHtml(item.trade_date)}</td>
+                  <td>${escapeHtml(formatCurrency(item.cash))}</td>
+                  <td>${escapeHtml(formatCurrency(item.market_value))}</td>
+                  <td>${escapeHtml(formatCurrency(item.equity))}</td>
+                  <td>${escapeHtml(String(item.open_positions ?? 0))}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      `;
+    }
+
+    function renderBacktestResult(result) {
+      const metrics = result.metrics || {};
+      const dailyPositions = result.daily_positions || [];
+      const stockPoolText = (result.stock_pool || []).join(", ") || "默认股票池";
+      const equitySeries = dailyPositions.map(item => ({
+        trade_date: item.trade_date,
+        value: Number(item.equity)
+      }));
+      const drawdownSeries = buildDrawdownSeries(dailyPositions);
+
+      backtestResults.innerHTML = `
+        <div class="row">
+          <div>
+            <div class="title">Review 回测结果</div>
+            <div class="subtle mono">${escapeHtml(result.start_date)} - ${escapeHtml(result.end_date)}</div>
+          </div>
+          <div class="subtle">${escapeHtml(stockPoolText)}</div>
+        </div>
+        <div class="metrics-grid">
+          <div class="metric"><div class="label">初始资金</div><div class="value">${escapeHtml(formatCurrency(result.initial_cash))}</div></div>
+          <div class="metric"><div class="label">期末权益</div><div class="value ${getSignedClass((result.ending_cash || 0) - (result.initial_cash || 0))}">${escapeHtml(formatCurrency(result.ending_cash))}</div></div>
+          <div class="metric"><div class="label">总收益率</div><div class="value ${getSignedClass(metrics.total_return)}">${escapeHtml(formatPercent(metrics.total_return))}</div></div>
+          <div class="metric"><div class="label">年化收益率</div><div class="value ${getSignedClass(metrics.annual_return)}">${escapeHtml(formatPercent(metrics.annual_return))}</div></div>
+          <div class="metric"><div class="label">最大回撤</div><div class="value">${escapeHtml(formatPercent(metrics.max_drawdown))}</div></div>
+          <div class="metric"><div class="label">胜率</div><div class="value">${escapeHtml(formatPercent(metrics.win_rate))}</div></div>
+          <div class="metric"><div class="label">盈利因子</div><div class="value">${escapeHtml(formatValue(metrics.profit_factor, 2))}</div></div>
+          <div class="metric"><div class="label">交易次数</div><div class="value">${escapeHtml(String(metrics.trade_count || 0))}</div></div>
+        </div>
+        <div class="chart-grid">
+          ${renderBacktestLineChart(equitySeries, {
+            title: "权益曲线",
+            caption: "展示账户总权益随交易日变化，能更直观看到策略斜率与波动。",
+            valueFormatter: formatCurrency,
+            stroke: "#60a5fa",
+            fill: "rgba(96, 165, 250, 0.16)"
+          })}
+          ${renderBacktestLineChart(drawdownSeries, {
+            title: "回撤曲线",
+            caption: "回撤越高代表离历史净值峰值越远，可快速定位风险集中区间。",
+            valueFormatter: formatPercent,
+            stroke: "#f87171",
+            fill: "rgba(248, 113, 113, 0.16)",
+            baselineValue: 0,
+            minValue: 0
+          })}
+        </div>
+        <div class="stack">
+          <div>
+            <div class="section-title">成交明细</div>
+            ${renderBacktestTrades(result.trades || [])}
+          </div>
+          <div>
+            <div class="section-title">最近 10 个交易日权益</div>
+            ${renderBacktestDailyPositions(dailyPositions)}
+          </div>
+        </div>
+      `;
+    }
+
     async function loadDashboard() {
       const response = await fetch("/dashboard/data");
       const payload = await response.json();
@@ -785,6 +1379,9 @@ def _overview_script() -> str:
       renderSummary(payload);
       renderDefaultStockPool(payload.default_stock_pool || []);
       openclawStatus.innerHTML = renderAutomationStatus(payload.openclaw_status);
+      if (!backtestStockPoolInput.value && (payload.default_stock_pool || []).length) {
+        backtestStockPoolInput.placeholder = `留空则使用默认股票池：${payload.default_stock_pool.join(", ")}`;
+      }
       if (!payload.cards || !payload.cards.length) {
         cards.innerHTML = '<div class="empty">还没有任何分析记录。先调用一次 /analyze，再回来查看趋势卡片与详情页入口。</div>';
         return;
@@ -817,6 +1414,12 @@ def _overview_script() -> str:
       renderDefaultStockPool(payload.stock_pool || []);
       defaultStockPoolStatus.textContent = `${tsCode} 已从默认股票池移除。`;
       await loadDashboard();
+    }
+
+    function syncBacktestTemplateNameFromSelection() {
+      if (backtestTemplateSelect.value) {
+        backtestTemplateNameInput.value = backtestTemplateSelect.value;
+      }
     }
 
     async function triggerManualAnalysis(event) {
@@ -918,7 +1521,75 @@ def _overview_script() -> str:
       }
     }
 
+    async function runBacktest(event) {
+      event.preventDefault();
+      const startDate = toCompactDate(backtestStartDateInput.value);
+      const endDate = toCompactDate(backtestEndDateInput.value);
+      const stockPool = normalizeStockPoolInput(backtestStockPoolInput.value);
+      const initialCash = Number(backtestInitialCashInput.value);
+      const positionSizePct = Number(backtestPositionSizeInput.value);
+      const commissionRate = Number(backtestCommissionInput.value);
+      const slippageRate = Number(backtestSlippageInput.value);
+
+      if (!startDate || !endDate) {
+        backtestStatus.textContent = "请先填写开始日期和结束日期。";
+        return;
+      }
+      if (startDate > endDate) {
+        backtestStatus.textContent = "开始日期不能晚于结束日期。";
+        return;
+      }
+
+      backtestButton.disabled = true;
+      backtestStatus.textContent = "正在运行回测...";
+
+      try {
+        const response = await fetch("/backtest", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            phase: "review",
+            start_date: startDate,
+            end_date: endDate,
+            stock_pool: stockPool.length ? stockPool : null,
+            initial_cash: initialCash,
+            position_size_pct: positionSizePct,
+            commission_rate: commissionRate,
+            slippage_rate: slippageRate
+          })
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.detail || "回测请求失败");
+        }
+
+        backtestStatus.textContent = `回测完成：${payload.metrics?.trade_count || 0} 笔交易，期末权益 ${formatCurrency(payload.ending_cash)}。`;
+        backtestStartDateInput.value = fromCompactDate(payload.start_date);
+        backtestEndDateInput.value = fromCompactDate(payload.end_date);
+        renderBacktestResult(payload);
+      } catch (error) {
+        backtestStatus.textContent = `回测失败：${error.message}`;
+      } finally {
+        backtestButton.disabled = false;
+      }
+    }
+
+    setBacktestDateDefaults();
+    renderBacktestTemplateOptions();
     manualAnalyzeForm.addEventListener("submit", triggerManualAnalysis);
+    backtestForm.addEventListener("submit", runBacktest);
+    saveBacktestTemplateButton.addEventListener("click", () => {
+      saveCurrentBacktestTemplate();
+    });
+    applyBacktestTemplateButton.addEventListener("click", () => {
+      loadSelectedBacktestTemplate();
+    });
+    deleteBacktestTemplateButton.addEventListener("click", () => {
+      deleteSelectedBacktestTemplate();
+    });
+    backtestTemplateSelect.addEventListener("change", () => {
+      syncBacktestTemplateNameFromSelection();
+    });
     defaultPoolAnalyzeButton.addEventListener("click", () => {
       triggerDefaultPoolAnalysis();
     });

@@ -25,6 +25,7 @@ class PriceSnapshot(BaseModel):
     ts_code: str
     name: str | None = None
     trade_date: str | None = None
+    open: float | None = None
     close: float | None = None
     pct_chg: float | None = None
     vol_ratio: float | None = None

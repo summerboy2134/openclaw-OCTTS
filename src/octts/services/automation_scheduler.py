@@ -49,11 +49,13 @@ def create_automation_scheduler(
 
 
 def build_automation_slots(settings: Settings) -> list[dict[str, str]]:
-    return [
+    slots = [
         {"phase": "morning", "time": settings.automation_morning_time, "label": "早盘分析"},
         {"phase": "afternoon", "time": settings.automation_afternoon_time, "label": "尾盘分析"},
         {"phase": "review", "time": settings.automation_review_time, "label": "复盘总结"},
     ]
+    enabled_phases = set(settings.automation_phases)
+    return [slot for slot in slots if slot["phase"] in enabled_phases]
 
 
 def _parse_hour_minute(raw_value: str) -> tuple[int, int]:

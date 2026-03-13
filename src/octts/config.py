@@ -61,11 +61,19 @@ class Settings(BaseSettings):
     automation_morning_time: str = Field(default="09:35", alias="OCTTS_AUTOMATION_MORNING_TIME")
     automation_afternoon_time: str = Field(default="14:35", alias="OCTTS_AUTOMATION_AFTERNOON_TIME")
     automation_review_time: str = Field(default="20:30", alias="OCTTS_AUTOMATION_REVIEW_TIME")
+    automation_phases_raw: str = Field(default="review", alias="OCTTS_AUTOMATION_PHASES")
     automation_notify: bool = Field(default=True, alias="OCTTS_AUTOMATION_NOTIFY")
 
     @property
     def stock_pool(self) -> list[str]:
         return [item.strip() for item in self.stock_pool_raw.split(",") if item.strip()]
+
+    @property
+    def automation_phases(self) -> list[str]:
+        allowed = {"morning", "afternoon", "review"}
+        phases = [item.strip().lower() for item in self.automation_phases_raw.split(",") if item.strip()]
+        valid_phases = [item for item in phases if item in allowed]
+        return valid_phases or ["review"]
 
     @property
     def deepseek_api_key(self) -> str | None:

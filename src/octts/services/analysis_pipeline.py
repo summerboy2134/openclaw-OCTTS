@@ -11,7 +11,10 @@ from octts.prompts.report_prompt import build_report_prompt
 from octts.schemas.report import (
     AnalysisRequest,
     AnalysisResult,
+    AnalysisPhase,
     HistoricalAnalysisRecord,
+    MemorySummary,
+    PriceSnapshot,
     SymbolAnalysisError,
     StructuredAnalysis,
     ValidationUpdate,
@@ -96,14 +99,10 @@ class AnalysisPipeline:
                     )
                 )
                 previous_memory = self._memory_store.get(ts_code)
-                system_prompt, user_prompt = build_report_prompt(
+                system_prompt, user_prompt, report = self.generate_report_from_snapshot(
                     phase=request.phase,
                     snapshot=snapshot,
                     previous_memory=previous_memory,
-                )
-                report = self._llm_client.analyze(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
                 )
                 self._memory_store.set(report.memory)
                 reports.append(report)
@@ -153,6 +152,24 @@ class AnalysisPipeline:
             errors=errors,
             raw_payloads=raw_payloads,
         )
+
+    def generate_report_from_snapshot(
+        self,
+        *,
+        phase: AnalysisPhase,
+        snapshot: PriceSnapshot,
+        previous_memory: MemorySummary | None,
+    ) -> tuple[str, str, StructuredAnalysis]:
+        system_prompt, user_prompt = build_report_prompt(
+            phase=phase,
+            snapshot=snapshot,
+            previous_memory=previous_memory,
+        )
+        report = self._llm_client.analyze(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
+        return system_prompt, user_prompt, report
 
 
 def format_reports_as_markdown(reports: list[StructuredAnalysis]) -> str:

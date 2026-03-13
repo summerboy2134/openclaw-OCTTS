@@ -54,6 +54,7 @@ OCTTS_LLM_JSON_MODE=true
 OCTTS_LLM_RETRY_ATTEMPTS=3
 OCTTS_AUTOMATION_ENABLED=true
 OCTTS_AUTOMATION_TIMEZONE=Asia/Shanghai
+OCTTS_AUTOMATION_PHASES=review
 OCTTS_AUTOMATION_MORNING_TIME=09:35
 OCTTS_AUTOMATION_AFTERNOON_TIME=14:35
 OCTTS_AUTOMATION_REVIEW_TIME=20:30
@@ -128,6 +129,14 @@ Open a single-stock detail page:
 open http://127.0.0.1:8000/stocks/600000.SH
 ```
 
+Run one review-only backtest request:
+
+```bash
+curl -X POST http://127.0.0.1:8000/backtest \
+  -H "Content-Type: application/json" \
+  -d '{"start_date":"20250101","end_date":"20250331","stock_pool":["600000.SH"]}'
+```
+
 ## How Validation Works
 
 Each generated report now includes a structured `decision` object:
@@ -151,11 +160,17 @@ decision and marks it as one of:
 
 ## Automation
 
-When `OCTTS_AUTOMATION_ENABLED=true`, the API process will automatically run the configured stock pool three times per day on weekdays only (`Monday` through `Friday`):
+When `OCTTS_AUTOMATION_ENABLED=true`, the API process will automatically run the configured stock pool on weekdays only (`Monday` through `Friday`). The active slots are controlled by `OCTTS_AUTOMATION_PHASES`, which now defaults to `review` for a single daily LLM pass:
 
 - `morning` at `OCTTS_AUTOMATION_MORNING_TIME`
 - `afternoon` at `OCTTS_AUTOMATION_AFTERNOON_TIME`
 - `review` at `OCTTS_AUTOMATION_REVIEW_TIME`
+
+Example values:
+
+- `review`
+- `morning,review`
+- `morning,afternoon,review`
 
 If you already use OpenClaw or system cron, you can disable the built-in scheduler and keep external orchestration.
 

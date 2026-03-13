@@ -2,6 +2,7 @@ from fastapi.testclient import TestClient
 
 from octts.api import app
 from octts.config import Settings
+from octts.schemas.backtest import BacktestMetrics, BacktestResult
 from octts.schemas.report import (
     DecisionValidation,
     HistoricalAnalysisRecord,
@@ -96,6 +97,9 @@ def test_dashboard_route_returns_html() -> None:
 
     assert response.status_code == 200
     assert "OCTTS Dashboard" in response.text
+    assert 'id="backtestForm"' in response.text
+    assert 'id="backtestTemplateSelect"' in response.text
+    assert "回撤曲线" in response.text
 
 
 def test_root_redirects_to_dashboard() -> None:
@@ -168,6 +172,40 @@ def test_openclaw_status_endpoint_uses_settings(monkeypatch) -> None:
     assert payload["connected"] is True
     assert payload["automation_enabled"] is True
     assert payload["automation_timezone"] == "Asia/Shanghai"
+    assert len(payload["automation_slots"]) == 1
+    assert payload["automation_slots"][0]["phase"] == "review"
+
+
+def test_backtest_endpoint_returns_result(monkeypatch) -> None:
+    class DummyBacktestEngine:
+        def run(self, request):
+            assert request.phase == "review"
+            return BacktestResult(
+                phase="review",
+                stock_pool=["600000.SH"],
+                start_date="20260101",
+                end_date="20260110",
+                initial_cash=100000,
+                ending_cash=101000,
+                metrics=BacktestMetrics(trade_count=1, total_return=0.01),
+            )
+
+    monkeypatch.setattr("octts.api._build_backtest_engine", lambda: DummyBacktestEngine())
+
+    client = TestClient(app)
+    response = client.post(
+        "/backtest",
+        json={
+            "stock_pool": ["600000.SH"],
+            "start_date": "20260101",
+            "end_date": "20260110",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["phase"] == "review"
+    assert payload["metrics"]["trade_count"] == 1
 
 
 def test_add_stock_pool_item_persists_to_env(tmp_path, monkeypatch) -> None:
