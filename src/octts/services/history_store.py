@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from octts.schemas.report import (
+    AnalysisPhase,
     DecisionValidation,
     HistoricalAnalysisRecord,
     PriceSnapshot,
@@ -46,6 +47,23 @@ class FileHistoryStore:
         if limit is not None:
             records = records[-limit:]
         return [HistoricalAnalysisRecord.model_validate(item) for item in records]
+
+    def get_latest_record(
+        self,
+        ts_code: str,
+        *,
+        phase: Optional[AnalysisPhase] = None,
+        before_trade_date: Optional[str] = None,
+    ) -> Optional[HistoricalAnalysisRecord]:
+        records = self.list_records(ts_code)
+        for record in reversed(records):
+            if phase and record.report.phase != phase:
+                continue
+            record_trade_date = _record_identity_day(record)
+            if before_trade_date and record_trade_date >= before_trade_date:
+                continue
+            return record
+        return None
 
     def list_latest(self) -> list[HistoricalAnalysisRecord]:
         latest: list[HistoricalAnalysisRecord] = []

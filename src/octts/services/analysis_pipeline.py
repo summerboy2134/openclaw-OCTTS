@@ -86,6 +86,7 @@ class AnalysisPipeline:
 
         for ts_code in stock_pool:
             previous_memory = None
+            previous_record = None
             snapshot = None
             system_prompt = None
             user_prompt = None
@@ -101,11 +102,17 @@ class AnalysisPipeline:
                         snapshot=snapshot,
                     )
                 )
-                previous_memory = self._memory_store.get(ts_code)
+                previous_record = self._history_store.get_latest_record(
+                    ts_code,
+                    phase="review",
+                    before_trade_date=snapshot.trade_date,
+                )
+                previous_memory = previous_record.report.memory if previous_record else None
                 system_prompt, user_prompt, report = self.generate_report_from_snapshot(
                     phase=request.phase,
                     snapshot=snapshot,
                     previous_memory=previous_memory,
+                    previous_record=previous_record,
                 )
                 self._memory_store.set(report.memory)
                 reports.append(report)
@@ -125,6 +132,7 @@ class AnalysisPipeline:
                 raw_payloads[ts_code] = {
                     "snapshot": snapshot.model_dump(mode="json"),
                     "previous_memory": previous_memory.model_dump(mode="json") if previous_memory else None,
+                    "previous_record": previous_record.model_dump(mode="json") if previous_record else None,
                     "system_prompt": system_prompt,
                     "user_prompt": user_prompt,
                 }
@@ -132,6 +140,7 @@ class AnalysisPipeline:
                 raw_payloads[ts_code] = {
                     "snapshot": snapshot.model_dump(mode="json") if snapshot else None,
                     "previous_memory": previous_memory.model_dump(mode="json") if previous_memory else None,
+                    "previous_record": previous_record.model_dump(mode="json") if previous_record else None,
                     "system_prompt": system_prompt,
                     "user_prompt": user_prompt,
                     "error": str(exc),
@@ -162,11 +171,13 @@ class AnalysisPipeline:
         phase: AnalysisPhase,
         snapshot: PriceSnapshot,
         previous_memory: Optional[MemorySummary],
+        previous_record: Optional[HistoricalAnalysisRecord] = None,
     ) -> tuple[str, str, StructuredAnalysis]:
         system_prompt, user_prompt = build_report_prompt(
             phase=phase,
             snapshot=snapshot,
             previous_memory=previous_memory,
+            previous_record=previous_record,
         )
         report = self._llm_client.analyze(
             system_prompt=system_prompt,

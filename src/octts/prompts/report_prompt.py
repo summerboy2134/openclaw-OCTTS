@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 from typing import Optional
 
-from octts.schemas.report import AnalysisPhase, MemorySummary, PriceSnapshot
+from octts.schemas.report import AnalysisPhase, HistoricalAnalysisRecord, MemorySummary, PriceSnapshot
 
 
 def build_report_prompt(
@@ -12,6 +13,7 @@ def build_report_prompt(
     phase: AnalysisPhase,
     snapshot: PriceSnapshot,
     previous_memory: Optional[MemorySummary],
+    previous_record: Optional[HistoricalAnalysisRecord] = None,
 ) -> tuple[str, str]:
     system_prompt = (
         "你是一名严谨的 A 股量化复盘分析助手。"
@@ -27,12 +29,20 @@ def build_report_prompt(
         "status": "initial_analysis",
         "message": "No previous memory available.",
     }
+    previous_record_payload = previous_record.model_dump(mode="json") if previous_record else None
 
     user_payload = {
         "task": "基于上一次判断和当前数据进行趋势延续/修正分析",
         "phase": phase,
         "snapshot": snapshot.model_dump(mode="json"),
         "previous_memory": previous_payload,
+        "previous_record": previous_record_payload,
+        "time_context": _build_time_context(
+            phase=phase,
+            snapshot=snapshot,
+            previous_memory=previous_memory,
+            previous_record=previous_record,
+        ),
         "output_schema": {
             "ts_code": "string",
             "phase": "morning|afternoon|review",
@@ -91,6 +101,9 @@ def build_report_prompt(
         },
         "analysis_instructions": [
             "明确判断上一次观点是延续、减弱、反转还是首次分析。",
+            "涉及历史比较时，优先引用 time_context 中的 previous_trade_date、previous_analysis_generated_at 与 current_trade_date。",
+            "默认不要使用'昨日'或'今日'这类相对时间词，除非能根据 time_context 明确确认就是相邻交易日；否则统一写成具体日期或'上次分析/上一交易日'。",
+            "跨周末或节假日时，禁止把上次分析直接表述为'昨日'。",
             "必须同时给出短线、中线、长线三层趋势判断，并分别解释依据。",
             "短线优先结合 minute_summary 与最近 5 个交易日；中线结合 daily_summary；长线结合 weekly_summary。",
             "解释哪些价格、量能、资金流数据支持当前结论，描述尽量短句化。",
@@ -111,3 +124,50 @@ def build_report_prompt(
     }
 
     return system_prompt, json.dumps(user_payload, ensure_ascii=False, indent=2)
+
+
+def _build_time_context(
+    *,
+    phase: AnalysisPhase,
+    snapshot: PriceSnapshot,
+    previous_memory: Optional[MemorySummary],
+    previous_record: Optional[HistoricalAnalysisRecord],
+) -> dict[str, object]:
+    previous_trade_date = previous_record.snapshot.trade_date if previous_record else None
+    previous_generated_at = previous_record.generated_at if previous_record else (
+        previous_memory.generated_at if previous_memory else None
+    )
+    current_trade_date = snapshot.trade_date
+
+    return {
+        "current_phase": phase,
+        "current_trade_date": current_trade_date,
+        "current_trade_date_label": _format_trade_date(current_trade_date),
+        "previous_analysis_phase": (
+            previous_record.report.phase if previous_record else (previous_memory.phase if previous_memory else None)
+        ),
+        "previous_trade_date": previous_trade_date,
+        "previous_trade_date_label": _format_trade_date(previous_trade_date),
+        "previous_analysis_generated_at": (
+            previous_generated_at.isoformat() if isinstance(previous_generated_at, datetime) else None
+        ),
+        "calendar_day_gap": _calculate_calendar_day_gap(previous_trade_date, current_trade_date),
+        "has_previous_analysis": bool(previous_memory or previous_record),
+    }
+
+
+def _format_trade_date(value: Optional[str]) -> Optional[str]:
+    if not value or len(value) != 8:
+        return value
+    return f"{value[:4]}-{value[4:6]}-{value[6:8]}"
+
+
+def _calculate_calendar_day_gap(previous_trade_date: Optional[str], current_trade_date: Optional[str]) -> Optional[int]:
+    if not previous_trade_date or not current_trade_date:
+        return None
+    try:
+        previous_day = datetime.strptime(previous_trade_date, "%Y%m%d")
+        current_day = datetime.strptime(current_trade_date, "%Y%m%d")
+    except ValueError:
+        return None
+    return (current_day - previous_day).days
