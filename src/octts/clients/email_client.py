@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import smtplib
 from email.message import EmailMessage
+from typing import Optional
 
 from octts.config import Settings
 
@@ -28,7 +29,7 @@ class EmailClient:
         subject: str,
         body: str,
         recipients: list[str],
-        attachments: list[tuple[str, bytes, str]] | None = None,
+        attachments: Optional[list[tuple[str, bytes, str]]] = None,
     ) -> None:
         if not recipients:
             raise ValueError("At least one email recipient is required.")

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+from typing import Optional
 
 
 def render_dashboard_html(
-    data_payload: dict[str, object] | None = None,
+    data_payload: Optional[dict[str, object]] = None,
     *,
     stock_detail_href_prefix: str = "/stocks/",
     stock_detail_href_suffix: str = "",
@@ -30,7 +31,7 @@ def render_dashboard_html(
 
 def render_stock_detail_html(
     ts_code: str,
-    data_payload: dict[str, object] | None = None,
+    data_payload: Optional[dict[str, object]] = None,
     *,
     back_href: str = "/dashboard",
     interactive: bool = True,
@@ -943,7 +944,7 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
 
 def _overview_script(
     *,
-    initial_payload: dict[str, object] | None = None,
+    initial_payload: Optional[dict[str, object]] = None,
     stock_detail_href_prefix: str = "/stocks/",
     stock_detail_href_suffix: str = "",
     interactive: bool = True,
@@ -1688,7 +1689,7 @@ def _overview_script(
 def _detail_script(
     ts_code: str,
     *,
-    initial_payload: dict[str, object] | None = None,
+    initial_payload: Optional[dict[str, object]] = None,
     interactive: bool = True,
 ) -> str:
     prefix = f"""
