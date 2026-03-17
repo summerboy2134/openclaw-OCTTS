@@ -95,11 +95,12 @@ def test_history_store_writes_one_file_per_symbol(tmp_path) -> None:
     assert store.list_records("600000.SH")
 
 
-def test_history_store_overwrites_same_day_same_phase(tmp_path) -> None:
+def test_history_store_overwrites_same_generated_day_same_phase(tmp_path) -> None:
     store = FileHistoryStore(str(tmp_path / "history"))
     first = _build_record()
     second = _build_record()
     second.record_id = "r2"
+    second.snapshot.trade_date = "20260310"
     second.report.trend_judgement = "已切换为更强的向上趋势"
 
     store.append(first)

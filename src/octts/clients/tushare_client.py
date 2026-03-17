@@ -72,8 +72,7 @@ class TushareClient:
 
     def fetch_daily_bars(self, *, ts_code: str, start_date: str, end_date: str) -> list[DailyBar]:
         try:
-            df = self._ts.pro_bar(
-                api=self._pro,
+            df = self._call_pro_bar(
                 ts_code=ts_code,
                 asset="E",
                 start_date=start_date,
@@ -100,17 +99,20 @@ class TushareClient:
         include_minute_summary: bool,
     ) -> PriceSnapshot:
         daily = self._fetch_daily(ts_code=ts_code, trade_date=trade_date)
-        daily_basic = self._fetch_daily_basic(ts_code=ts_code, trade_date=trade_date)
-        minute_summary = self._fetch_minute_summary(ts_code=ts_code) if include_minute_summary else []
-        daily_summary = self._fetch_daily_summary(ts_code=ts_code, trade_date=trade_date)
-        weekly_summary = self._fetch_weekly_summary(ts_code=ts_code, trade_date=trade_date)
-        moneyflow_summary = self._fetch_moneyflow_summary(ts_code=ts_code, trade_date=trade_date)
+        resolved_trade_date = _normalize_trade_date_value(daily.get("trade_date")) or trade_date
+        daily_basic = self._fetch_daily_basic(ts_code=ts_code, trade_date=resolved_trade_date)
+        minute_summary = (
+            self._fetch_minute_summary(ts_code=ts_code, trade_date=resolved_trade_date) if include_minute_summary else []
+        )
+        daily_summary = self._fetch_daily_summary(ts_code=ts_code, trade_date=resolved_trade_date)
+        weekly_summary = self._fetch_weekly_summary(ts_code=ts_code, trade_date=resolved_trade_date)
+        moneyflow_summary = self._fetch_moneyflow_summary(ts_code=ts_code, trade_date=resolved_trade_date)
         name = self._fetch_stock_name(ts_code)
 
         return PriceSnapshot(
             ts_code=ts_code,
             name=name,
-            trade_date=daily.get("trade_date"),
+            trade_date=resolved_trade_date,
             open=_safe_float(daily.get("open")),
             close=_safe_float(daily.get("close")),
             pct_chg=_safe_float(daily.get("pct_chg")),
@@ -134,8 +136,7 @@ class TushareClient:
             # Fallback to a recent bar if same-day daily data is not ready yet.
             end_date = trade_date or datetime.now().strftime("%Y%m%d")
             start_date = (datetime.now() - timedelta(days=self._settings.default_lookback_days)).strftime("%Y%m%d")
-            df = self._ts.pro_bar(
-                api=self._pro,
+            df = self._call_pro_bar(
                 ts_code=ts_code,
                 asset="E",
                 start_date=start_date,
@@ -147,15 +148,19 @@ class TushareClient:
         if df is None or df.empty:
             raise ValueError(f"No daily market data returned for {ts_code}.")
 
+        df = _sort_frame_by_trade_date_desc(df)
         return df.iloc[0].to_dict()
 
     def _fetch_daily_basic(self, *, ts_code: str, trade_date: Optional[str]) -> dict[str, Any]:
         df = self._pro.daily_basic(ts_code=ts_code, trade_date=trade_date)
         if df.empty:
             return {}
+        df = _sort_frame_by_trade_date_desc(df)
         return df.iloc[0].to_dict()
 
-    def _fetch_minute_summary(self, *, ts_code: str) -> list[dict[str, Any]]:
+    def _fetch_minute_summary(self, *, ts_code: str, trade_date: Optional[str]) -> list[dict[str, Any]]:
+        if not trade_date or trade_date != _today_trade_date():
+            return []
         try:
             df = self._pro.rt_min(ts_code=ts_code, freq=self._settings.minute_freq)
         except Exception:
@@ -165,8 +170,7 @@ class TushareClient:
             end_dt = datetime.now()
             start_dt = end_dt - timedelta(days=2)
             try:
-                df = self._ts.pro_bar(
-                    api=self._pro,
+                df = self._call_pro_bar(
                     ts_code=ts_code,
                     asset="E",
                     start_date=start_dt.strftime("%Y-%m-%d %H:%M:%S"),
@@ -190,8 +194,7 @@ class TushareClient:
             "%Y%m%d"
         )
         try:
-            df = self._ts.pro_bar(
-                api=self._pro,
+            df = self._call_pro_bar(
                 ts_code=ts_code,
                 asset="E",
                 start_date=start_date,
@@ -204,6 +207,7 @@ class TushareClient:
 
         if df is None or df.empty:
             return []
+        df = _sort_frame_by_trade_date_desc(df)
         return [row for row in df.head(max(self._settings.default_lookback_days, 20)).to_dict(orient="records")]
 
     def _fetch_weekly_summary(self, *, ts_code: str, trade_date: Optional[str]) -> list[dict[str, Any]]:
@@ -211,8 +215,7 @@ class TushareClient:
         anchor_date = datetime.strptime(end_date, "%Y%m%d")
         start_date = (anchor_date - timedelta(days=120)).strftime("%Y%m%d")
         try:
-            df = self._ts.pro_bar(
-                api=self._pro,
+            df = self._call_pro_bar(
                 ts_code=ts_code,
                 asset="E",
                 start_date=start_date,
@@ -225,6 +228,7 @@ class TushareClient:
 
         if df is None or df.empty:
             return []
+        df = _sort_frame_by_trade_date_desc(df)
         return [row for row in df.head(12).to_dict(orient="records")]
 
     def _fetch_moneyflow_summary(self, *, ts_code: str, trade_date: Optional[str]) -> dict[str, Any]:
@@ -236,6 +240,7 @@ class TushareClient:
         if df.empty:
             return {}
 
+        df = _sort_frame_by_trade_date_desc(df)
         record = df.iloc[0].to_dict()
         keys = [
             "buy_sm_amount",
@@ -260,6 +265,14 @@ class TushareClient:
             return None
         return df.iloc[0].get("name")
 
+    def _call_pro_bar(self, **kwargs):
+        try:
+            return self._ts.pro_bar(api=self._pro, **kwargs)
+        except TypeError as exc:
+            if "unexpected keyword argument 'api'" not in str(exc):
+                raise
+            return self._ts.pro_bar(**kwargs)
+
 
 def _safe_float(value: Any) -> Optional[float]:
     if value is None:
@@ -282,3 +295,24 @@ def _serialize_daily_bar(row: dict[str, Any]) -> dict[str, Any]:
         "vol": _safe_float(row.get("vol")),
         "amount": _safe_float(row.get("amount")),
     }
+
+
+def _today_trade_date() -> str:
+    return datetime.now().strftime("%Y%m%d")
+
+
+def _normalize_trade_date_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if len(text) == 8 and text.isdigit() else None
+
+
+def _sort_frame_by_trade_date_desc(df):
+    columns = getattr(df, "columns", [])
+    if "trade_date" not in columns or not hasattr(df, "sort_values"):
+        return df
+    try:
+        return df.sort_values(by="trade_date", ascending=False)
+    except Exception:
+        return df

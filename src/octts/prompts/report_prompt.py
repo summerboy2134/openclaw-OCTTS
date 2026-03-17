@@ -14,6 +14,8 @@ def build_report_prompt(
     snapshot: PriceSnapshot,
     previous_memory: Optional[MemorySummary],
     previous_record: Optional[HistoricalAnalysisRecord] = None,
+    market_context: Optional[dict[str, object]] = None,
+    previous_trading_snapshot: Optional[dict[str, object]] = None,
 ) -> tuple[str, str]:
     system_prompt = (
         "你是一名严谨的 A 股量化复盘分析助手。"
@@ -37,11 +39,15 @@ def build_report_prompt(
         "snapshot": snapshot.model_dump(mode="json"),
         "previous_memory": previous_payload,
         "previous_record": previous_record_payload,
+        "market_context": market_context,
+        "previous_trading_snapshot": previous_trading_snapshot,
         "time_context": _build_time_context(
             phase=phase,
             snapshot=snapshot,
             previous_memory=previous_memory,
             previous_record=previous_record,
+            market_context=market_context,
+            previous_trading_snapshot=previous_trading_snapshot,
         ),
         "output_schema": {
             "ts_code": "string",
@@ -101,11 +107,18 @@ def build_report_prompt(
         },
         "analysis_instructions": [
             "明确判断上一次观点是延续、减弱、反转还是首次分析。",
+            "当前分析所对应的日期只能以 snapshot.trade_date 与 time_context.current_trade_date 为准，不要根据系统当前时间、生成时间或 minute_summary 自行推断'今天'。",
+            "历史观点状态只用于承接上一次分析结论，默认参考 previous_record 与 previous_memory，不要把它和上一交易日行情混为一谈。",
+            "把 market_context 视为主要分析输入，其中 current_daily_bar、previous_daily_bar、recent_daily_bars、current_weekly_bar、previous_weekly_bar、recent_weekly_bars 为程序整理后的可靠行情上下文。",
+            "凡是描述'收涨/收跌'、'放量/缩量'、'站上/跌破'、'今日/本次'相对变化时，优先基于 market_context.current_daily_bar 与 market_context.previous_daily_bar 做比较；仅在缺失时，才回退为当前 snapshot 截面描述。",
             "涉及历史比较时，优先引用 time_context 中的 previous_trade_date、previous_analysis_generated_at 与 current_trade_date。",
-            "默认不要使用'昨日'或'今日'这类相对时间词，除非能根据 time_context 明确确认就是相邻交易日；否则统一写成具体日期或'上次分析/上一交易日'。",
+            "如果 market_context.previous_daily_bar 存在，优先引用其中的 trade_date 作为上一交易日，不要直接拿上一次分析日期代替上一交易日。",
+            "默认不要使用'昨日'或'今日'这类相对时间词；只有在 current_trade_date 与上一交易日明确相邻时，才允许写'上一交易日'，否则统一写成具体日期或'上次分析'。",
             "跨周末或节假日时，禁止把上次分析直接表述为'昨日'。",
             "必须同时给出短线、中线、长线三层趋势判断，并分别解释依据。",
-            "短线优先结合 minute_summary 与最近 5 个交易日；中线结合 daily_summary；长线结合 weekly_summary。",
+            "短线优先结合 minute_summary、market_context.current_daily_bar、market_context.previous_daily_bar 与 market_context.recent_daily_bars。",
+            "中线优先结合 market_context.recent_daily_bars 与关键价位变化。",
+            "长线优先结合 market_context.current_weekly_bar、market_context.previous_weekly_bar 与 market_context.recent_weekly_bars。",
             "解释哪些价格、量能、资金流数据支持当前结论，描述尽量短句化。",
             "如果历史观点被推翻，指出被推翻的原因。",
             "必须给出 next_1d、next_3d、next_5d 三个预测窗口的方向判断与信心分数。",
@@ -132,12 +145,17 @@ def _build_time_context(
     snapshot: PriceSnapshot,
     previous_memory: Optional[MemorySummary],
     previous_record: Optional[HistoricalAnalysisRecord],
+    market_context: Optional[dict[str, object]],
+    previous_trading_snapshot: Optional[dict[str, object]],
 ) -> dict[str, object]:
     previous_trade_date = previous_record.snapshot.trade_date if previous_record else None
     previous_generated_at = previous_record.generated_at if previous_record else (
         previous_memory.generated_at if previous_memory else None
     )
     current_trade_date = snapshot.trade_date
+    previous_market_trade_date = _extract_trade_date(
+        (market_context or {}).get("previous_daily_bar") if isinstance(market_context, dict) else previous_trading_snapshot
+    )
 
     return {
         "current_phase": phase,
@@ -148,11 +166,14 @@ def _build_time_context(
         ),
         "previous_trade_date": previous_trade_date,
         "previous_trade_date_label": _format_trade_date(previous_trade_date),
+        "previous_market_trade_date": previous_market_trade_date,
+        "previous_market_trade_date_label": _format_trade_date(previous_market_trade_date),
         "previous_analysis_generated_at": (
             previous_generated_at.isoformat() if isinstance(previous_generated_at, datetime) else None
         ),
         "calendar_day_gap": _calculate_calendar_day_gap(previous_trade_date, current_trade_date),
         "has_previous_analysis": bool(previous_memory or previous_record),
+        "has_previous_trading_snapshot": bool(previous_market_trade_date),
     }
 
 
@@ -171,3 +192,13 @@ def _calculate_calendar_day_gap(previous_trade_date: Optional[str], current_trad
     except ValueError:
         return None
     return (current_day - previous_day).days
+
+
+def _extract_trade_date(previous_trading_snapshot: Optional[dict[str, object]]) -> Optional[str]:
+    if not isinstance(previous_trading_snapshot, dict):
+        return None
+    value = previous_trading_snapshot.get("trade_date")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None

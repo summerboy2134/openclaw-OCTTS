@@ -883,6 +883,15 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
       return labelFor(PREDICTION_WINDOW_LABELS, value);
     }}
 
+    function formatSnapshotTradeDate(snapshot) {{
+      const tradeDate = snapshot && snapshot.trade_date;
+      const text = String(tradeDate || "");
+      if (text.length === 8) {{
+        return `行情截至 ${{text.slice(0, 4)}}-${{text.slice(4, 6)}}-${{text.slice(6, 8)}}`;
+      }}
+      return `行情截至 ${{text || "—"}}`;
+    }}
+
     function renderAutomationStatus(status) {{
       if (!status) return '<div class="empty">OpenClaw 状态暂不可用</div>';
       const connectivity = status.connected ? "connected" : "disconnected";
@@ -931,6 +940,7 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
             <span class="badge ${{escapeHtml(item.validation.status)}}">${{escapeHtml(formatValidationStatus(item.validation.status))}}</span>
           </div>
           <div class="subtle" style="margin-top:6px;">${{escapeHtml(item.generated_at)}}</div>
+          <div class="subtle" style="margin-top:4px;">${{escapeHtml(formatSnapshotTradeDate(item.snapshot))}}</div>
           <div style="margin-top:8px;">${{escapeHtml(item.validation.note)}}</div>
         </div>
       `).join("");
@@ -1196,6 +1206,7 @@ def _overview_script(
             <div>
               <div class="title">${escapeHtml(item.ts_code)}${item.name ? " · " + escapeHtml(item.name) : ""}</div>
               <div class="subtle">${escapeHtml(item.generated_at)} · ${escapeHtml(formatPhase(item.phase))}</div>
+              <div class="subtle">${escapeHtml(formatSnapshotTradeDate(item.snapshot))}</div>
             </div>
             <div class="row">
               <span class="badge ${escapeHtml(item.decision.signal)}">${escapeHtml(formatSignal(item.decision.signal))}</span>
@@ -1715,6 +1726,7 @@ def _detail_script(
           <div>
             <div class="title">${{escapeHtml(symbol.ts_code)}}${{symbol.name ? " · " + escapeHtml(symbol.name) : ""}}</div>
             <div class="subtle">${{escapeHtml(symbol.generated_at)}} · ${{escapeHtml(formatPhase(symbol.phase))}}</div>
+            <div class="subtle">${{escapeHtml(formatSnapshotTradeDate(symbol.snapshot))}}</div>
           </div>
           <div class="row">
             <span class="badge ${{escapeHtml(symbol.decision.signal)}}">${{escapeHtml(formatSignal(symbol.decision.signal))}}</span>
@@ -1751,6 +1763,7 @@ def _detail_script(
         return `${{formatPredictionWindow(item.window)}}：${{formatTrendBias(item.bias)}} (${{confidence}}%)`;
       }}).join("\\n") || "—";
       detailMetrics.innerHTML = [
+        ["行情截至", escapeHtml(formatSnapshotTradeDate(symbol.snapshot).replace("行情截至 ", ""))],
         ["入场区间", `${{formatValue(zone.low)}} - ${{formatValue(zone.high)}}`],
         ["止损位", formatValue(symbol.decision.stop_loss)],
         ["目标位", (symbol.decision.take_profit || []).map(v => formatValue(v)).join(" / ") || "—"],

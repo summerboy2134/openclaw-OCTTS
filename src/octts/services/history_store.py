@@ -136,7 +136,8 @@ class FileHistoryStore:
         return self._load_records(self._load_path(path))
 
     def _load_records(self, raw_records: list[dict[str, object]]) -> list[HistoricalAnalysisRecord]:
-        return _sort_records([HistoricalAnalysisRecord.model_validate(item) for item in raw_records])
+        records = [HistoricalAnalysisRecord.model_validate(item) for item in raw_records]
+        return _sort_records(_deduplicate_records(records))
 
     def _load_symbol(self, ts_code: str) -> list[dict[str, object]]:
         return self._load_path(self._symbol_path(ts_code))
@@ -360,7 +361,7 @@ def _same_analysis_slot(existing: HistoricalAnalysisRecord, incoming: Historical
     return (
         existing.report.ts_code == incoming.report.ts_code
         and existing.report.phase == incoming.report.phase
-        and _record_identity_day(existing) == _record_identity_day(incoming)
+        and _generated_day(existing) == _generated_day(incoming)
     )
 
 
@@ -368,6 +369,18 @@ def _record_identity_day(record: HistoricalAnalysisRecord) -> str:
     if record.snapshot.trade_date:
         return record.snapshot.trade_date
     return record.generated_at.strftime("%Y%m%d")
+
+
+def _generated_day(record: HistoricalAnalysisRecord) -> str:
+    return record.generated_at.strftime("%Y%m%d")
+
+
+def _deduplicate_records(records: list[HistoricalAnalysisRecord]) -> list[HistoricalAnalysisRecord]:
+    deduplicated: dict[tuple[str, str, str], HistoricalAnalysisRecord] = {}
+    for record in _sort_records(records):
+        slot_key = (record.report.ts_code, record.report.phase, _generated_day(record))
+        deduplicated[slot_key] = record
+    return list(deduplicated.values())
 
 
 def _sort_records(records: list[HistoricalAnalysisRecord]) -> list[HistoricalAnalysisRecord]:

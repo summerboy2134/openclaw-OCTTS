@@ -87,6 +87,8 @@ class AnalysisPipeline:
         for ts_code in stock_pool:
             previous_memory = None
             previous_record = None
+            market_context = None
+            previous_trading_snapshot = None
             snapshot = None
             system_prompt = None
             user_prompt = None
@@ -108,11 +110,15 @@ class AnalysisPipeline:
                     before_trade_date=snapshot.trade_date,
                 )
                 previous_memory = previous_record.report.memory if previous_record else None
+                market_context = _build_market_context(snapshot)
+                previous_trading_snapshot = market_context.get("previous_daily_bar")
                 system_prompt, user_prompt, report = self.generate_report_from_snapshot(
                     phase=request.phase,
                     snapshot=snapshot,
                     previous_memory=previous_memory,
                     previous_record=previous_record,
+                    market_context=market_context,
+                    previous_trading_snapshot=previous_trading_snapshot,
                 )
                 self._memory_store.set(report.memory)
                 reports.append(report)
@@ -133,6 +139,8 @@ class AnalysisPipeline:
                     "snapshot": snapshot.model_dump(mode="json"),
                     "previous_memory": previous_memory.model_dump(mode="json") if previous_memory else None,
                     "previous_record": previous_record.model_dump(mode="json") if previous_record else None,
+                    "market_context": market_context,
+                    "previous_trading_snapshot": previous_trading_snapshot,
                     "system_prompt": system_prompt,
                     "user_prompt": user_prompt,
                 }
@@ -141,6 +149,8 @@ class AnalysisPipeline:
                     "snapshot": snapshot.model_dump(mode="json") if snapshot else None,
                     "previous_memory": previous_memory.model_dump(mode="json") if previous_memory else None,
                     "previous_record": previous_record.model_dump(mode="json") if previous_record else None,
+                    "market_context": market_context,
+                    "previous_trading_snapshot": previous_trading_snapshot,
                     "system_prompt": system_prompt,
                     "user_prompt": user_prompt,
                     "error": str(exc),
@@ -172,12 +182,18 @@ class AnalysisPipeline:
         snapshot: PriceSnapshot,
         previous_memory: Optional[MemorySummary],
         previous_record: Optional[HistoricalAnalysisRecord] = None,
+        market_context: Optional[dict[str, object]] = None,
+        previous_trading_snapshot: Optional[dict[str, object]] = None,
     ) -> tuple[str, str, StructuredAnalysis]:
+        market_context = market_context or _build_market_context(snapshot)
+        previous_trading_snapshot = previous_trading_snapshot or market_context.get("previous_daily_bar")
         system_prompt, user_prompt = build_report_prompt(
             phase=phase,
             snapshot=snapshot,
             previous_memory=previous_memory,
             previous_record=previous_record,
+            market_context=market_context,
+            previous_trading_snapshot=previous_trading_snapshot,
         )
         report = self._llm_client.analyze(
             system_prompt=system_prompt,
@@ -251,3 +267,121 @@ def _translate_prediction_window(value: str) -> str:
 
 def _translate_previous_view_status(value: str) -> str:
     return PREVIOUS_VIEW_STATUS_LABELS.get(value, value)
+
+
+def _build_market_context(snapshot: PriceSnapshot) -> dict[str, object]:
+    daily_bars = _normalize_bar_series(snapshot.daily_summary)
+    current_daily_bar = _snapshot_to_daily_bar(snapshot)
+    if current_daily_bar:
+        daily_bars = _merge_bar_series(daily_bars, [current_daily_bar])
+    previous_daily_bar = _pick_previous_bar(daily_bars, snapshot.trade_date)
+
+    weekly_bars = _normalize_bar_series(snapshot.weekly_summary)
+    current_weekly_bar = weekly_bars[-1] if weekly_bars else None
+    previous_weekly_bar = weekly_bars[-2] if len(weekly_bars) >= 2 else None
+
+    return {
+        "current_daily_bar": current_daily_bar,
+        "previous_daily_bar": previous_daily_bar,
+        "recent_daily_bars": daily_bars[-5:],
+        "current_weekly_bar": current_weekly_bar,
+        "previous_weekly_bar": previous_weekly_bar,
+        "recent_weekly_bars": weekly_bars[-8:],
+    }
+
+
+def _normalize_bar_series(raw_bars: list[dict[str, object]]) -> list[dict[str, object]]:
+    normalized: dict[str, dict[str, object]] = {}
+    for item in raw_bars:
+        if not isinstance(item, dict):
+            continue
+        bar = _serialize_bar(item)
+        trade_date = bar.get("trade_date")
+        if trade_date:
+            normalized[str(trade_date)] = bar
+    return sorted(normalized.values(), key=lambda item: str(item.get("trade_date") or ""))
+
+
+def _merge_bar_series(
+    existing_bars: list[dict[str, object]], incoming_bars: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    merged = list(existing_bars)
+    by_trade_date = {str(item.get("trade_date")): index for index, item in enumerate(merged) if item.get("trade_date")}
+    for bar in incoming_bars:
+        trade_date = bar.get("trade_date")
+        if not trade_date:
+            continue
+        key = str(trade_date)
+        if key in by_trade_date:
+            merged[by_trade_date[key]] = bar
+        else:
+            by_trade_date[key] = len(merged)
+            merged.append(bar)
+    return sorted(merged, key=lambda item: str(item.get("trade_date") or ""))
+
+
+def _snapshot_to_daily_bar(snapshot: PriceSnapshot) -> Optional[dict[str, object]]:
+    trade_date = _normalize_trade_date(snapshot.trade_date)
+    if not trade_date:
+        return None
+    return {
+        "trade_date": trade_date,
+        "open": _safe_float(snapshot.open),
+        "high": _safe_float(snapshot.high),
+        "low": _safe_float(snapshot.low),
+        "close": _safe_float(snapshot.close),
+        "pct_chg": _safe_float(snapshot.pct_chg),
+        "amount": _safe_float(snapshot.amount),
+        "vol": None,
+        "turnover_rate": _safe_float(snapshot.turnover_rate),
+        "vol_ratio": _safe_float(snapshot.vol_ratio),
+    }
+
+
+def _serialize_bar(raw_bar: dict[str, object]) -> dict[str, object]:
+    return {
+        "trade_date": _normalize_trade_date(raw_bar.get("trade_date")),
+        "open": _safe_float(raw_bar.get("open")),
+        "high": _safe_float(raw_bar.get("high")),
+        "low": _safe_float(raw_bar.get("low")),
+        "close": _safe_float(raw_bar.get("close")),
+        "pct_chg": _safe_float(raw_bar.get("pct_chg")),
+        "vol": _safe_float(raw_bar.get("vol")),
+        "amount": _safe_float(raw_bar.get("amount")),
+        "turnover_rate": _safe_float(raw_bar.get("turnover_rate")),
+        "vol_ratio": _safe_float(raw_bar.get("vol_ratio")),
+    }
+
+
+def _pick_previous_bar(
+    bars: list[dict[str, object]], current_trade_date: Optional[str]
+) -> Optional[dict[str, object]]:
+    normalized_current = _normalize_trade_date(current_trade_date)
+    candidates = [
+        item for item in bars if item.get("trade_date") and (not normalized_current or str(item["trade_date"]) < normalized_current)
+    ]
+    if not candidates:
+        return None
+    return candidates[-1]
+
+
+def _extract_previous_trading_snapshot(snapshot: PriceSnapshot) -> Optional[dict[str, object]]:
+    market_context = _build_market_context(snapshot)
+    previous_daily_bar = market_context.get("previous_daily_bar")
+    return previous_daily_bar if isinstance(previous_daily_bar, dict) else None
+
+
+def _normalize_trade_date(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if len(text) == 8 and text.isdigit() else None
+
+
+def _safe_float(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
