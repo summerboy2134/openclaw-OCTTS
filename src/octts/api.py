@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
+from octts.clients.email_client import EmailClient
 from octts.clients.llm_client import LLMClient
 from octts.clients.tushare_client import TushareClient
 from octts.clients.wecom_client import WeComClient
@@ -19,6 +20,8 @@ from octts.services.automation_scheduler import build_automation_slots, create_a
 from octts.services.backtest_engine import BacktestEngine
 from octts.services.history_store import FileHistoryStore
 from octts.services.memory_store import create_memory_store
+from octts.services.report_email_service import ReportEmailService
+from octts.services.report_exporter import ReportExporter
 from octts.ui.dashboard import render_dashboard_html, render_stock_detail_html
 
 
@@ -27,6 +30,7 @@ async def lifespan(app: FastAPI):
     scheduler = create_automation_scheduler(
         settings=get_settings(),
         pipeline_factory=_build_pipeline,
+        report_email_service_factory=_build_report_email_service,
     )
     app.state.automation_scheduler = scheduler
     if scheduler:
@@ -225,6 +229,24 @@ def _build_backtest_engine() -> BacktestEngine:
     return BacktestEngine(
         pipeline=pipeline,
         market_data_client=tushare_client,
+    )
+
+
+def _build_report_exporter() -> ReportExporter:
+    settings = get_settings()
+    return ReportExporter(
+        settings=settings,
+        history_store=_build_history_store(settings),
+    )
+
+
+def _build_report_email_service() -> ReportEmailService:
+    settings = get_settings()
+    return ReportEmailService(
+        settings=settings,
+        history_store=_build_history_store(settings),
+        report_exporter=_build_report_exporter(),
+        email_client=EmailClient(settings),
     )
 
 

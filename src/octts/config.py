@@ -63,6 +63,15 @@ class Settings(BaseSettings):
     automation_review_time: str = Field(default="20:30", alias="OCTTS_AUTOMATION_REVIEW_TIME")
     automation_phases_raw: str = Field(default="review", alias="OCTTS_AUTOMATION_PHASES")
     automation_notify: bool = Field(default=True, alias="OCTTS_AUTOMATION_NOTIFY")
+    email_enabled: bool = Field(default=False, alias="OCTTS_EMAIL_ENABLED")
+    email_recipients_raw: str = Field(default="", alias="OCTTS_EMAIL_RECIPIENTS")
+    email_send_time: Optional[str] = Field(default=None, alias="OCTTS_EMAIL_SEND_TIME")
+    smtp_host: Optional[str] = Field(default=None, alias="OCTTS_SMTP_HOST")
+    smtp_port: int = Field(default=587, alias="OCTTS_SMTP_PORT")
+    smtp_username: Optional[str] = Field(default=None, alias="OCTTS_SMTP_USERNAME")
+    smtp_password: Optional[str] = Field(default=None, alias="OCTTS_SMTP_PASSWORD")
+    smtp_use_tls: bool = Field(default=True, alias="OCTTS_SMTP_USE_TLS")
+    email_subject_prefix: str = Field(default="OCTTS", alias="OCTTS_EMAIL_SUBJECT_PREFIX")
 
     @property
     def stock_pool(self) -> list[str]:
@@ -74,6 +83,10 @@ class Settings(BaseSettings):
         phases = [item.strip().lower() for item in self.automation_phases_raw.split(",") if item.strip()]
         valid_phases = [item for item in phases if item in allowed]
         return valid_phases or ["review"]
+
+    @property
+    def email_recipients(self) -> list[str]:
+        return [item.strip() for item in self.email_recipients_raw.split(",") if item.strip()]
 
     @property
     def deepseek_api_key(self) -> Optional[str]:

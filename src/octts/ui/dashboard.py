@@ -1,12 +1,69 @@
 from __future__ import annotations
 
+import json
 
-def render_dashboard_html() -> str:
+
+def render_dashboard_html(
+    data_payload: dict[str, object] | None = None,
+    *,
+    stock_detail_href_prefix: str = "/stocks/",
+    stock_detail_href_suffix: str = "",
+    interactive: bool = True,
+) -> str:
     return _render_shell(
         title="OCTTS Dashboard",
         page_title="OCTTS 智能趋势总览",
-        page_subtitle="总览页聚合股票池信号、历史命中状态，并支持手动输入股票代码后立即触发一次分析。",
-        content="""
+        page_subtitle=(
+            "总览页聚合股票池信号、历史命中状态，并支持手动输入股票代码后立即触发一次分析。"
+            if interactive
+            else "离线报告包已内嵌当前快照数据，打开本地 HTML 后仍可继续点击卡片进入单股详情。"
+        ),
+        content=_dashboard_content(interactive=interactive),
+        script=_overview_script(
+            initial_payload=data_payload,
+            stock_detail_href_prefix=stock_detail_href_prefix,
+            stock_detail_href_suffix=stock_detail_href_suffix,
+            interactive=interactive,
+        ),
+    )
+
+
+def render_stock_detail_html(
+    ts_code: str,
+    data_payload: dict[str, object] | None = None,
+    *,
+    back_href: str = "/dashboard",
+    interactive: bool = True,
+) -> str:
+    return _render_shell(
+        title=f"OCTTS {ts_code}",
+        page_title=f"{ts_code} 单股详情",
+        page_subtitle=(
+            "单股详情页展示该股票最新结构化决策、验证状态、关键价位和完整历史时间线。"
+            if interactive
+            else "离线详情页已内嵌该股票的最新数据和历史时间线，可在本地直接查看。"
+        ),
+        content=_detail_content(back_href=back_href, interactive=interactive),
+        script=_detail_script(ts_code, initial_payload=data_payload, interactive=interactive),
+    )
+
+
+def _dashboard_content(*, interactive: bool) -> str:
+    if not interactive:
+        return """
+      <section class="layout" style="grid-template-columns:minmax(0, 1fr);">
+        <div class="main-column">
+          <section class="panel">
+            <div class="section-title">离线报告</div>
+            <div class="subtle">当前压缩包包含总览与每只股票的详情页，点击下方卡片即可在本地继续跳转浏览。</div>
+          </section>
+          <section class="summary-grid" id="summaryGrid"></section>
+          <section class="cards" id="cards"></section>
+        </div>
+      </section>
+    """
+
+    return """
       <section class="layout">
         <div class="main-column">
           <section class="summary-grid" id="summaryGrid"></section>
@@ -134,22 +191,21 @@ def render_dashboard_html() -> str:
           </section>
         </aside>
       </section>
-    """,
-        script=_overview_script(),
+    """
+
+
+def _detail_content(*, back_href: str, interactive: bool) -> str:
+    action_html = (
+        '<button id="clearSymbolDataButton" class="danger-button" type="button">清空这只股票的分析结果</button>'
+        if interactive
+        else '<div class="subtle">离线详情页仅用于查看，已禁用在线清理操作。</div>'
     )
-
-
-def render_stock_detail_html(ts_code: str) -> str:
-    return _render_shell(
-        title=f"OCTTS {ts_code}",
-        page_title=f"{ts_code} 单股详情",
-        page_subtitle="单股详情页展示该股票最新结构化决策、验证状态、关键价位和完整历史时间线。",
-        content=f"""
+    return f"""
       <section class="detail-shell">
         <div class="toolbar">
-          <a class="ghost-link" href="/dashboard">返回总览</a>
+          <a class="ghost-link" href="{back_href}">返回总览</a>
           <div class="row">
-            <button id="clearSymbolDataButton" class="danger-button" type="button">清空这只股票的分析结果</button>
+            {action_html}
             <div id="detailGeneratedAt" class="subtle">等待加载数据...</div>
           </div>
         </div>
@@ -188,9 +244,13 @@ def render_stock_detail_html(ts_code: str) -> str:
           </aside>
         </section>
       </section>
-    """,
-        script=_detail_script(ts_code),
-    )
+    """
+
+
+def _to_json_script_value(value: object) -> str:
+    if value is None:
+        return "null"
+    return json.dumps(value, ensure_ascii=False)
 
 
 def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: str, script: str) -> str:
@@ -881,8 +941,20 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
 </html>"""
 
 
-def _overview_script() -> str:
-    return """
+def _overview_script(
+    *,
+    initial_payload: dict[str, object] | None = None,
+    stock_detail_href_prefix: str = "/stocks/",
+    stock_detail_href_suffix: str = "",
+    interactive: bool = True,
+) -> str:
+    prefix = f"""
+    const IS_INTERACTIVE = {"true" if interactive else "false"};
+    const INITIAL_DASHBOARD_PAYLOAD = {_to_json_script_value(initial_payload)};
+    const STOCK_DETAIL_HREF_PREFIX = {json.dumps(stock_detail_href_prefix, ensure_ascii=False)};
+    const STOCK_DETAIL_HREF_SUFFIX = {json.dumps(stock_detail_href_suffix, ensure_ascii=False)};
+    """
+    return prefix + """
     const summaryGrid = document.getElementById("summaryGrid");
     const cards = document.getElementById("cards");
     const generatedAt = document.getElementById("generatedAt");
@@ -917,6 +989,10 @@ def _overview_script() -> str:
     const backtestStatus = document.getElementById("backtestStatus");
     const backtestResults = document.getElementById("backtestResults");
     const BACKTEST_TEMPLATE_STORAGE_KEY = "octts.backtestTemplates.v1";
+
+    function buildStockDetailHref(tsCode) {
+      return `${STOCK_DETAIL_HREF_PREFIX}${encodeURIComponent(tsCode)}${STOCK_DETAIL_HREF_SUFFIX}`;
+    }
 
     function renderSummary(payload) {
       const items = payload.cards || [];
@@ -1113,7 +1189,7 @@ def _overview_script() -> str:
     function renderCard(item) {
       const zone = item.decision.entry_zone || {};
       const trendBreakdown = item.trend_breakdown || {};
-      return `<a class="card-link" href="/stocks/${encodeURIComponent(item.ts_code)}">
+      return `<a class="card-link" href="${buildStockDetailHref(item.ts_code)}">
         <article class="card">
           <div class="row">
             <div>
@@ -1363,13 +1439,19 @@ def _overview_script() -> str:
     }
 
     async function loadDashboard() {
-      const response = await fetch("/dashboard/data");
-      const payload = await response.json();
+      const payload = INITIAL_DASHBOARD_PAYLOAD || await (async () => {
+        const response = await fetch("/dashboard/data");
+        return response.json();
+      })();
       generatedAt.textContent = payload.generated_at ? `最近更新：${payload.generated_at}` : "暂无数据，请先触发一次分析。";
       renderSummary(payload);
-      renderDefaultStockPool(payload.default_stock_pool || []);
-      openclawStatus.innerHTML = renderAutomationStatus(payload.openclaw_status);
-      if (!backtestStockPoolInput.value && (payload.default_stock_pool || []).length) {
+      if (IS_INTERACTIVE && defaultStockPool) {
+        renderDefaultStockPool(payload.default_stock_pool || []);
+      }
+      if (openclawStatus) {
+        openclawStatus.innerHTML = renderAutomationStatus(payload.openclaw_status);
+      }
+      if (IS_INTERACTIVE && backtestStockPoolInput && !backtestStockPoolInput.value && (payload.default_stock_pool || []).length) {
         backtestStockPoolInput.placeholder = `留空则使用默认股票池：${payload.default_stock_pool.join(", ")}`;
       }
       if (!payload.cards || !payload.cards.length) {
@@ -1446,7 +1528,7 @@ def _overview_script() -> str:
 
         manualAnalyzeStatus.textContent = `${tsCode} 分析完成，正在刷新页面...`;
         await loadDashboard();
-        window.location.href = `/stocks/${encodeURIComponent(tsCode)}`;
+        window.location.href = buildStockDetailHref(tsCode);
       } catch (error) {
         manualAnalyzeStatus.textContent = `触发分析失败：${error.message}`;
       } finally {
@@ -1564,36 +1646,38 @@ def _overview_script() -> str:
       }
     }
 
-    setBacktestDateDefaults();
-    renderBacktestTemplateOptions();
-    manualAnalyzeForm.addEventListener("submit", triggerManualAnalysis);
-    backtestForm.addEventListener("submit", runBacktest);
-    saveBacktestTemplateButton.addEventListener("click", () => {
-      saveCurrentBacktestTemplate();
-    });
-    applyBacktestTemplateButton.addEventListener("click", () => {
-      loadSelectedBacktestTemplate();
-    });
-    deleteBacktestTemplateButton.addEventListener("click", () => {
-      deleteSelectedBacktestTemplate();
-    });
-    backtestTemplateSelect.addEventListener("change", () => {
-      syncBacktestTemplateNameFromSelection();
-    });
-    defaultPoolAnalyzeButton.addEventListener("click", () => {
-      triggerDefaultPoolAnalysis();
-    });
-    clearAllDataButton.addEventListener("click", () => {
-      clearAllAnalysisData();
-    });
-    defaultStockPool.addEventListener("click", event => {
-      const button = event.target.closest("[data-remove-ts-code]");
-      if (!button) return;
-      const tsCode = button.dataset.removeTsCode;
-      removeFromDefaultStockPool(tsCode).catch(error => {
-        defaultStockPoolStatus.textContent = `移除失败：${error.message}`;
+    if (IS_INTERACTIVE) {
+      setBacktestDateDefaults();
+      renderBacktestTemplateOptions();
+      manualAnalyzeForm.addEventListener("submit", triggerManualAnalysis);
+      backtestForm.addEventListener("submit", runBacktest);
+      saveBacktestTemplateButton.addEventListener("click", () => {
+        saveCurrentBacktestTemplate();
       });
-    });
+      applyBacktestTemplateButton.addEventListener("click", () => {
+        loadSelectedBacktestTemplate();
+      });
+      deleteBacktestTemplateButton.addEventListener("click", () => {
+        deleteSelectedBacktestTemplate();
+      });
+      backtestTemplateSelect.addEventListener("change", () => {
+        syncBacktestTemplateNameFromSelection();
+      });
+      defaultPoolAnalyzeButton.addEventListener("click", () => {
+        triggerDefaultPoolAnalysis();
+      });
+      clearAllDataButton.addEventListener("click", () => {
+        clearAllAnalysisData();
+      });
+      defaultStockPool.addEventListener("click", event => {
+        const button = event.target.closest("[data-remove-ts-code]");
+        if (!button) return;
+        const tsCode = button.dataset.removeTsCode;
+        removeFromDefaultStockPool(tsCode).catch(error => {
+          defaultStockPoolStatus.textContent = `移除失败：${error.message}`;
+        });
+      });
+    }
 
     loadDashboard().catch(error => {
       cards.innerHTML = `<div class="empty">加载总览失败：${escapeHtml(error.message)}</div>`;
@@ -1601,8 +1685,17 @@ def _overview_script() -> str:
     """
 
 
-def _detail_script(ts_code: str) -> str:
-    return f"""
+def _detail_script(
+    ts_code: str,
+    *,
+    initial_payload: dict[str, object] | None = None,
+    interactive: bool = True,
+) -> str:
+    prefix = f"""
+    const IS_INTERACTIVE = {"true" if interactive else "false"};
+    const INITIAL_DETAIL_PAYLOAD = {_to_json_script_value(initial_payload)};
+    """
+    return prefix + f"""
     const detailGeneratedAt = document.getElementById("detailGeneratedAt");
     const generatedAt = detailGeneratedAt;
     const heroCard = document.getElementById("heroCard");
@@ -1673,12 +1766,17 @@ def _detail_script(ts_code: str) -> str:
     }}
 
     async function loadDetail() {{
-      const response = await fetch("/stocks/{ts_code}/data");
-      if (response.status === 404) {{
-        heroCard.innerHTML = '<div class="empty">该股票暂无历史记录。先触发一次分析再查看详情页。</div>';
+      const payload = INITIAL_DETAIL_PAYLOAD || await (async () => {{
+        const response = await fetch("/stocks/{ts_code}/data");
+        if (response.status === 404) {{
+          heroCard.innerHTML = '<div class="empty">该股票暂无历史记录。先触发一次分析再查看详情页。</div>';
+          return null;
+        }}
+        return response.json();
+      }})();
+      if (!payload) {{
         return;
       }}
-      const payload = await response.json();
       const symbol = payload.symbol;
       generatedAt.textContent = payload.generated_at ? `最近更新：${{payload.generated_at}}` : "暂无数据";
       heroCard.innerHTML = renderHero(symbol);
@@ -1719,7 +1817,9 @@ def _detail_script(ts_code: str) -> str:
       }}
     }}
 
-    clearSymbolDataButton.addEventListener("click", clearCurrentSymbol);
+    if (IS_INTERACTIVE && clearSymbolDataButton) {{
+      clearSymbolDataButton.addEventListener("click", clearCurrentSymbol);
+    }}
     loadDetail().catch(error => {{
       heroCard.innerHTML = `<div class="empty">加载单股详情失败：${{escapeHtml(error.message)}}</div>`;
     }});
