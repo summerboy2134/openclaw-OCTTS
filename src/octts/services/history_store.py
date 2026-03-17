@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 from typing import Optional
@@ -25,7 +26,7 @@ class FileHistoryStore:
         self._migrate_legacy_payload_if_needed(directory_path)
 
     def append(self, record: HistoricalAnalysisRecord) -> None:
-        existing = [HistoricalAnalysisRecord.model_validate(item) for item in self._load_symbol(record.report.ts_code)]
+        existing = self._load_symbol_records(record.report.ts_code)
         replacement_index = None
         for index in range(len(existing) - 1, -1, -1):
             if _same_analysis_slot(existing[index], record):
@@ -37,16 +38,17 @@ class FileHistoryStore:
         else:
             existing[replacement_index] = record
 
+        existing = _sort_records(existing)
         self._save_symbol(
             record.report.ts_code,
             [item.model_dump(mode="json") for item in existing[-self._limit_per_symbol :]],
         )
 
     def list_records(self, ts_code: str, limit: Optional[int] = None) -> list[HistoricalAnalysisRecord]:
-        records = self._load_symbol(ts_code)
+        records = self._load_symbol_records(ts_code)
         if limit is not None:
             records = records[-limit:]
-        return [HistoricalAnalysisRecord.model_validate(item) for item in records]
+        return records
 
     def get_latest_record(
         self,
@@ -68,14 +70,14 @@ class FileHistoryStore:
     def list_latest(self) -> list[HistoricalAnalysisRecord]:
         latest: list[HistoricalAnalysisRecord] = []
         for path in self._directory.glob("*.json"):
-            records = self._load_path(path)
+            records = self._load_path_records(path)
             if records:
-                latest.append(HistoricalAnalysisRecord.model_validate(records[-1]))
+                latest.append(records[-1])
         latest.sort(key=lambda item: item.generated_at, reverse=True)
         return latest
 
     def refresh_validations(self, *, ts_code: str, snapshot: PriceSnapshot) -> list[ValidationUpdate]:
-        records = [HistoricalAnalysisRecord.model_validate(item) for item in self._load_symbol(ts_code)]
+        records = self._load_symbol_records(ts_code)
         updates: list[ValidationUpdate] = []
 
         for record in records:
@@ -101,6 +103,7 @@ class FileHistoryStore:
                 )
                 record.validation = new_validation
 
+        records = _sort_records(records)
         self._save_symbol(ts_code, [record.model_dump(mode="json") for record in records])
         return updates
 
@@ -109,9 +112,31 @@ class FileHistoryStore:
         if path.exists():
             path.unlink()
 
+    def delete_record(self, ts_code: str, generated_at: str) -> int:
+        target_generated_at = _parse_generated_at(generated_at)
+        records = self._load_symbol_records(ts_code)
+        remaining_records = [record for record in records if record.generated_at != target_generated_at]
+        removed_records = len(records) - len(remaining_records)
+        if removed_records == 0:
+            return 0
+        if remaining_records:
+            self._save_symbol(ts_code, [record.model_dump(mode="json") for record in remaining_records])
+        else:
+            self.delete_symbol(ts_code)
+        return removed_records
+
     def clear(self) -> None:
         for path in self._directory.glob("*.json"):
             path.unlink()
+
+    def _load_symbol_records(self, ts_code: str) -> list[HistoricalAnalysisRecord]:
+        return self._load_records(self._load_symbol(ts_code))
+
+    def _load_path_records(self, path: Path) -> list[HistoricalAnalysisRecord]:
+        return self._load_records(self._load_path(path))
+
+    def _load_records(self, raw_records: list[dict[str, object]]) -> list[HistoricalAnalysisRecord]:
+        return _sort_records([HistoricalAnalysisRecord.model_validate(item) for item in raw_records])
 
     def _load_symbol(self, ts_code: str) -> list[dict[str, object]]:
         return self._load_path(self._symbol_path(ts_code))
@@ -343,3 +368,17 @@ def _record_identity_day(record: HistoricalAnalysisRecord) -> str:
     if record.snapshot.trade_date:
         return record.snapshot.trade_date
     return record.generated_at.strftime("%Y%m%d")
+
+
+def _sort_records(records: list[HistoricalAnalysisRecord]) -> list[HistoricalAnalysisRecord]:
+    return sorted(records, key=lambda item: item.generated_at)
+
+
+def _parse_generated_at(value: str) -> datetime:
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError("generated_at must be a valid ISO 8601 timestamp.") from exc

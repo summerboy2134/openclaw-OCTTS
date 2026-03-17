@@ -4,7 +4,7 @@ import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
@@ -54,6 +54,9 @@ class AnalysisActionResponse(BaseModel):
     cleared_all: bool = False
     removed_records: int = 0
     removed_memory_items: int = 0
+    removed_generated_at: str | None = None
+    remaining_records: int = 0
+    updated_memory: bool = False
 
 
 @app.get("/", include_in_schema=False)
@@ -193,6 +196,48 @@ def clear_symbol_analysis_data(ts_code: str) -> AnalysisActionResponse:
         cleared_symbols=[normalized],
         removed_records=removed_records,
         removed_memory_items=removed_memory_items,
+    )
+
+
+@app.delete("/analysis-data/{ts_code}/records", response_model=AnalysisActionResponse)
+def delete_symbol_analysis_record(
+    ts_code: str,
+    generated_at: str = Query(..., description="ISO 8601 timestamp of the record to delete."),
+) -> AnalysisActionResponse:
+    normalized = _normalize_ts_code(ts_code)
+    settings = get_settings()
+    history_store = _build_history_store(settings)
+    memory_store = create_memory_store(settings)
+
+    try:
+        removed_records = history_store.delete_record(normalized, generated_at)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if removed_records == 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No analysis record found for {normalized} at {generated_at}",
+        )
+
+    remaining_records = len(history_store.list_records(normalized))
+    removed_memory_items = 0
+    updated_memory = False
+    latest_record = history_store.get_latest_record(normalized)
+    if latest_record is None:
+        removed_memory_items = 1 if memory_store.get(normalized) else 0
+        memory_store.delete(normalized)
+    else:
+        memory_store.set(latest_record.report.memory)
+        updated_memory = True
+
+    return AnalysisActionResponse(
+        cleared_symbols=[normalized],
+        removed_records=removed_records,
+        removed_memory_items=removed_memory_items,
+        removed_generated_at=generated_at,
+        remaining_records=remaining_records,
+        updated_memory=updated_memory,
     )
 
 
