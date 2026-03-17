@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -54,7 +55,7 @@ class AnalysisActionResponse(BaseModel):
     cleared_all: bool = False
     removed_records: int = 0
     removed_memory_items: int = 0
-    removed_generated_at: str | None = None
+    removed_generated_at: Optional[str] = None
     remaining_records: int = 0
     updated_memory: bool = False
 
