@@ -200,6 +200,28 @@ def test_format_reports_as_markdown_includes_core_sections() -> None:
     assert "交易信号：买入" in content
 
 
+def test_format_reports_as_markdown_marks_avoid_levels_as_non_participation() -> None:
+    report = FakeLLMClient().analyze(system_prompt="", user_prompt="").model_copy(
+        update={
+            "decision": FakeLLMClient()
+            .analyze(system_prompt="", user_prompt="")
+            .decision.model_copy(
+                update={
+                    "signal": "avoid",
+                    "entry_zone": PriceZone(low=13.8, high=14.1),
+                    "stop_loss": 13.5,
+                    "take_profit": [14.5],
+                }
+            )
+        }
+    )
+    content = format_reports_as_markdown([report])
+
+    assert "入场区间：13.8 - 14.1（不建议参与）" in content
+    assert "止损位：13.5（不建议参与）" in content
+    assert "目标位：14.5（不建议参与）" in content
+
+
 def test_pipeline_skips_failed_symbol_for_multi_stock_requests(tmp_path) -> None:
     settings = Settings(
         OCTTS_STOCK_POOL="600000.SH,000001.SZ",

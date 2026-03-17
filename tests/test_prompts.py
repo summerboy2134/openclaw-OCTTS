@@ -36,6 +36,11 @@ def test_build_report_prompt_embeds_previous_memory() -> None:
 
     payload = json.loads(user_prompt)
     assert payload["previous_memory"]["trend_bias"] == "bullish"
+    assert "snapshot.amount" in payload["field_unit_hints"]
+    assert "千元" in payload["field_unit_hints"]["snapshot.amount"]
     assert payload["output_schema"]["decision"]["signal"] == "buy|hold|reduce|sell|avoid"
     assert payload["output_schema"]["trend_breakdown"]["short_term"] == "bullish|neutral|bearish"
     assert payload["output_schema"]["prediction_windows"][0]["window"] == "next_1d|next_3d|next_5d"
+    assert any("entry_zone" in item for item in payload["analysis_instructions"])
+    assert any("千元" in item and "amount" in item for item in payload["analysis_instructions"])
+    assert any("signal 为 avoid" in item and "观察性参考点位" in item for item in payload["analysis_instructions"])

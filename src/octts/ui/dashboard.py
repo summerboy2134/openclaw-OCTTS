@@ -767,6 +767,21 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
       return String(value);
     }}
 
+    function formatPriceZone(zone) {{
+      if (!zone) return "—";
+      const low = zone.low;
+      const high = zone.high;
+      if ((low === null || low === undefined || low === "") && (high === null || high === undefined || high === "")) {{
+        return "—";
+      }}
+      return `${{formatValue(low)}} - ${{formatValue(high)}}`;
+    }}
+
+    function annotateAvoidValue(signal, value) {{
+      if (signal !== "avoid" || value === "—") return value;
+      return `${{value}}（不建议参与）`;
+    }}
+
     function escapeHtml(value) {{
       return String(value ?? "")
         .replaceAll("&", "&amp;")
@@ -1217,8 +1232,8 @@ def _overview_script(
             <div class="metric"><div class="label">趋势判断</div><div class="value">${escapeHtml(item.trend_judgement)}</div></div>
             <div class="metric"><div class="label">短 / 中 / 长趋势</div><div class="value">${escapeHtml(`${formatTrendBias(trendBreakdown.short_term)} / ${formatTrendBias(trendBreakdown.mid_term)} / ${formatTrendBias(trendBreakdown.long_term)}`)}</div></div>
             <div class="metric"><div class="label">信心分数</div><div class="value">${Math.round((item.decision.confidence_score || 0) * 100)}%</div></div>
-            <div class="metric"><div class="label">入场区间</div><div class="value">${formatValue(zone.low)} - ${formatValue(zone.high)}</div></div>
-            <div class="metric"><div class="label">目标位</div><div class="value">${(item.decision.take_profit || []).map(v => formatValue(v)).join(" / ") || "—"}</div></div>
+            <div class="metric"><div class="label">入场区间</div><div class="value">${annotateAvoidValue(item.decision.signal, formatPriceZone(zone))}</div></div>
+            <div class="metric"><div class="label">目标位</div><div class="value">${annotateAvoidValue(item.decision.signal, (item.decision.take_profit || []).map(v => formatValue(v)).join(" / ") || "—")}</div></div>
           </div>
           ${sparkline(item.snapshot.minute_summary)}
           <div class="metric">
@@ -1764,9 +1779,9 @@ def _detail_script(
       }}).join("\\n") || "—";
       detailMetrics.innerHTML = [
         ["行情截至", escapeHtml(formatSnapshotTradeDate(symbol.snapshot).replace("行情截至 ", ""))],
-        ["入场区间", `${{formatValue(zone.low)}} - ${{formatValue(zone.high)}}`],
-        ["止损位", formatValue(symbol.decision.stop_loss)],
-        ["目标位", (symbol.decision.take_profit || []).map(v => formatValue(v)).join(" / ") || "—"],
+        ["入场区间", annotateAvoidValue(symbol.decision.signal, formatPriceZone(zone))],
+        ["止损位", annotateAvoidValue(symbol.decision.signal, formatValue(symbol.decision.stop_loss))],
+        ["目标位", annotateAvoidValue(symbol.decision.signal, (symbol.decision.take_profit || []).map(v => formatValue(v)).join(" / ") || "—")],
         ["持有周期", escapeHtml(formatHoldingHorizon(symbol.decision.holding_horizon))],
         ["失效条件", escapeHtml(symbol.decision.invalidation_condition)],
         ["历史观点状态", escapeHtml(formatPreviousViewStatus(symbol.previous_view_status))],
