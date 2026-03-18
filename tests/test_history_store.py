@@ -86,6 +86,60 @@ def test_history_store_initial_validation_marks_entry_state() -> None:
     assert record.validation.status == "entered"
 
 
+def test_history_store_initial_validation_marks_avoid_with_zone_as_watching_setup() -> None:
+    snapshot = PriceSnapshot(
+        ts_code="600000.SH",
+        trade_date="20260309",
+        close=10.6,
+        high=10.7,
+        low=10.4,
+    )
+    decision = TradingDecision(
+        signal="avoid",
+        rationale="暂不参与，等待回踩观察。",
+        entry_zone=PriceZone(low=10.0, high=10.2),
+        stop_loss=None,
+        take_profit=[],
+        invalidation_condition="放量跌破 10.0",
+        holding_horizon="swing",
+        confidence_score=0.65,
+        risk_reward_ratio=None,
+        evidence=["尚未回到观察区间"],
+    )
+
+    validation = build_initial_validation(decision=decision, snapshot=snapshot)
+
+    assert validation.status == "watching_setup"
+    assert validation.entry_triggered is False
+
+
+def test_history_store_initial_validation_marks_hold_as_tracking_position() -> None:
+    snapshot = PriceSnapshot(
+        ts_code="600000.SH",
+        trade_date="20260309",
+        close=10.2,
+        high=10.3,
+        low=10.0,
+    )
+    decision = TradingDecision(
+        signal="hold",
+        rationale="已有仓位，继续跟踪。",
+        entry_zone=PriceZone(low=10.0, high=10.2),
+        stop_loss=9.8,
+        take_profit=[10.8],
+        invalidation_condition="跌破 9.8",
+        holding_horizon="swing",
+        confidence_score=0.7,
+        risk_reward_ratio=1.6,
+        evidence=["趋势未破坏"],
+    )
+
+    validation = build_initial_validation(decision=decision, snapshot=snapshot)
+
+    assert validation.status == "tracking_position"
+    assert validation.entry_triggered is True
+
+
 def test_history_store_writes_one_file_per_symbol(tmp_path) -> None:
     store = FileHistoryStore(str(tmp_path / "history"))
     store.append(_build_record())

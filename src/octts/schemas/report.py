@@ -15,7 +15,9 @@ HoldingHorizon = Literal["intraday", "swing", "position"]
 PredictionWindowType = Literal["next_1d", "next_3d", "next_5d"]
 ValidationStatus = Literal[
     "no_signal",
+    "watching_setup",
     "watching_entry",
+    "tracking_position",
     "entered",
     "take_profit_hit",
     "stop_loss_hit",

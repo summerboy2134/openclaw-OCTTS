@@ -102,15 +102,34 @@ def test_call_pro_bar_falls_back_when_api_kwarg_is_unsupported() -> None:
     assert "api" not in client._ts.calls[1]
 
 
-def test_fetch_daily_picks_latest_trade_date_when_frame_order_is_ascending() -> None:
+def test_fetch_daily_picks_latest_trade_date_when_frame_order_is_ascending(monkeypatch) -> None:
     import pandas as pd
 
     client = object.__new__(TushareClient)
     client._settings = Settings(TUSHARE_TOKEN="token", OCTTS_MEMORY_BACKEND="file", OCTTS_MEMORY_FILE_PATH="memory.json")
+    monkeypatch.setattr("octts.clients.tushare_client._today_trade_date", lambda: "20260318")
 
     class DailyOnly:
+        def __init__(self) -> None:
+            self.daily_calls: list[str | None] = []
+
+        def trade_cal(self, *, exchange: str, start_date: str, end_date: str, is_open: str):
+            del exchange, start_date, end_date, is_open
+            return pd.DataFrame(
+                [
+                    {"cal_date": "20260312"},
+                    {"cal_date": "20260313"},
+                    {"cal_date": "20260314"},
+                    {"cal_date": "20260317"},
+                    {"cal_date": "20260318"},
+                ]
+            )
+
         def daily(self, *, ts_code: str, trade_date: str | None):
-            del ts_code, trade_date
+            del ts_code
+            self.daily_calls.append(trade_date)
+            if trade_date == "20260318":
+                return pd.DataFrame()
             return pd.DataFrame(
                 [
                     {"trade_date": "20260312", "close": 59.04},
@@ -126,3 +145,4 @@ def test_fetch_daily_picks_latest_trade_date_when_frame_order_is_ascending() -> 
 
     assert record["trade_date"] == "20260317"
     assert record["close"] == 52.84
+    assert client._pro.daily_calls == ["20260318", "20260317"]

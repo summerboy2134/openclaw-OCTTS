@@ -22,7 +22,11 @@ class ReportEmailService:
         self._email_client = email_client
 
     def send_latest_report_email(self) -> None:
-        latest_records = self._history_store.list_latest()
+        default_stock_pool = self._settings.stock_pool
+        allowed_codes = {item.strip().upper() for item in default_stock_pool if item and item.strip()}
+        latest_records = [
+            record for record in self._history_store.list_latest() if record.report.ts_code.upper() in allowed_codes
+        ]
         if not latest_records:
             raise ValueError("No analysis history available for email delivery.")
         if not self._settings.email_recipients:
@@ -31,7 +35,7 @@ class ReportEmailService:
         generated_at = latest_records[0].generated_at.strftime("%Y-%m-%d %H:%M:%S UTC")
         reports = [record.report for record in latest_records]
         subject = f"{self._settings.email_subject_prefix} 自动报告 {latest_records[0].generated_at.strftime('%Y-%m-%d %H:%M')}"
-        archive_name, archive_bytes = self._report_exporter.export_latest_report_zip()
+        archive_name, archive_bytes = self._report_exporter.export_latest_report_zip(default_stock_pool)
         summary = format_reports_as_markdown(reports)
         body = (
             f"OCTTS 最新离线报告已生成。\n"

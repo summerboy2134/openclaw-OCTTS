@@ -223,9 +223,9 @@ def format_reports_as_markdown(reports: list[StructuredAnalysis]) -> str:
                 f"> 历史观点状态：{_translate_previous_view_status(report.previous_view_status)}",
                 f"> 操作建议：{report.operation_advice}",
                 f"> 交易信号：{_translate_signal(report.decision.signal)}",
-                f"> 入场区间：{_annotate_non_participation(report, _format_entry_zone(report))}",
-                f"> 止损位：{_annotate_non_participation(report, _format_stop_loss(report))}",
-                f"> 目标位：{_annotate_non_participation(report, _format_take_profit(report))}",
+                f"> 入场区间：{_format_entry_zone(report)}",
+                f"> 止损位：{_format_stop_loss(report)}",
+                f"> 目标位：{_format_take_profit(report)}",
                 f"> 预测窗口：{prediction_windows}",
                 "",
                 report.summary_markdown,
@@ -241,9 +241,11 @@ def format_reports_as_markdown(reports: list[StructuredAnalysis]) -> str:
 def _format_entry_zone(report: StructuredAnalysis) -> str:
     zone = report.decision.entry_zone
     if zone is None:
-        return "未设置"
+        return "观望" if report.decision.signal == "avoid" else "未设置"
     low = zone.low if zone.low is not None else "-"
     high = zone.high if zone.high is not None else "-"
+    if report.decision.signal == "avoid" and low == "-" and high == "-":
+        return "观望"
     return f"{low} - {high}"
 
 
@@ -255,12 +257,6 @@ def _format_take_profit(report: StructuredAnalysis) -> str:
 
 def _format_stop_loss(report: StructuredAnalysis) -> str:
     return str(report.decision.stop_loss) if report.decision.stop_loss is not None else "未设置"
-
-
-def _annotate_non_participation(report: StructuredAnalysis, value: str) -> str:
-    if report.decision.signal != "avoid" or value == "未设置":
-        return value
-    return f"{value}（不建议参与）"
 
 
 def _translate_trend_bias(value: str) -> str:

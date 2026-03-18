@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+from typing import Optional
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from octts.config import Settings
@@ -15,8 +16,8 @@ class ReportExporter:
         self._settings = settings
         self._history_store = history_store
 
-    def build_dashboard_payload(self) -> dict[str, object]:
-        latest_records = self._history_store.list_latest()
+    def build_dashboard_payload(self, ts_codes: Optional[list[str]] = None) -> dict[str, object]:
+        latest_records = self._filter_latest_records(self._history_store.list_latest(), ts_codes)
         cards = [
             _serialize_record(
                 record,
@@ -50,12 +51,12 @@ class ReportExporter:
             "openclaw_status": _build_openclaw_status(self._settings),
         }
 
-    def export_latest_report_zip(self) -> tuple[str, bytes]:
-        latest_records = self._history_store.list_latest()
+    def export_latest_report_zip(self, ts_codes: Optional[list[str]] = None) -> tuple[str, bytes]:
+        latest_records = self._filter_latest_records(self._history_store.list_latest(), ts_codes)
         if not latest_records:
             raise ValueError("No analysis history available for export.")
 
-        dashboard_payload = self.build_dashboard_payload()
+        dashboard_payload = self.build_dashboard_payload(ts_codes)
         latest_generated_at = latest_records[0].generated_at.strftime("%Y%m%d-%H%M%S")
         archive_name = f"octts-report-{latest_generated_at}.zip"
         buffer = BytesIO()
@@ -82,6 +83,16 @@ class ReportExporter:
                 )
 
         return archive_name, buffer.getvalue()
+
+    def _filter_latest_records(
+        self, records: list[HistoricalAnalysisRecord], ts_codes: Optional[list[str]]
+    ) -> list[HistoricalAnalysisRecord]:
+        if not ts_codes:
+            return records
+        allowed_codes = {item.strip().upper() for item in ts_codes if item and item.strip()}
+        if not allowed_codes:
+            return []
+        return [record for record in records if record.report.ts_code.upper() in allowed_codes]
 
 
 def _serialize_record(

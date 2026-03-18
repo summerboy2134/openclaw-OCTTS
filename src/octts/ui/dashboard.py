@@ -586,8 +586,8 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
 
     .badge.buy, .badge.take_profit_hit {{ background: rgba(52, 211, 153, 0.14); color: var(--good); }}
     .badge.sell, .badge.stop_loss_hit {{ background: rgba(248, 113, 113, 0.14); color: var(--bad); }}
-    .badge.hold, .badge.entered, .badge.connected {{ background: rgba(96, 165, 250, 0.14); color: var(--accent); }}
-    .badge.reduce, .badge.watching_entry, .badge.expired, .badge.avoid, .badge.no_signal, .badge.disconnected {{ background: rgba(251, 191, 36, 0.14); color: var(--warn); }}
+    .badge.hold, .badge.entered, .badge.tracking_position, .badge.connected {{ background: rgba(96, 165, 250, 0.14); color: var(--accent); }}
+    .badge.reduce, .badge.watching_entry, .badge.watching_setup, .badge.expired, .badge.avoid, .badge.no_signal, .badge.disconnected {{ background: rgba(251, 191, 36, 0.14); color: var(--warn); }}
 
     .metrics-grid {{
       display: grid;
@@ -777,9 +777,10 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
       return `${{formatValue(low)}} - ${{formatValue(high)}}`;
     }}
 
-    function annotateAvoidValue(signal, value) {{
-      if (signal !== "avoid" || value === "—") return value;
-      return `${{value}}（不建议参与）`;
+    function formatEntryZoneDisplay(signal, zone) {{
+      const value = formatPriceZone(zone);
+      if (signal === "avoid" && value === "—") return "观望";
+      return value;
     }}
 
     function escapeHtml(value) {{
@@ -839,7 +840,9 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
 
     const VALIDATION_STATUS_LABELS = {{
       no_signal: "无交易信号",
+      watching_setup: "等待条件成熟",
       watching_entry: "等待入场",
+      tracking_position: "持仓跟踪",
       entered: "已进入区间",
       take_profit_hit: "已触发止盈",
       stop_loss_hit: "已触发止损",
@@ -1028,7 +1031,9 @@ def _overview_script(
         renderSummaryCard("默认股票池", (payload.default_stock_pool || []).length),
         renderSummaryCard("止盈触发", statuses.take_profit_hit || 0),
         renderSummaryCard("止损触发", statuses.stop_loss_hit || 0),
-        renderSummaryCard("等待入场", statuses.watching_entry || 0)
+        renderSummaryCard("等待条件成熟", statuses.watching_setup || 0),
+        renderSummaryCard("等待入场", statuses.watching_entry || 0),
+        renderSummaryCard("持仓跟踪", statuses.tracking_position || 0)
       ].join("");
     }
 
@@ -1232,8 +1237,8 @@ def _overview_script(
             <div class="metric"><div class="label">趋势判断</div><div class="value">${escapeHtml(item.trend_judgement)}</div></div>
             <div class="metric"><div class="label">短 / 中 / 长趋势</div><div class="value">${escapeHtml(`${formatTrendBias(trendBreakdown.short_term)} / ${formatTrendBias(trendBreakdown.mid_term)} / ${formatTrendBias(trendBreakdown.long_term)}`)}</div></div>
             <div class="metric"><div class="label">信心分数</div><div class="value">${Math.round((item.decision.confidence_score || 0) * 100)}%</div></div>
-            <div class="metric"><div class="label">入场区间</div><div class="value">${annotateAvoidValue(item.decision.signal, formatPriceZone(zone))}</div></div>
-            <div class="metric"><div class="label">目标位</div><div class="value">${annotateAvoidValue(item.decision.signal, (item.decision.take_profit || []).map(v => formatValue(v)).join(" / ") || "—")}</div></div>
+            <div class="metric"><div class="label">入场区间</div><div class="value">${formatEntryZoneDisplay(item.decision.signal, zone)}</div></div>
+            <div class="metric"><div class="label">目标位</div><div class="value">${(item.decision.take_profit || []).map(v => formatValue(v)).join(" / ") || "—"}</div></div>
           </div>
           ${sparkline(item.snapshot.minute_summary)}
           <div class="metric">
@@ -1765,7 +1770,9 @@ def _detail_script(
       validationSummary.innerHTML = [
         renderSummaryCard("止盈触发", summary.take_profit_hit || 0),
         renderSummaryCard("止损触发", summary.stop_loss_hit || 0),
+        renderSummaryCard("等待条件成熟", summary.watching_setup || 0),
         renderSummaryCard("等待入场", summary.watching_entry || 0),
+        renderSummaryCard("持仓跟踪", summary.tracking_position || 0),
         renderSummaryCard("已进入区间", summary.entered || 0)
       ].join("");
     }}
@@ -1779,9 +1786,9 @@ def _detail_script(
       }}).join("\\n") || "—";
       detailMetrics.innerHTML = [
         ["行情截至", escapeHtml(formatSnapshotTradeDate(symbol.snapshot).replace("行情截至 ", ""))],
-        ["入场区间", annotateAvoidValue(symbol.decision.signal, formatPriceZone(zone))],
-        ["止损位", annotateAvoidValue(symbol.decision.signal, formatValue(symbol.decision.stop_loss))],
-        ["目标位", annotateAvoidValue(symbol.decision.signal, (symbol.decision.take_profit || []).map(v => formatValue(v)).join(" / ") || "—")],
+        ["入场区间", formatEntryZoneDisplay(symbol.decision.signal, zone)],
+        ["止损位", formatValue(symbol.decision.stop_loss)],
+        ["目标位", (symbol.decision.take_profit || []).map(v => formatValue(v)).join(" / ") || "—"],
         ["持有周期", escapeHtml(formatHoldingHorizon(symbol.decision.holding_horizon))],
         ["失效条件", escapeHtml(symbol.decision.invalidation_condition)],
         ["历史观点状态", escapeHtml(formatPreviousViewStatus(symbol.previous_view_status))],

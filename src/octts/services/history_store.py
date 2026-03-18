@@ -204,9 +204,66 @@ def evaluate_decision_validation(
     entry_triggered = _entry_triggered(decision, current_snapshot)
 
     if decision.signal == "avoid":
+        if not _has_observation_zone(decision):
+            return DecisionValidation(
+                status="no_signal",
+                note="该建议为规避信号，不参与命中率统计。",
+                current_close=close,
+                current_high=high,
+                current_low=low,
+            )
+        if _is_expired(decision.holding_horizon, generated_at, current_snapshot.trade_date):
+            return DecisionValidation(
+                status="expired",
+                note="观察区间在建议周期内未形成可执行信号，标记为过期。",
+                entry_triggered=entry_triggered,
+                current_close=close,
+                current_high=high,
+                current_low=low,
+            )
         return DecisionValidation(
-            status="no_signal",
-            note="该建议为规避信号，不参与命中率统计。",
+            status="watching_setup",
+            note="当前为观望信号，继续观察价格是否进入关注区间并等待条件成熟。",
+            entry_triggered=entry_triggered,
+            current_close=close,
+            current_high=high,
+            current_low=low,
+        )
+
+    if decision.signal == "hold":
+        if _is_expired(decision.holding_horizon, generated_at, current_snapshot.trade_date):
+            return DecisionValidation(
+                status="expired",
+                note="已超过建议持有周期，标记为过期。",
+                entry_triggered=True,
+                current_close=close,
+                current_high=high,
+                current_low=low,
+            )
+        if stop_loss is not None and low is not None and low <= stop_loss:
+            return DecisionValidation(
+                status="stop_loss_hit",
+                note=f"价格触及止损位 {stop_loss}，持有观点失效。",
+                entry_triggered=True,
+                stop_loss_hit=True,
+                current_close=close,
+                current_high=high,
+                current_low=low,
+            )
+        if first_target is not None and high is not None and high >= first_target:
+            return DecisionValidation(
+                status="take_profit_hit",
+                note=f"价格触及第一止盈位 {first_target}。",
+                entry_triggered=True,
+                target_hit_level=first_target,
+                current_close=close,
+                current_high=high,
+                current_low=low,
+            )
+        return DecisionValidation(
+            status="tracking_position",
+            note="当前以持有跟踪为主，继续观察止盈止损与趋势变化。",
+            entry_triggered=True,
             current_close=close,
             current_high=high,
             current_low=low,
@@ -289,9 +346,27 @@ def evaluate_decision_validation(
 
 def build_initial_validation(*, decision: TradingDecision, snapshot: PriceSnapshot) -> DecisionValidation:
     if decision.signal == "avoid":
+        if _has_observation_zone(decision):
+            return DecisionValidation(
+                status="watching_setup",
+                note="当前为观望信号，继续观察价格是否进入关注区间并等待条件成熟。",
+                entry_triggered=_entry_triggered(decision, snapshot),
+                current_close=snapshot.close,
+                current_high=snapshot.high,
+                current_low=snapshot.low,
+            )
         return DecisionValidation(
             status="no_signal",
             note="该建议为规避信号，不参与命中率统计。",
+            current_close=snapshot.close,
+            current_high=snapshot.high,
+            current_low=snapshot.low,
+        )
+    if decision.signal == "hold":
+        return DecisionValidation(
+            status="tracking_position",
+            note="当前以持有跟踪为主，继续观察止盈止损与趋势变化。",
+            entry_triggered=True,
             current_close=snapshot.close,
             current_high=snapshot.high,
             current_low=snapshot.low,
@@ -335,6 +410,13 @@ def _entry_triggered(decision: TradingDecision, snapshot: PriceSnapshot) -> bool
     if low is None or high is None:
         return close is not None and lower <= close <= upper
     return low <= upper and high >= lower
+
+
+def _has_observation_zone(decision: TradingDecision) -> bool:
+    zone = decision.entry_zone
+    if zone is None:
+        return False
+    return zone.low is not None or zone.high is not None
 
 
 def _is_expired(holding_horizon: str, generated_at, trade_date: Optional[str]) -> bool:

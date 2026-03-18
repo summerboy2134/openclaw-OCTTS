@@ -43,4 +43,5 @@ def test_build_report_prompt_embeds_previous_memory() -> None:
     assert payload["output_schema"]["prediction_windows"][0]["window"] == "next_1d|next_3d|next_5d"
     assert any("entry_zone" in item for item in payload["analysis_instructions"])
     assert any("千元" in item and "amount" in item for item in payload["analysis_instructions"])
-    assert any("signal 为 avoid" in item and "观察性参考点位" in item for item in payload["analysis_instructions"])
+    assert any("signal 为 avoid" in item and "不强制提供" in item for item in payload["analysis_instructions"])
+    assert any("等待入场" in item and "entry_zone" in item for item in payload["analysis_instructions"])
