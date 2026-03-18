@@ -41,6 +41,7 @@ class Settings(BaseSettings):
 
     memory_backend: Literal["redis", "file"] = Field(default="redis", alias="OCTTS_MEMORY_BACKEND")
     memory_file_path: str = Field(default="memory/latest_memory.json", alias="OCTTS_MEMORY_FILE_PATH")
+    position_file_path: str = Field(default="memory/positions.json", alias="OCTTS_POSITION_FILE_PATH")
     history_dir_path: str = Field(
         default="memory/history",
         validation_alias=AliasChoices("OCTTS_HISTORY_DIR_PATH", "OCTTS_HISTORY_FILE_PATH"),

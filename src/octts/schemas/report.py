@@ -12,6 +12,7 @@ AnalysisPhase = Literal["morning", "afternoon", "review"]
 TrendBias = Literal["bullish", "neutral", "bearish"]
 SignalType = Literal["buy", "hold", "reduce", "sell", "avoid"]
 HoldingHorizon = Literal["intraday", "swing", "position"]
+PositionStatus = Literal["holding", "watching"]
 PredictionWindowType = Literal["next_1d", "next_3d", "next_5d"]
 ValidationStatus = Literal[
     "no_signal",

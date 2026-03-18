@@ -15,6 +15,7 @@ from octts.services.analysis_pipeline import AnalysisPipeline
 from octts.services.backtest_engine import BacktestEngine
 from octts.services.history_store import FileHistoryStore
 from octts.services.memory_store import FileMemoryStore
+from octts.services.position_store import FilePositionStore
 
 
 class FakeMarketDataClient:
@@ -103,6 +104,7 @@ def test_backtest_engine_runs_review_only_strategy(tmp_path) -> None:
         llm_client=FakeLLMClient(),
         memory_store=FileMemoryStore(str(tmp_path / "memory.json")),
         history_store=FileHistoryStore(str(tmp_path / "history")),
+        position_store=FilePositionStore(str(tmp_path / "positions.json")),
     )
     engine = BacktestEngine(
         pipeline=pipeline,

@@ -17,6 +17,7 @@ from octts.schemas.report import (
     AnalysisPhase,
     HistoricalAnalysisRecord,
     MemorySummary,
+    PositionStatus,
     PriceSnapshot,
     SymbolAnalysisError,
     StructuredAnalysis,
@@ -24,6 +25,7 @@ from octts.schemas.report import (
 )
 from octts.services.history_store import FileHistoryStore, build_initial_validation
 from octts.services.memory_store import MemoryStore
+from octts.services.position_store import FilePositionStore
 
 TREND_BIAS_LABELS = {
     "bullish": "看多",
@@ -62,6 +64,7 @@ class AnalysisPipeline:
         llm_client: LLMClient,
         memory_store: MemoryStore,
         history_store: FileHistoryStore,
+        position_store: FilePositionStore,
         wecom_client: Optional[WeComClient] = None,
     ) -> None:
         self._settings = settings
@@ -69,6 +72,7 @@ class AnalysisPipeline:
         self._llm_client = llm_client
         self._memory_store = memory_store
         self._history_store = history_store
+        self._position_store = position_store
         self._wecom_client = wecom_client
 
     def run(self, request: AnalysisRequest) -> AnalysisResult:
@@ -83,6 +87,7 @@ class AnalysisPipeline:
         request_id = str(uuid4())
         now = datetime.now(UTC)
         allow_partial_success = len(stock_pool) > 1
+        default_stock_pool = {item.strip().upper() for item in self._settings.stock_pool if item.strip()}
 
         for ts_code in stock_pool:
             previous_memory = None
@@ -92,6 +97,8 @@ class AnalysisPipeline:
             snapshot = None
             system_prompt = None
             user_prompt = None
+            position_status = self._position_store.get_status(ts_code)
+            is_default_pool_symbol = ts_code.strip().upper() in default_stock_pool
             try:
                 snapshot = self._tushare_client.fetch_snapshot(
                     ts_code=ts_code,
@@ -119,6 +126,8 @@ class AnalysisPipeline:
                     previous_record=previous_record,
                     market_context=market_context,
                     previous_trading_snapshot=previous_trading_snapshot,
+                    is_default_pool_symbol=is_default_pool_symbol,
+                    position_status=position_status,
                 )
                 self._memory_store.set(report.memory)
                 reports.append(report)
@@ -141,6 +150,8 @@ class AnalysisPipeline:
                     "previous_record": previous_record.model_dump(mode="json") if previous_record else None,
                     "market_context": market_context,
                     "previous_trading_snapshot": previous_trading_snapshot,
+                    "position_status": position_status,
+                    "is_default_pool_symbol": is_default_pool_symbol,
                     "system_prompt": system_prompt,
                     "user_prompt": user_prompt,
                 }
@@ -151,6 +162,8 @@ class AnalysisPipeline:
                     "previous_record": previous_record.model_dump(mode="json") if previous_record else None,
                     "market_context": market_context,
                     "previous_trading_snapshot": previous_trading_snapshot,
+                    "position_status": position_status,
+                    "is_default_pool_symbol": is_default_pool_symbol,
                     "system_prompt": system_prompt,
                     "user_prompt": user_prompt,
                     "error": str(exc),
@@ -184,6 +197,8 @@ class AnalysisPipeline:
         previous_record: Optional[HistoricalAnalysisRecord] = None,
         market_context: Optional[dict[str, object]] = None,
         previous_trading_snapshot: Optional[dict[str, object]] = None,
+        is_default_pool_symbol: bool = False,
+        position_status: Optional[PositionStatus] = None,
     ) -> tuple[str, str, StructuredAnalysis]:
         market_context = market_context or _build_market_context(snapshot)
         previous_trading_snapshot = previous_trading_snapshot or market_context.get("previous_daily_bar")
@@ -194,6 +209,8 @@ class AnalysisPipeline:
             previous_record=previous_record,
             market_context=market_context,
             previous_trading_snapshot=previous_trading_snapshot,
+            is_default_pool_symbol=is_default_pool_symbol,
+            position_status=position_status,
         )
         report = self._llm_client.analyze(
             system_prompt=system_prompt,

@@ -8,13 +8,15 @@ from octts.config import Settings
 from octts.schemas.report import HistoricalAnalysisRecord
 from octts.services.automation_scheduler import build_automation_slots
 from octts.services.history_store import FileHistoryStore
+from octts.services.position_store import FilePositionStore
 from octts.ui.dashboard import render_dashboard_html, render_stock_detail_html
 
 
 class ReportExporter:
-    def __init__(self, *, settings: Settings, history_store: FileHistoryStore) -> None:
+    def __init__(self, *, settings: Settings, history_store: FileHistoryStore, position_store: FilePositionStore) -> None:
         self._settings = settings
         self._history_store = history_store
+        self._position_store = position_store
 
     def build_dashboard_payload(self, ts_codes: Optional[list[str]] = None) -> dict[str, object]:
         latest_records = self._filter_latest_records(self._history_store.list_latest(), ts_codes)
@@ -22,6 +24,7 @@ class ReportExporter:
             _serialize_record(
                 record,
                 self._history_store,
+                self._position_store,
                 history_limit=8,
             )
             for record in latest_records
@@ -45,10 +48,12 @@ class ReportExporter:
             "symbol": _serialize_record(
                 latest,
                 self._history_store,
+                self._position_store,
                 history_limit=self._settings.history_limit_per_symbol,
             ),
             "validation_summary": _build_validation_summary(records),
             "openclaw_status": _build_openclaw_status(self._settings),
+            "position_status": self._position_store.get_status(ts_code),
         }
 
     def export_latest_report_zip(self, ts_codes: Optional[list[str]] = None) -> tuple[str, bytes]:
@@ -98,6 +103,7 @@ class ReportExporter:
 def _serialize_record(
     record: HistoricalAnalysisRecord,
     history_store: FileHistoryStore,
+    position_store: FilePositionStore,
     *,
     history_limit: int,
 ) -> dict[str, object]:
@@ -117,6 +123,7 @@ def _serialize_record(
         "validation": record.validation.model_dump(mode="json"),
         "snapshot": record.snapshot.model_dump(mode="json"),
         "memory": record.report.memory.model_dump(mode="json"),
+        "position_status": position_store.get_status(record.report.ts_code),
         "history": [item.model_dump(mode="json") for item in history],
     }
 
@@ -131,11 +138,6 @@ def _build_validation_summary(records: list[HistoricalAnalysisRecord]) -> dict[s
 
 def _build_openclaw_status(settings: Settings) -> dict[str, object]:
     automation_enabled = settings.automation_enabled
-    status_note = (
-        "当前已启用内置定时分析，服务会按配置时间自动扫描默认股票池。"
-        if automation_enabled
-        else "当前保持外部编排模式。"
-    ) + "如需真实联动状态，可在后续接入网关健康检查或 job 列表接口。"
     return {
         "mode": "built_in_scheduler" if automation_enabled else "external_orchestration",
         "gateway_url": settings.openclaw_gateway_url,
@@ -146,5 +148,4 @@ def _build_openclaw_status(settings: Settings) -> dict[str, object]:
         "automation_notify": settings.automation_notify,
         "automation_timezone": settings.automation_timezone,
         "automation_slots": build_automation_slots(settings),
-        "status_note": status_note,
     }

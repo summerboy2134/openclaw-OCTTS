@@ -14,6 +14,7 @@ from octts.schemas.report import (
 from octts.services.analysis_pipeline import AnalysisPipeline, format_reports_as_markdown
 from octts.services.history_store import FileHistoryStore
 from octts.services.memory_store import FileMemoryStore
+from octts.services.position_store import FilePositionStore
 
 
 class FakeTushareClient:
@@ -175,6 +176,7 @@ def test_pipeline_runs_and_persists_memory(tmp_path) -> None:
         llm_client=FakeLLMClient(),
         memory_store=memory_store,
         history_store=history_store,
+        position_store=FilePositionStore(str(tmp_path / "positions.json")),
         wecom_client=wecom_client,
     )
 
@@ -261,6 +263,7 @@ def test_pipeline_skips_failed_symbol_for_multi_stock_requests(tmp_path) -> None
         llm_client=FlakyLLMClient(),
         memory_store=memory_store,
         history_store=history_store,
+        position_store=FilePositionStore(str(tmp_path / "positions.json")),
     )
 
     result = pipeline.run(AnalysisRequest(phase="review"))
@@ -289,6 +292,7 @@ def test_pipeline_passes_daily_and_weekly_market_context_to_prompt(tmp_path) -> 
         llm_client=llm_client,
         memory_store=memory_store,
         history_store=history_store,
+        position_store=FilePositionStore(str(tmp_path / "positions.json")),
     )
 
     pipeline.run(AnalysisRequest(phase="review"))
@@ -305,3 +309,6 @@ def test_pipeline_passes_daily_and_weekly_market_context_to_prompt(tmp_path) -> 
     previous_trading_snapshot = llm_client.last_user_payload["previous_trading_snapshot"]
     assert previous_trading_snapshot["trade_date"] == "20260308"
     assert previous_trading_snapshot["close"] == 10.0
+    symbol_context = llm_client.last_user_payload["symbol_context"]
+    assert symbol_context["is_default_pool_symbol"] is True
+    assert symbol_context["position_status"] is None

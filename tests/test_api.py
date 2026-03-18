@@ -14,6 +14,7 @@ from octts.schemas.report import (
 )
 from octts.services.history_store import FileHistoryStore
 from octts.services.memory_store import FileMemoryStore
+from octts.services.position_store import FilePositionStore
 
 
 def _build_record() -> HistoricalAnalysisRecord:
@@ -68,12 +69,15 @@ def test_dashboard_data_returns_latest_cards(tmp_path, monkeypatch) -> None:
     history_path = tmp_path / "history.json"
     store = FileHistoryStore(str(history_path))
     store.append(_build_record())
+    position_store = FilePositionStore(str(tmp_path / "positions.json"))
+    position_store.set_status("600000.SH", "holding")
 
     monkeypatch.setattr(
         "octts.api.get_settings",
         lambda: Settings(
             OCTTS_STOCK_POOL="",
             OCTTS_HISTORY_FILE_PATH=str(history_path),
+            OCTTS_POSITION_FILE_PATH=str(tmp_path / "positions.json"),
             OCTTS_HISTORY_LIMIT_PER_SYMBOL=30,
             OCTTS_MEMORY_BACKEND="file",
             OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
@@ -87,6 +91,7 @@ def test_dashboard_data_returns_latest_cards(tmp_path, monkeypatch) -> None:
     payload = response.json()
     assert len(payload["cards"]) == 1
     assert payload["cards"][0]["ts_code"] == "600000.SH"
+    assert payload["cards"][0]["position_status"] == "holding"
     assert payload["default_stock_pool"] == []
     assert "openclaw_status" in payload
 
@@ -122,11 +127,14 @@ def test_stock_detail_data_returns_symbol_payload(tmp_path, monkeypatch) -> None
     history_path = tmp_path / "history.json"
     store = FileHistoryStore(str(history_path))
     store.append(_build_record())
+    position_store = FilePositionStore(str(tmp_path / "positions.json"))
+    position_store.set_status("600000.SH", "holding")
 
     monkeypatch.setattr(
         "octts.api.get_settings",
         lambda: Settings(
             OCTTS_HISTORY_FILE_PATH=str(history_path),
+            OCTTS_POSITION_FILE_PATH=str(tmp_path / "positions.json"),
             OCTTS_HISTORY_LIMIT_PER_SYMBOL=30,
             OCTTS_MEMORY_BACKEND="file",
             OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
@@ -142,6 +150,7 @@ def test_stock_detail_data_returns_symbol_payload(tmp_path, monkeypatch) -> None
     payload = response.json()
     assert payload["symbol"]["ts_code"] == "600000.SH"
     assert payload["openclaw_status"]["connected"] is True
+    assert payload["position_status"] == "holding"
 
 
 def test_stock_detail_page_returns_html() -> None:
@@ -150,6 +159,29 @@ def test_stock_detail_page_returns_html() -> None:
 
     assert response.status_code == 200
     assert "600000.SH 单股详情" in response.text
+    assert 'id="positionStatusSelect"' in response.text
+    assert 'id="reanalyzeSymbolButton"' in response.text
+
+
+def test_update_position_status_persists_selection(tmp_path, monkeypatch) -> None:
+    position_path = tmp_path / "positions.json"
+    monkeypatch.setattr(
+        "octts.api.get_settings",
+        lambda: Settings(
+            OCTTS_POSITION_FILE_PATH=str(position_path),
+            OCTTS_MEMORY_BACKEND="file",
+            OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+        ),
+    )
+
+    client = TestClient(app)
+    response = client.put("/positions/600000.sh", json={"position_status": "holding"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ts_code"] == "600000.SH"
+    assert payload["position_status"] == "holding"
+    assert FilePositionStore(str(position_path)).get_status("600000.SH") == "holding"
 
 
 def test_openclaw_status_endpoint_uses_settings(monkeypatch) -> None:

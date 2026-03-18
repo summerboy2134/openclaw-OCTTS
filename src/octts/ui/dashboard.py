@@ -201,6 +201,31 @@ def _detail_content(*, back_href: str, interactive: bool) -> str:
         if interactive
         else '<div class="subtle">离线详情页仅用于查看，已禁用在线清理操作。</div>'
     )
+    position_panel_html = (
+        """
+            <section class="panel">
+              <div class="section-title">持仓操作</div>
+              <div class="stack">
+                <label class="field">
+                  <span class="mini-label">当前状态</span>
+                  <select id="positionStatusSelect">
+                    <option value="watching">未持有</option>
+                    <option value="holding">已持有</option>
+                  </select>
+                </label>
+                <button id="reanalyzeSymbolButton" class="primary-button" type="button">按当前状态重新分析</button>
+                <div id="detailActionStatus" class="subtle">切换状态后会自动保存，重新分析会按当前状态生成建议。</div>
+              </div>
+            </section>
+        """
+        if interactive
+        else """
+            <section class="panel">
+              <div class="section-title">持仓操作</div>
+              <div class="subtle">离线详情页仅用于查看，已禁用持仓状态修改与重新分析。</div>
+            </section>
+        """
+    )
     return f"""
       <section class="detail-shell">
         <div class="toolbar">
@@ -230,6 +255,7 @@ def _detail_content(*, back_href: str, interactive: bool) -> str:
             </section>
           </div>
           <aside class="side-column">
+            {position_panel_html}
             <section class="panel automation-panel">
               <div class="section-title">OpenClaw 自动化</div>
               <div id="detailOpenclawStatus" class="stack"></div>
@@ -586,8 +612,8 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
 
     .badge.buy, .badge.take_profit_hit {{ background: rgba(52, 211, 153, 0.14); color: var(--good); }}
     .badge.sell, .badge.stop_loss_hit {{ background: rgba(248, 113, 113, 0.14); color: var(--bad); }}
-    .badge.hold, .badge.entered, .badge.tracking_position, .badge.connected {{ background: rgba(96, 165, 250, 0.14); color: var(--accent); }}
-    .badge.reduce, .badge.watching_entry, .badge.watching_setup, .badge.expired, .badge.avoid, .badge.no_signal, .badge.disconnected {{ background: rgba(251, 191, 36, 0.14); color: var(--warn); }}
+    .badge.hold, .badge.entered, .badge.tracking_position, .badge.connected, .badge.position-holding {{ background: rgba(96, 165, 250, 0.14); color: var(--accent); }}
+    .badge.reduce, .badge.watching_entry, .badge.watching_setup, .badge.expired, .badge.avoid, .badge.no_signal, .badge.disconnected, .badge.position-watching {{ background: rgba(251, 191, 36, 0.14); color: var(--warn); }}
 
     .metrics-grid {{
       display: grid;
@@ -838,6 +864,11 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
       avoid: "观望"
     }};
 
+    const POSITION_STATUS_LABELS = {{
+      holding: "已持有",
+      watching: "未持有"
+    }};
+
     const VALIDATION_STATUS_LABELS = {{
       no_signal: "无交易信号",
       watching_setup: "等待条件成熟",
@@ -883,6 +914,10 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
 
     function formatSignal(value) {{
       return labelFor(SIGNAL_LABELS, value);
+    }}
+
+    function formatPositionStatus(value) {{
+      return labelFor(POSITION_STATUS_LABELS, value || "watching");
     }}
 
     function formatValidationStatus(value) {{
@@ -941,10 +976,6 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
               <span class="subtle">${{escapeHtml(slot.time)}}</span>
             </div>
           `).join("")}}</div>
-        </div>
-        <div class="automation-item">
-          <div class="mini-label">状态说明</div>
-          <div class="value">${{escapeHtml(status.status_note)}}</div>
         </div>
       `;
     }}
@@ -1220,6 +1251,8 @@ def _overview_script(
     function renderCard(item) {
       const zone = item.decision.entry_zone || {};
       const trendBreakdown = item.trend_breakdown || {};
+      const positionStatus = item.position_status || "watching";
+      const positionBadgeClass = positionStatus === "holding" ? "position-holding" : "position-watching";
       return `<a class="card-link" href="${buildStockDetailHref(item.ts_code)}">
         <article class="card">
           <div class="row">
@@ -1229,6 +1262,7 @@ def _overview_script(
               <div class="subtle">${escapeHtml(formatSnapshotTradeDate(item.snapshot))}</div>
             </div>
             <div class="row">
+              <span class="badge ${escapeHtml(positionBadgeClass)}">${escapeHtml(formatPositionStatus(positionStatus))}</span>
               <span class="badge ${escapeHtml(item.decision.signal)}">${escapeHtml(formatSignal(item.decision.signal))}</span>
               <span class="badge ${escapeHtml(item.validation.status)}">${escapeHtml(formatValidationStatus(item.validation.status))}</span>
             </div>
@@ -1725,7 +1759,7 @@ def _detail_script(
 ) -> str:
     prefix = f"""
     const IS_INTERACTIVE = {"true" if interactive else "false"};
-    const INITIAL_DETAIL_PAYLOAD = {_to_json_script_value(initial_payload)};
+    let initialDetailPayload = {_to_json_script_value(initial_payload)};
     """
     return prefix + f"""
     const detailGeneratedAt = document.getElementById("detailGeneratedAt");
@@ -1739,6 +1773,10 @@ def _detail_script(
     const detailRisks = document.getElementById("detailRisks");
     const detailOpenclawStatus = document.getElementById("detailOpenclawStatus");
     const clearSymbolDataButton = document.getElementById("clearSymbolDataButton");
+    const positionStatusSelect = document.getElementById("positionStatusSelect");
+    const reanalyzeSymbolButton = document.getElementById("reanalyzeSymbolButton");
+    const detailActionStatus = document.getElementById("detailActionStatus");
+    let currentPositionStatus = "watching";
 
     function renderHero(symbol) {{
       return `
@@ -1801,8 +1839,80 @@ def _detail_script(
       ].map(([label, value]) => `<div class="metric"><div class="label">${{label}}</div><div class="value">${{value}}</div></div>`).join("");
     }}
 
-    async function loadDetail() {{
-      const payload = INITIAL_DETAIL_PAYLOAD || await (async () => {{
+    async function savePositionStatus(nextStatus) {{
+      if (!IS_INTERACTIVE || !positionStatusSelect) return;
+      const previousStatus = currentPositionStatus;
+      positionStatusSelect.disabled = true;
+      if (detailActionStatus) {{
+        detailActionStatus.textContent = "正在保存持仓状态...";
+      }}
+      try {{
+        const response = await fetch("/positions/{ts_code}", {{
+          method: "PUT",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ position_status: nextStatus }})
+        }});
+        const payload = await response.json();
+        if (!response.ok) {{
+          throw new Error(payload.detail || "保存失败");
+        }}
+        currentPositionStatus = payload.position_status || nextStatus;
+        positionStatusSelect.value = currentPositionStatus;
+        if (detailActionStatus) {{
+          detailActionStatus.textContent = `持仓状态已保存为${{currentPositionStatus === "holding" ? "已持有" : "未持有"}}。`;
+        }}
+      }} catch (error) {{
+        positionStatusSelect.value = previousStatus;
+        if (detailActionStatus) {{
+          detailActionStatus.textContent = `保存失败：${{error.message}}`;
+        }}
+        throw error;
+      }} finally {{
+        positionStatusSelect.disabled = false;
+      }}
+    }}
+
+    async function reanalyzeCurrentSymbol() {{
+      if (!IS_INTERACTIVE || !reanalyzeSymbolButton) return;
+      reanalyzeSymbolButton.disabled = true;
+      if (positionStatusSelect) positionStatusSelect.disabled = true;
+      if (detailActionStatus) {{
+        detailActionStatus.textContent = "正在重新分析当前股票...";
+      }}
+      try {{
+        if (positionStatusSelect && positionStatusSelect.value !== currentPositionStatus) {{
+          await savePositionStatus(positionStatusSelect.value);
+        }}
+        const response = await fetch("/analyze", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{
+            phase: "review",
+            stock_pool: ["{ts_code}"],
+            notify: false
+          }})
+        }});
+        const payload = await response.json();
+        if (!response.ok) {{
+          throw new Error(payload.detail || "重新分析失败");
+        }}
+        await loadDetail(true);
+        const signal = payload.reports && payload.reports[0] && payload.reports[0].decision ? payload.reports[0].decision.signal : null;
+        if (detailActionStatus) {{
+          detailActionStatus.textContent = signal ? `重新分析完成，最新信号：${{formatSignal(signal)}}。` : "重新分析完成。";
+        }}
+      }} catch (error) {{
+        if (detailActionStatus) {{
+          detailActionStatus.textContent = `重新分析失败：${{error.message}}`;
+        }}
+      }} finally {{
+        reanalyzeSymbolButton.disabled = false;
+        if (positionStatusSelect) positionStatusSelect.disabled = false;
+      }}
+    }}
+
+    async function loadDetail(forceRefresh = false) {{
+      const payload = (!forceRefresh && initialDetailPayload) || await (async () => {{
         const response = await fetch("/stocks/{ts_code}/data");
         if (response.status === 404) {{
           heroCard.innerHTML = '<div class="empty">该股票暂无历史记录。先触发一次分析再查看详情页。</div>';
@@ -1813,6 +1923,7 @@ def _detail_script(
       if (!payload) {{
         return;
       }}
+      initialDetailPayload = null;
       const symbol = payload.symbol;
       generatedAt.textContent = payload.generated_at ? `最近更新：${{payload.generated_at}}` : "暂无数据";
       heroCard.innerHTML = renderHero(symbol);
@@ -1823,6 +1934,10 @@ def _detail_script(
       detailEvidence.innerHTML = renderList(symbol.decision.evidence || []);
       detailRisks.innerHTML = renderList(symbol.memory.key_risks || []);
       detailOpenclawStatus.innerHTML = renderAutomationStatus(payload.openclaw_status);
+      currentPositionStatus = payload.position_status || "watching";
+      if (positionStatusSelect) {{
+        positionStatusSelect.value = currentPositionStatus;
+      }}
     }}
 
     async function clearCurrentSymbol() {{
@@ -1855,6 +1970,14 @@ def _detail_script(
 
     if (IS_INTERACTIVE && clearSymbolDataButton) {{
       clearSymbolDataButton.addEventListener("click", clearCurrentSymbol);
+    }}
+    if (IS_INTERACTIVE && positionStatusSelect) {{
+      positionStatusSelect.addEventListener("change", event => {{
+        savePositionStatus(event.target.value).catch(() => {{}});
+      }});
+    }}
+    if (IS_INTERACTIVE && reanalyzeSymbolButton) {{
+      reanalyzeSymbolButton.addEventListener("click", reanalyzeCurrentSymbol);
     }}
     loadDetail().catch(error => {{
       heroCard.innerHTML = `<div class="empty">加载单股详情失败：${{escapeHtml(error.message)}}</div>`;

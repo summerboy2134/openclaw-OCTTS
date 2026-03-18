@@ -78,6 +78,57 @@ def test_fetch_minute_summary_skips_non_current_trade_date(monkeypatch) -> None:
     assert client._fetch_minute_summary(ts_code="600000.SH", trade_date="20260316") == []
 
 
+def test_fetch_minute_summary_filters_today_and_sorts_ascending(monkeypatch) -> None:
+    import pandas as pd
+
+    client = object.__new__(TushareClient)
+    client._settings = Settings(TUSHARE_TOKEN="token", OCTTS_MEMORY_BACKEND="file", OCTTS_MEMORY_FILE_PATH="memory.json")
+
+    class MinuteOnly:
+        def rt_min(self, *, ts_code: str, freq: str):
+            del ts_code, freq
+            return pd.DataFrame(
+                [
+                    {"trade_time": "2026-03-17 14:30:00", "close": 9.9},
+                    {"trade_time": "2026-03-18 10:30:00", "close": 10.4},
+                    {"trade_time": "2026-03-18 09:30:00", "close": 10.1},
+                ]
+            )
+
+    client._pro = MinuteOnly()
+    client._ts = object()
+    monkeypatch.setattr("octts.clients.tushare_client._today_trade_date", lambda: "20260318")
+
+    rows = client._fetch_minute_summary(ts_code="600000.SH", trade_date="20260318")
+
+    assert [item["trade_time"] for item in rows] == ["2026-03-18 09:30:00", "2026-03-18 10:30:00"]
+
+
+def test_fetch_minute_summary_accepts_time_only_records_for_today(monkeypatch) -> None:
+    import pandas as pd
+
+    client = object.__new__(TushareClient)
+    client._settings = Settings(TUSHARE_TOKEN="token", OCTTS_MEMORY_BACKEND="file", OCTTS_MEMORY_FILE_PATH="memory.json")
+
+    class MinuteOnly:
+        def rt_min(self, *, ts_code: str, freq: str):
+            del ts_code, freq
+            return pd.DataFrame(
+                [
+                    {"trade_time": "10:30:00", "close": 10.4},
+                    {"trade_time": "09:30:00", "close": 10.1},
+                ]
+            )
+
+    client._pro = MinuteOnly()
+    client._ts = object()
+    monkeypatch.setattr("octts.clients.tushare_client._today_trade_date", lambda: "20260318")
+
+    rows = client._fetch_minute_summary(ts_code="600000.SH", trade_date="20260318")
+
+    assert [item["trade_time"] for item in rows] == ["09:30:00", "10:30:00"]
+
+
 def test_call_pro_bar_falls_back_when_api_kwarg_is_unsupported() -> None:
     client = object.__new__(TushareClient)
     client._pro = object()
@@ -146,3 +197,146 @@ def test_fetch_daily_picks_latest_trade_date_when_frame_order_is_ascending(monke
     assert record["trade_date"] == "20260317"
     assert record["close"] == 52.84
     assert client._pro.daily_calls == ["20260318", "20260317"]
+
+
+def test_build_snapshot_uses_intraday_data_when_today_daily_is_unavailable(monkeypatch) -> None:
+    client = RecordingTushareClient()
+    monkeypatch.setattr("octts.clients.tushare_client._today_trade_date", lambda: "20260318")
+
+    def fetch_daily(*, ts_code: str, trade_date: str | None) -> dict[str, object]:
+        del ts_code, trade_date
+        return {
+            "trade_date": "20260317",
+            "open": 10.0,
+            "close": 10.0,
+            "pct_chg": 0.0,
+            "amount": 1000000,
+            "high": 10.1,
+            "low": 9.9,
+        }
+
+    def fetch_minute_summary(*, ts_code: str, trade_date: str | None) -> list[dict[str, object]]:
+        del ts_code
+        client.calls.append(("minute_summary", trade_date))
+        return [
+            {"trade_time": "2026-03-18 09:30:00", "open": 10.1, "high": 10.2, "low": 10.0, "close": 10.15, "amount": 1000},
+            {"trade_time": "2026-03-18 10:00:00", "open": 10.15, "high": 10.4, "low": 10.1, "close": 10.3, "amount": 1200},
+        ]
+
+    client._fetch_daily = fetch_daily  # type: ignore[method-assign]
+    client._fetch_minute_summary = fetch_minute_summary  # type: ignore[method-assign]
+
+    snapshot = client._build_snapshot(
+        ts_code="600000.SH",
+        phase="review",
+        trade_date="20260318",
+        include_minute_summary=True,
+    )
+
+    assert snapshot.trade_date == "20260318"
+    assert snapshot.open == 10.1
+    assert snapshot.close == 10.3
+    assert snapshot.high == 10.4
+    assert snapshot.low == 10.0
+    assert snapshot.amount == 2200
+    assert round(snapshot.pct_chg or 0, 2) == 3.0
+    assert ("daily_basic", "20260318") in client.calls
+
+
+def test_build_snapshot_prefers_daily_data_after_close_when_today_daily_exists(monkeypatch) -> None:
+    client = RecordingTushareClient()
+    monkeypatch.setattr("octts.clients.tushare_client._today_trade_date", lambda: "20260318")
+
+    def fetch_daily(*, ts_code: str, trade_date: str | None) -> dict[str, object]:
+        del ts_code, trade_date
+        return {
+            "trade_date": "20260318",
+            "open": 10.2,
+            "close": 10.5,
+            "pct_chg": 5.0,
+            "amount": 5000000,
+            "high": 10.6,
+            "low": 10.1,
+        }
+
+    def fetch_minute_summary(*, ts_code: str, trade_date: str | None) -> list[dict[str, object]]:
+        del ts_code
+        client.calls.append(("minute_summary", trade_date))
+        return [
+            {"trade_time": "2026-03-18 09:30:00", "open": 10.1, "high": 10.2, "low": 10.0, "close": 10.15, "amount": 1000}
+        ]
+
+    client._fetch_daily = fetch_daily  # type: ignore[method-assign]
+    client._fetch_minute_summary = fetch_minute_summary  # type: ignore[method-assign]
+
+    snapshot = client._build_snapshot(
+        ts_code="600000.SH",
+        phase="review",
+        trade_date="20260318",
+        include_minute_summary=True,
+    )
+
+    assert snapshot.trade_date == "20260318"
+    assert snapshot.close == 10.5
+    assert snapshot.minute_summary == []
+
+
+def test_build_snapshot_uses_realtime_quote_when_minute_data_is_unavailable(monkeypatch) -> None:
+    client = RecordingTushareClient()
+    monkeypatch.setattr("octts.clients.tushare_client._today_trade_date", lambda: "20260318")
+
+    def fetch_daily(*, ts_code: str, trade_date: str | None) -> dict[str, object]:
+        del ts_code, trade_date
+        return {
+            "trade_date": "20260317",
+            "open": 57.28,
+            "close": 52.84,
+            "pct_chg": -7.2169,
+            "amount": 260939.064,
+            "high": 57.36,
+            "low": 52.7,
+        }
+
+    def fetch_minute_summary(*, ts_code: str, trade_date: str | None) -> list[dict[str, object]]:
+        del ts_code, trade_date
+        client.calls.append(("minute_summary", trade_date))
+        return []
+
+    class QuotesOnly:
+        def get_realtime_quotes(self, code: str):
+            import pandas as pd
+
+            assert code == "600000"
+            return pd.DataFrame(
+                [
+                    {
+                        "date": "2026-03-18",
+                        "time": "11:30:00",
+                        "open": "52.980",
+                        "pre_close": "52.840",
+                        "price": "54.680",
+                        "high": "54.760",
+                        "low": "52.850",
+                        "amount": "128386958.740",
+                    }
+                ]
+            )
+
+    client._fetch_daily = fetch_daily  # type: ignore[method-assign]
+    client._fetch_minute_summary = fetch_minute_summary  # type: ignore[method-assign]
+    client._ts = QuotesOnly()
+
+    snapshot = client._build_snapshot(
+        ts_code="600000.SH",
+        phase="review",
+        trade_date="20260318",
+        include_minute_summary=True,
+    )
+
+    assert snapshot.trade_date == "20260318"
+    assert snapshot.open == 52.98
+    assert snapshot.close == 54.68
+    assert snapshot.high == 54.76
+    assert snapshot.low == 52.85
+    assert round(snapshot.amount or 0, 3) == 128386.959
+    assert round(snapshot.pct_chg or 0, 4) == 3.4815

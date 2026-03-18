@@ -5,7 +5,7 @@ from datetime import datetime
 
 from typing import Optional
 
-from octts.schemas.report import AnalysisPhase, HistoricalAnalysisRecord, MemorySummary, PriceSnapshot
+from octts.schemas.report import AnalysisPhase, HistoricalAnalysisRecord, MemorySummary, PositionStatus, PriceSnapshot
 
 
 def build_report_prompt(
@@ -16,6 +16,8 @@ def build_report_prompt(
     previous_record: Optional[HistoricalAnalysisRecord] = None,
     market_context: Optional[dict[str, object]] = None,
     previous_trading_snapshot: Optional[dict[str, object]] = None,
+    is_default_pool_symbol: bool = False,
+    position_status: Optional[PositionStatus] = None,
 ) -> tuple[str, str]:
     system_prompt = (
         "你是一名严谨的 A 股量化复盘分析助手。"
@@ -41,11 +43,27 @@ def build_report_prompt(
         "previous_record": previous_record_payload,
         "market_context": market_context,
         "previous_trading_snapshot": previous_trading_snapshot,
+        "symbol_context": {
+            "is_default_pool_symbol": is_default_pool_symbol,
+            "position_status": position_status,
+        },
         "field_unit_hints": {
-            "snapshot.amount": "成交额，TuShare 日线字段原始单位为千元；如需换算为亿元，请使用 amount / 100000。",
-            "market_context.current_daily_bar.amount": "成交额，单位同 snapshot.amount，为千元；换算为亿元请除以 100000。",
-            "market_context.previous_daily_bar.amount": "成交额，单位同 snapshot.amount，为千元；换算为亿元请除以 100000。",
-            "market_context.recent_daily_bars[].amount": "成交额，单位同 snapshot.amount，为千元；换算为亿元请除以 100000。",
+            "snapshot.amount": (
+                "成交额，TuShare 日线字段原始单位为千元；如需换算为亿元，请使用 amount / 100000。"
+                "例如 amount=128386.959 时，只能写成 1.284 亿或约 1.28 亿，不能写成 12.84 亿。"
+            ),
+            "market_context.current_daily_bar.amount": (
+                "成交额，单位同 snapshot.amount，为千元；换算为亿元请除以 100000。"
+                "例如 amount=128386.959 时，应写成 1.284 亿。"
+            ),
+            "market_context.previous_daily_bar.amount": (
+                "成交额，单位同 snapshot.amount，为千元；换算为亿元请除以 100000。"
+                "禁止把千元误当成万元或亿元。"
+            ),
+            "market_context.recent_daily_bars[].amount": (
+                "成交额，单位同 snapshot.amount，为千元；换算为亿元请除以 100000。"
+                "若文案写'成交额 X 亿'，必须先完成换算再输出。"
+            ),
         },
         "time_context": _build_time_context(
             phase=phase,
@@ -118,6 +136,9 @@ def build_report_prompt(
             "把 market_context 视为主要分析输入，其中 current_daily_bar、previous_daily_bar、recent_daily_bars、current_weekly_bar、previous_weekly_bar、recent_weekly_bars 为程序整理后的可靠行情上下文。",
             "凡是描述'收涨/收跌'、'放量/缩量'、'站上/跌破'、'今日/本次'相对变化时，优先基于 market_context.current_daily_bar 与 market_context.previous_daily_bar 做比较；仅在缺失时，才回退为当前 snapshot 截面描述。",
             "凡是引用 snapshot.amount 或 market_context 中的 amount 描述成交额时，必须按'千元'理解；若输出为'亿'，请用 amount / 100000 换算，禁止把千元误写成万元或亿元。",
+            "成交额是高频易错项：若 snapshot.amount=128386.959，则成交额只能写成 1.284 亿、约 1.28 亿或 12838.6959 万，绝不能写成 12.84 亿。",
+            "如果你在 trend_judgement、summary_markdown、operation_advice、risk_warning、observation_points、decision.rationale、decision.evidence、prediction_windows.rationale 或 memory.* 中写到'成交额 X 亿'，输出前必须逐项核对 X 是否等于 amount / 100000。",
+            "若无法确认换算结果，宁可直接写'成交额放大/缩量'，也不要输出具体的'X 亿'数值。",
             "涉及历史比较时，优先引用 time_context 中的 previous_trade_date、previous_analysis_generated_at 与 current_trade_date。",
             "如果 market_context.previous_daily_bar 存在，优先引用其中的 trade_date 作为上一交易日，不要直接拿上一次分析日期代替上一交易日。",
             "默认不要使用'昨日'或'今日'这类相对时间词；只有在 current_trade_date 与上一交易日明确相邻时，才允许写'上一交易日'，否则统一写成具体日期或'上次分析'。",
@@ -134,6 +155,10 @@ def build_report_prompt(
             "如果 signal 为 avoid，不强制提供 entry_zone、stop_loss、take_profit；当判断属于'等待入场'或'观察回踩/突破'时，可以给出一个参考 entry_zone 作为关注区间。",
             "对于 avoid，若当前结论只是继续观望且没有明确触发位，可以留空 entry_zone、stop_loss、take_profit。",
             "对于 buy、hold、reduce、sell，优先结合支撑/阻力/最近高低点给出可执行价位：entry_zone 尽量提供 low 和 high，stop_loss 尽量提供具体数值，take_profit 至少给出一个目标位。",
+            "如果 symbol_context.is_default_pool_symbol 为 true，这只股票视为重点跟踪标的，优先给出可执行的仓位管理意见，不要轻易输出泛化观望。",
+            "如果 symbol_context.position_status 为 holding，优先在 hold、reduce、sell 中做决策；只有明确适合继续加仓时才给 buy，并尽量提供 stop_loss、take_profit 与失效条件。",
+            "如果 symbol_context.position_status 为 watching，优先在 buy 与 avoid 中做决策；若暂不入场但存在明确触发位，可使用 avoid 并给出 entry_zone 作为观察区间。",
+            "如果 symbol_context.is_default_pool_symbol 为 true 且 position_status 为空，也要尽量给出可执行参考；只有在边界不清晰时才使用 avoid。",
             "给出可执行但克制的操作建议，不要承诺收益。",
             "trend_judgement 控制在 50 字内。",
             "trend_breakdown 中每个 reason 控制在 70 字内。",

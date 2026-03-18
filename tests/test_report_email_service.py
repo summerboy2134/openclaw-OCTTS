@@ -15,6 +15,7 @@ from octts.schemas.report import (
     TradingDecision,
 )
 from octts.services.history_store import FileHistoryStore
+from octts.services.position_store import FilePositionStore
 from octts.services.report_email_service import ReportEmailService
 from octts.services.report_exporter import ReportExporter
 
@@ -92,10 +93,11 @@ def test_send_latest_report_email_only_includes_default_stock_pool(tmp_path) -> 
         OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
     )
     history_store = FileHistoryStore(str(tmp_path / "history"))
+    position_store = FilePositionStore(str(tmp_path / "positions.json"))
     now = datetime(2026, 3, 18, 12, 0, tzinfo=UTC)
     history_store.append(_build_record("600000.SH", now))
     history_store.append(_build_record("000001.SZ", now - timedelta(minutes=1)))
-    exporter = ReportExporter(settings=settings, history_store=history_store)
+    exporter = ReportExporter(settings=settings, history_store=history_store, position_store=position_store)
     email_client = CapturingEmailClient()
 
     ReportEmailService(
@@ -125,13 +127,16 @@ def test_export_latest_report_zip_filters_requested_stock_pool(tmp_path) -> None
         OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
     )
     history_store = FileHistoryStore(str(tmp_path / "history"))
+    position_store = FilePositionStore(str(tmp_path / "positions.json"))
     now = datetime(2026, 3, 18, 12, 0, tzinfo=UTC)
     history_store.append(_build_record("600000.SH", now))
     history_store.append(_build_record("000001.SZ", now - timedelta(minutes=1)))
 
-    archive_name, archive_bytes = ReportExporter(settings=settings, history_store=history_store).export_latest_report_zip(
-        ["000001.SZ"]
-    )
+    archive_name, archive_bytes = ReportExporter(
+        settings=settings,
+        history_store=history_store,
+        position_store=position_store,
+    ).export_latest_report_zip(["000001.SZ"])
 
     assert archive_name.endswith(".zip")
     with ZipFile(BytesIO(archive_bytes)) as archive:

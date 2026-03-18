@@ -101,12 +101,34 @@ class TushareClient:
         include_minute_summary: bool,
     ) -> PriceSnapshot:
         target_trade_date = self._resolve_target_trade_date(trade_date)
+        minute_summary = (
+            self._fetch_minute_summary(ts_code=ts_code, trade_date=target_trade_date) if include_minute_summary else []
+        )
         daily = self._fetch_daily(ts_code=ts_code, trade_date=target_trade_date)
         resolved_trade_date = _normalize_trade_date_value(daily.get("trade_date")) or target_trade_date or trade_date
+        intraday_daily = None
+        if (
+            include_minute_summary
+            and target_trade_date == _today_trade_date()
+            and resolved_trade_date != target_trade_date
+            and minute_summary
+        ):
+            intraday_daily = _build_intraday_daily_record(
+                minute_summary,
+                trade_date=target_trade_date,
+                previous_close=_safe_float(daily.get("close")),
+            )
+        if intraday_daily:
+            daily = {**daily, **intraday_daily}
+            resolved_trade_date = target_trade_date
+        elif include_minute_summary and target_trade_date == _today_trade_date() and resolved_trade_date != target_trade_date:
+            realtime_daily = self._fetch_realtime_daily(ts_code=ts_code, trade_date=target_trade_date, previous_daily=daily)
+            if realtime_daily:
+                daily = {**daily, **realtime_daily}
+                resolved_trade_date = target_trade_date
+        elif include_minute_summary and target_trade_date == _today_trade_date() and resolved_trade_date == target_trade_date:
+            minute_summary = []
         daily_basic = self._fetch_daily_basic(ts_code=ts_code, trade_date=resolved_trade_date)
-        minute_summary = (
-            self._fetch_minute_summary(ts_code=ts_code, trade_date=resolved_trade_date) if include_minute_summary else []
-        )
         daily_summary = self._fetch_daily_summary(ts_code=ts_code, trade_date=resolved_trade_date)
         weekly_summary = self._fetch_weekly_summary(ts_code=ts_code, trade_date=resolved_trade_date)
         moneyflow_summary = self._fetch_moneyflow_summary(ts_code=ts_code, trade_date=resolved_trade_date)
@@ -229,8 +251,26 @@ class TushareClient:
         if df is None or df.empty:
             return []
 
-        subset = df.head(16)
-        return [row for row in subset.to_dict(orient="records")]
+        records = [row for row in df.to_dict(orient="records")]
+        minute_records = _normalize_minute_records(records, trade_date)
+        return minute_records
+
+    def _fetch_realtime_daily(
+        self, *, ts_code: str, trade_date: str, previous_daily: Optional[dict[str, Any]] = None
+    ) -> Optional[dict[str, Any]]:
+        fetch_quote = getattr(self._ts, "get_realtime_quotes", None)
+        if fetch_quote is None:
+            return None
+        try:
+            df = fetch_quote(_strip_exchange_suffix(ts_code))
+        except Exception:
+            return None
+        if df is None or getattr(df, "empty", True):
+            return None
+        records = df.to_dict(orient="records")
+        if not records:
+            return None
+        return _build_realtime_daily_record(records[0], trade_date=trade_date, previous_daily=previous_daily)
 
     def _fetch_daily_summary(self, *, ts_code: str, trade_date: Optional[str]) -> list[dict[str, Any]]:
         end_date = trade_date or datetime.now().strftime("%Y%m%d")
@@ -376,6 +416,165 @@ def _pick_trade_date_record(df, *, target_trade_date: Optional[str], oldest_allo
         return best_record
 
     return None
+
+
+def _normalize_minute_records(records: list[dict[str, Any]], trade_date: str) -> list[dict[str, Any]]:
+    normalized: list[tuple[tuple[int, str], dict[str, Any]]] = []
+    for record in records:
+        record_trade_date = _extract_minute_trade_date(record, fallback_trade_date=trade_date)
+        if record_trade_date != trade_date:
+            continue
+        sort_key = _minute_sort_key(record)
+        normalized.append((sort_key, record))
+    normalized.sort(key=lambda item: item[0])
+    return [record for _, record in normalized]
+
+
+def _build_intraday_daily_record(
+    minute_records: list[dict[str, Any]], *, trade_date: str, previous_close: Optional[float]
+) -> Optional[dict[str, Any]]:
+    records = _normalize_minute_records(minute_records, trade_date)
+    if not records:
+        return None
+
+    first = records[0]
+    last = records[-1]
+    first_open = _safe_float(first.get("open"))
+    fallback_open = _safe_float(first.get("price")) or _safe_float(first.get("close")) or _safe_float(first.get("close_price"))
+    close = _safe_float(last.get("close")) or _safe_float(last.get("price")) or _safe_float(last.get("close_price"))
+    open_price = first_open if first_open is not None else fallback_open
+
+    high_candidates = [_safe_float(item.get("high")) for item in records]
+    low_candidates = [_safe_float(item.get("low")) for item in records]
+    price_candidates = [
+        _safe_float(item.get("price")) or _safe_float(item.get("close")) or _safe_float(item.get("close_price"))
+        for item in records
+    ]
+    high = _max_defined(high_candidates + price_candidates)
+    low = _min_defined(low_candidates + price_candidates)
+    amount_values = [_safe_float(item.get("amount")) for item in records]
+    amount = _sum_defined(amount_values)
+    pct_chg = None
+    if previous_close not in (None, 0) and close is not None:
+        pct_chg = ((close - previous_close) / previous_close) * 100
+
+    return {
+        "trade_date": trade_date,
+        "open": open_price,
+        "close": close,
+        "high": high,
+        "low": low,
+        "amount": amount,
+        "pct_chg": pct_chg,
+    }
+
+
+def _build_realtime_daily_record(
+    record: dict[str, Any], *, trade_date: str, previous_daily: Optional[dict[str, Any]] = None
+) -> Optional[dict[str, Any]]:
+    record_trade_date = _extract_realtime_trade_date(record)
+    if record_trade_date != trade_date:
+        return None
+
+    previous_close = _safe_float(record.get("pre_close"))
+    if previous_close is None and previous_daily is not None:
+        previous_close = _safe_float(previous_daily.get("close"))
+    close = _safe_float(record.get("price"))
+    open_price = _safe_float(record.get("open"))
+    high = _safe_float(record.get("high"))
+    low = _safe_float(record.get("low"))
+    amount = _safe_float(record.get("amount"))
+    pct_chg = None
+    if previous_close not in (None, 0) and close is not None:
+        pct_chg = ((close - previous_close) / previous_close) * 100
+
+    return {
+        "trade_date": trade_date,
+        "open": open_price,
+        "close": close,
+        "high": high,
+        "low": low,
+        "amount": amount / 1000 if amount is not None else None,
+        "pct_chg": pct_chg,
+    }
+
+
+def _extract_minute_trade_date(record: dict[str, Any], fallback_trade_date: Optional[str] = None) -> Optional[str]:
+    value = record.get("trade_date")
+    normalized = _normalize_trade_date_value(value)
+    if normalized:
+        return normalized
+    timestamp = _extract_minute_timestamp(record)
+    if not timestamp:
+        return None
+    digits = "".join(ch for ch in timestamp if ch.isdigit())
+    if len(digits) >= 8:
+        candidate = digits[:8]
+        return candidate if len(candidate) == 8 else None
+    if fallback_trade_date and _looks_like_intraday_time(timestamp):
+        return fallback_trade_date
+    return None
+
+
+def _extract_realtime_trade_date(record: dict[str, Any]) -> Optional[str]:
+    date_text = str(record.get("date") or "").strip()
+    if not date_text:
+        return None
+    digits = "".join(ch for ch in date_text if ch.isdigit())
+    return digits if len(digits) == 8 else None
+
+
+def _extract_minute_timestamp(record: dict[str, Any]) -> Optional[str]:
+    for key in ("trade_time", "trade_datetime", "datetime", "time"):
+        value = record.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _minute_sort_key(record: dict[str, Any]) -> tuple[int, str]:
+    timestamp = _extract_minute_timestamp(record)
+    if not timestamp:
+        return (1, "")
+    return (0, timestamp)
+
+
+def _looks_like_intraday_time(value: str) -> bool:
+    text = value.strip()
+    if not text:
+        return False
+    if ":" in text:
+        return True
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return len(digits) in {4, 6}
+
+
+def _strip_exchange_suffix(ts_code: str) -> str:
+    return ts_code.split(".", maxsplit=1)[0].strip()
+
+
+def _max_defined(values: list[Optional[float]]) -> Optional[float]:
+    filtered = [value for value in values if value is not None]
+    if not filtered:
+        return None
+    return max(filtered)
+
+
+def _min_defined(values: list[Optional[float]]) -> Optional[float]:
+    filtered = [value for value in values if value is not None]
+    if not filtered:
+        return None
+    return min(filtered)
+
+
+def _sum_defined(values: list[Optional[float]]) -> Optional[float]:
+    filtered = [value for value in values if value is not None]
+    if not filtered:
+        return None
+    return sum(filtered)
 
 
 def _sort_frame_by_trade_date_desc(df):

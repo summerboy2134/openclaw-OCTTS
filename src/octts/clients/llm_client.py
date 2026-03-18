@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any, Optional
@@ -36,6 +37,7 @@ class LLMClient:
         use_json_mode = self._settings.llm_json_mode
         total_attempts = 1 + max(0, self._settings.llm_retry_attempts)
         max_tokens = self._settings.llm_max_tokens
+        expected_snapshot_amount_yi = _extract_snapshot_amount_yi(user_prompt)
 
         for attempt in range(total_attempts):
             try:
@@ -45,7 +47,10 @@ class LLMClient:
                     max_tokens=max_tokens,
                 )
                 payload = _extract_json(content)
-                payload = _coerce_structured_payload(payload)
+                payload = _coerce_structured_payload(
+                    payload,
+                    expected_snapshot_amount_yi=expected_snapshot_amount_yi,
+                )
                 analysis = StructuredAnalysis.model_validate(payload)
                 if finish_reason == "length" and attempt < total_attempts - 1:
                     raise ValueError("Model output was truncated due to token limit.")
@@ -167,8 +172,17 @@ def _looks_like_json_mode_not_supported(exc: Exception) -> bool:
     return "response_format" in message or "json_object" in message or "json schema" in message
 
 
-def _coerce_structured_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def _coerce_structured_payload(
+    payload: dict[str, Any],
+    *,
+    expected_snapshot_amount_yi: Optional[float] = None,
+) -> dict[str, Any]:
     coerced = dict(payload)
+    if expected_snapshot_amount_yi and expected_snapshot_amount_yi > 0:
+        coerced = _normalize_amount_mentions_in_value(
+            coerced,
+            expected_snapshot_amount_yi=expected_snapshot_amount_yi,
+        )
     memory_payload = coerced.get("memory")
     if not isinstance(memory_payload, dict):
         coerced["memory"] = _build_memory_fallback(coerced)
@@ -268,6 +282,82 @@ def _bias_from_signal(signal: Any) -> Optional[str]:
         "avoid": "bearish",
     }
     return mapping.get(str(signal))
+
+
+def _extract_snapshot_amount_yi(user_prompt: str) -> Optional[float]:
+    try:
+        payload = json.loads(user_prompt)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    snapshot = payload.get("snapshot")
+    if not isinstance(snapshot, dict):
+        return None
+
+    amount = snapshot.get("amount")
+    try:
+        amount_value = float(amount)
+    except (TypeError, ValueError):
+        return None
+
+    if amount_value <= 0:
+        return None
+    return amount_value / 100000
+
+
+def _normalize_amount_mentions_in_value(value: Any, *, expected_snapshot_amount_yi: float) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _normalize_amount_mentions_in_value(item, expected_snapshot_amount_yi=expected_snapshot_amount_yi)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _normalize_amount_mentions_in_value(item, expected_snapshot_amount_yi=expected_snapshot_amount_yi)
+            for item in value
+        ]
+    if isinstance(value, str):
+        return _normalize_snapshot_amount_mentions(value, expected_snapshot_amount_yi=expected_snapshot_amount_yi)
+    return value
+
+
+def _normalize_snapshot_amount_mentions(text: str, *, expected_snapshot_amount_yi: float) -> str:
+    if "成交额" not in text or "亿" not in text:
+        return text
+
+    pattern = re.compile(r"(成交额[^\d\n]{0,12})(\d+(?:\.\d+)?)(\s*)(亿元|亿)")
+
+    def replace(match: re.Match[str]) -> str:
+        displayed_value = float(match.group(2))
+        if not _looks_like_amount_scale_error(displayed_value, expected_snapshot_amount_yi):
+            return match.group(0)
+        corrected_value = _format_yi_amount(expected_snapshot_amount_yi)
+        return f"{match.group(1)}{corrected_value}{match.group(3)}{match.group(4)}"
+
+    return pattern.sub(replace, text)
+
+
+def _looks_like_amount_scale_error(displayed_value: float, expected_value: float) -> bool:
+    if displayed_value <= 0 or expected_value <= 0:
+        return False
+
+    larger = max(displayed_value, expected_value)
+    smaller = min(displayed_value, expected_value)
+    ratio = larger / smaller
+    if ratio < 3:
+        return False
+
+    nearest_power = 10 ** round(math.log10(ratio))
+    if nearest_power < 10:
+        return False
+    return abs(ratio / nearest_power - 1) <= 0.25
+
+
+def _format_yi_amount(value: float) -> str:
+    return f"{value:.3f}".rstrip("0").rstrip(".")
 
 
 def _next_retry_max_tokens(current: int) -> int:

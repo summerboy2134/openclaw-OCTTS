@@ -15,12 +15,13 @@ from octts.clients.tushare_client import TushareClient
 from octts.clients.wecom_client import WeComClient
 from octts.config import Settings, get_settings
 from octts.schemas.backtest import BacktestRequest, BacktestResult
-from octts.schemas.report import AnalysisRequest, AnalysisResult
+from octts.schemas.report import AnalysisRequest, AnalysisResult, PositionStatus
 from octts.services.analysis_pipeline import AnalysisPipeline
 from octts.services.automation_scheduler import build_automation_slots, create_automation_scheduler
 from octts.services.backtest_engine import BacktestEngine
 from octts.services.history_store import FileHistoryStore
 from octts.services.memory_store import create_memory_store
+from octts.services.position_store import create_position_store
 from octts.services.report_email_service import ReportEmailService
 from octts.services.report_exporter import ReportExporter
 from octts.ui.dashboard import render_dashboard_html, render_stock_detail_html
@@ -48,6 +49,10 @@ app = FastAPI(title="OCTTS", version="0.1.0", lifespan=lifespan)
 
 class StockPoolItemRequest(BaseModel):
     ts_code: str
+
+
+class PositionStatusRequest(BaseModel):
+    position_status: PositionStatus
 
 
 class AnalysisActionResponse(BaseModel):
@@ -106,8 +111,9 @@ def dashboard() -> HTMLResponse:
 def dashboard_data() -> dict[str, object]:
     settings = get_settings()
     history_store = _build_history_store(settings)
+    position_store = create_position_store(settings)
     latest_records = history_store.list_latest()
-    cards = [_serialize_record(record, history_store, history_limit=8) for record in latest_records]
+    cards = [_serialize_record(record, history_store, position_store, history_limit=8) for record in latest_records]
     validation_summary = _build_validation_summary(latest_records)
 
     return {
@@ -126,19 +132,30 @@ def stock_detail_page(ts_code: str) -> HTMLResponse:
 
 @app.get("/stocks/{ts_code}/data")
 def stock_detail_data(ts_code: str) -> dict[str, object]:
+    normalized = _normalize_ts_code(ts_code)
     settings = get_settings()
     history_store = _build_history_store(settings)
-    records = history_store.list_records(ts_code, limit=settings.history_limit_per_symbol)
+    position_store = create_position_store(settings)
+    records = history_store.list_records(normalized, limit=settings.history_limit_per_symbol)
     if not records:
-        raise HTTPException(status_code=404, detail=f"No history found for {ts_code}")
+        raise HTTPException(status_code=404, detail=f"No history found for {normalized}")
 
     latest = records[-1]
     return {
         "generated_at": latest.generated_at,
-        "symbol": _serialize_record(latest, history_store, history_limit=settings.history_limit_per_symbol),
+        "symbol": _serialize_record(latest, history_store, position_store, history_limit=settings.history_limit_per_symbol),
         "validation_summary": _build_validation_summary(records),
         "openclaw_status": _build_openclaw_status(settings),
+        "position_status": position_store.get_status(normalized),
     }
+
+
+@app.put("/positions/{ts_code}")
+def update_position_status(ts_code: str, request: PositionStatusRequest) -> dict[str, object]:
+    normalized = _normalize_ts_code(ts_code)
+    position_store = create_position_store(get_settings())
+    position_store.set_status(normalized, request.position_status)
+    return {"ts_code": normalized, "position_status": request.position_status}
 
 
 @app.get("/openclaw/status")
@@ -256,6 +273,7 @@ def _build_pipeline() -> AnalysisPipeline:
         llm_client=llm_client,
         memory_store=create_memory_store(settings),
         history_store=_build_history_store(settings),
+        position_store=create_position_store(settings),
         wecom_client=wecom_client,
     )
 
@@ -270,6 +288,7 @@ def _build_backtest_engine() -> BacktestEngine:
         llm_client=LLMClient(settings),
         memory_store=create_memory_store(settings),
         history_store=_build_history_store(settings),
+        position_store=create_position_store(settings),
         wecom_client=wecom_client,
     )
     return BacktestEngine(
@@ -283,6 +302,7 @@ def _build_report_exporter() -> ReportExporter:
     return ReportExporter(
         settings=settings,
         history_store=_build_history_store(settings),
+        position_store=create_position_store(settings),
     )
 
 
@@ -303,7 +323,7 @@ def _build_history_store(settings: Settings) -> FileHistoryStore:
     )
 
 
-def _serialize_record(record, history_store: FileHistoryStore, history_limit: int) -> dict[str, object]:
+def _serialize_record(record, history_store: FileHistoryStore, position_store, history_limit: int) -> dict[str, object]:
     history = history_store.list_records(record.report.ts_code, limit=history_limit)
     return {
         "ts_code": record.report.ts_code,
@@ -320,6 +340,7 @@ def _serialize_record(record, history_store: FileHistoryStore, history_limit: in
         "validation": record.validation.model_dump(mode="json"),
         "snapshot": record.snapshot.model_dump(mode="json"),
         "memory": record.report.memory.model_dump(mode="json"),
+        "position_status": position_store.get_status(record.report.ts_code),
         "history": [item.model_dump(mode="json") for item in history],
     }
 
@@ -334,11 +355,6 @@ def _build_validation_summary(records) -> dict[str, int]:
 
 def _build_openclaw_status(settings: Settings) -> dict[str, object]:
     automation_enabled = settings.automation_enabled
-    status_note = (
-        "当前已启用内置定时分析，服务会按配置时间自动扫描默认股票池。"
-        if automation_enabled
-        else "当前保持外部编排模式。"
-    ) + "如需真实联动状态，可在后续接入网关健康检查或 job 列表接口。"
     return {
         "mode": "built_in_scheduler" if automation_enabled else "external_orchestration",
         "gateway_url": settings.openclaw_gateway_url,
@@ -349,7 +365,6 @@ def _build_openclaw_status(settings: Settings) -> dict[str, object]:
         "automation_notify": settings.automation_notify,
         "automation_timezone": settings.automation_timezone,
         "automation_slots": build_automation_slots(settings),
-        "status_note": status_note,
     }
 
 
