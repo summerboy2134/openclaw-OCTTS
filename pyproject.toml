@@ -10,13 +10,18 @@ readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
   "apscheduler>=3.10.4",
+  "beautifulsoup4",
   "fastapi>=0.100.0",
+  "httpx",
   "json-repair>=0.29.0",
+  "numpy",
   "openai>=1.0.0",
+  "pandas",
   "pydantic>=2.8.0",
   "pydantic-settings>=2.4.0",
   "redis>=5.0.8",
   "requests>=2.32.0",
+  "sqlalchemy",
   "tinyshare",
   "uvicorn>=0.30.0",
 ]

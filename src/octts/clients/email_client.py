@@ -30,6 +30,7 @@ class EmailClient:
         body: str,
         recipients: list[str],
         attachments: Optional[list[tuple[str, bytes, str]]] = None,
+        html_content: Optional[str] = None,
     ) -> None:
         if not recipients:
             raise ValueError("At least one email recipient is required.")
@@ -39,6 +40,8 @@ class EmailClient:
         message["From"] = self._username
         message["To"] = ", ".join(recipients)
         message.set_content(body)
+        if html_content:
+            message.add_alternative(html_content, subtype="html")
 
         for filename, content, mime_type in attachments or []:
             maintype, subtype = mime_type.split("/", maxsplit=1)

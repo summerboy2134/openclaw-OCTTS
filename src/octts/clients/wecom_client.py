@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import logging
+
 from octts.config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class WeComClient:
@@ -29,4 +33,5 @@ class WeComClient:
         response.raise_for_status()
         payload = response.json()
         if payload.get("errcode") not in (0, "0", None):
+            logger.error("WeCom webhook rejected markdown: errcode=%s errmsg=%s", payload.get("errcode"), payload.get("errmsg"))
             raise ValueError(f"WeCom webhook rejected message: {payload}")

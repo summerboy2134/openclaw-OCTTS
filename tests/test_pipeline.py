@@ -1,4 +1,5 @@
 import json
+from typing import Dict, Optional
 
 from octts.config import Settings
 from octts.schemas.report import (
@@ -18,7 +19,7 @@ from octts.services.position_store import FilePositionStore
 
 
 class FakeTushareClient:
-    def fetch_snapshot(self, *, ts_code: str, phase: str, trade_date: str | None = None) -> PriceSnapshot:
+    def fetch_snapshot(self, *, ts_code: str, phase: str, trade_date: Optional[str] = None) -> PriceSnapshot:
         current_trade_date = trade_date or "20260309"
         return PriceSnapshot(
             ts_code=ts_code,
@@ -144,7 +145,7 @@ class FlakyLLMClient(FakeLLMClient):
 
 class CapturingLLMClient(FakeLLMClient):
     def __init__(self) -> None:
-        self.last_user_payload: dict[str, object] | None = None
+        self.last_user_payload: Optional[Dict[str, object]] = None
 
     def analyze(self, *, system_prompt: str, user_prompt: str) -> StructuredAnalysis:
         del system_prompt

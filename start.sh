@@ -10,6 +10,23 @@ port_pids() {
   lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true
 }
 
+cleanup_port_state() {
+  local pids
+  pids="$(lsof -tiTCP:"$PORT" 2>/dev/null || true)"
+  while IFS= read -r pid; do
+    [[ -z "$pid" ]] && continue
+    kill -TERM "$pid" 2>/dev/null || true
+  done <<< "$pids"
+
+  sleep 1
+
+  pids="$(lsof -tiTCP:"$PORT" 2>/dev/null || true)"
+  while IFS= read -r pid; do
+    [[ -z "$pid" ]] && continue
+    kill -KILL "$pid" 2>/dev/null || true
+  done <<< "$pids"
+}
+
 wait_for_port_release() {
   local attempts="${1:-20}"
   local delay_seconds="${2:-0.5}"
@@ -33,25 +50,10 @@ ensure_port_available() {
     return
   fi
 
-  echo "Port $PORT is already in use."
+  echo "Port $PORT is already in use. Stopping existing listener..."
   while IFS= read -r pid; do
     [[ -z "$pid" ]] && continue
     echo "  PID $pid: $(ps -p "$pid" -o command= 2>/dev/null || echo "unknown process")"
-  done <<< "$pids"
-
-  if [[ ! -t 0 ]]; then
-    echo "Cannot prompt in non-interactive mode. Stop the existing process or free port $PORT first."
-    exit 1
-  fi
-
-  read -r -p "Kill the process(es) above and continue? [y/N] " reply
-  if [[ ! "$reply" =~ ^[Yy]$ ]]; then
-    echo "Startup cancelled."
-    exit 1
-  fi
-
-  while IFS= read -r pid; do
-    [[ -z "$pid" ]] && continue
     kill -TERM "$pid" 2>/dev/null || true
   done <<< "$pids"
 
@@ -81,11 +83,40 @@ if [[ ! -d .venv ]]; then
   python3 -m venv .venv
 fi
 
-if [[ ! -f .venv/.octts_bootstrapped ]]; then
-  .venv/bin/python -m pip install --upgrade pip >/dev/null
-  .venv/bin/pip install -e '.[dev]'
-  touch .venv/.octts_bootstrapped
-fi
+deps_fingerprint() {
+  shasum pyproject.toml | awk '{print $1}'
+}
+
+ensure_dependencies() {
+  local marker_file=".venv/.octts_bootstrapped"
+  local fingerprint_file=".venv/.octts_deps_fingerprint"
+  local current_fingerprint=""
+  local installed_fingerprint=""
+  local needs_install=0
+
+  current_fingerprint="$(deps_fingerprint)"
+  if [[ -f "$fingerprint_file" ]]; then
+    installed_fingerprint="$(<"$fingerprint_file")"
+  fi
+
+  if [[ ! -f "$marker_file" ]]; then
+    needs_install=1
+  elif [[ "$current_fingerprint" != "$installed_fingerprint" ]]; then
+    needs_install=1
+  elif ! .venv/bin/python -c "import fastapi, sqlalchemy" >/dev/null 2>&1; then
+    needs_install=1
+  fi
+
+  if [[ "$needs_install" -eq 1 ]]; then
+    echo "Installing or refreshing Python dependencies..."
+    .venv/bin/python -m pip install --upgrade pip >/dev/null
+    .venv/bin/pip install -e '.[dev]'
+    printf '%s\n' "$current_fingerprint" > "$fingerprint_file"
+    touch "$marker_file"
+  fi
+}
+
+ensure_dependencies
 
 echo
 echo "OCTTS starting on http://127.0.0.1:$PORT"
@@ -94,5 +125,6 @@ echo "Stock detail example: http://127.0.0.1:$PORT/stocks/600000.SH"
 echo
 
 ensure_port_available
+cleanup_port_state
 
-exec .venv/bin/uvicorn octts.api:app --host 0.0.0.0 --port "$PORT" --reload
+exec .venv/bin/uvicorn octts.api:app --host 0.0.0.0 --port "$PORT"

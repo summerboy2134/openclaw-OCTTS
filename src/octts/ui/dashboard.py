@@ -70,6 +70,30 @@ def _dashboard_content(*, interactive: bool) -> str:
           <section class="summary-grid" id="summaryGrid"></section>
           <section class="panel">
             <div class="row">
+              <div>
+                <div class="section-title">智能选股中心</div>
+                <div class="subtle">智能选股面向沪深 A 股，先跑技术筛选与新闻聚类，再对候选股做多维 AI 分析并生成报告</div>
+              </div>
+              <div class="button-row">
+                <button id="runIntelligentScreeningButton" class="primary-button" type="button">运行智能选股</button>
+                <a class="ghost-link" href="/intelligent-screening">展开完整智能选股页</a>
+              </div>
+            </div>
+            <div id="intelligentScreeningStatus" class="subtle" style="margin-top:12px;"></div>
+            <div id="intelligentScreeningSummary" class="summary-grid" style="margin-top:16px;"></div>
+            <div class="metrics-grid" style="margin-top:16px;">
+              <div class="metric">
+                <div class="label">AI 推荐列表</div>
+                <div id="intelligentRecommendations"></div>
+              </div>
+              <div class="metric">
+                <div class="label">智能报告摘要</div>
+                <div id="intelligentReportSummary" class="value"></div>
+              </div>
+            </div>
+          </section>
+          <section class="panel">
+            <div class="row">
               <div class="section-title">策略回测</div>
               <div class="subtle">最简版回测面板，直接调用 review 回测链路并展示结果。</div>
             </div>
@@ -249,6 +273,10 @@ def _detail_content(*, back_href: str, interactive: bool) -> str:
               </div>
             </section>
             <section class="metrics-grid" id="detailMetrics"></section>
+            <section class="panel">
+              <div class="section-title">智能选股建议</div>
+              <div id="detailIntelligentInsight" class="stack"></div>
+            </section>
             <section class="panel">
               <div class="section-title">History Replay</div>
               <div id="detailHistory" class="timeline"></div>
@@ -466,6 +494,24 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
       background: rgba(127, 29, 29, 0.18);
       color: #fecaca;
       cursor: pointer;
+    }}
+
+    .recommendation-list {{
+      display: grid;
+      gap: 10px;
+    }}
+
+    .recommendation-item {{
+      display: grid;
+      gap: 6px;
+      padding: 12px 14px;
+      border-radius: 14px;
+      background: rgba(15, 23, 42, 0.62);
+      border: 1px solid rgba(148, 163, 184, 0.12);
+    }}
+
+    .recommendation-item:hover {{
+      border-color: rgba(96, 165, 250, 0.3);
     }}
 
     .hero-card {{
@@ -1031,6 +1077,11 @@ def _overview_script(
     const defaultStockPoolStatus = document.getElementById("defaultStockPoolStatus");
     const clearAllDataButton = document.getElementById("clearAllDataButton");
     const dataControlStatus = document.getElementById("dataControlStatus");
+    const runIntelligentScreeningButton = document.getElementById("runIntelligentScreeningButton");
+    const intelligentScreeningStatus = document.getElementById("intelligentScreeningStatus");
+    const intelligentScreeningSummary = document.getElementById("intelligentScreeningSummary");
+    const intelligentRecommendations = document.getElementById("intelligentRecommendations");
+    const intelligentReportSummary = document.getElementById("intelligentReportSummary");
     const backtestForm = document.getElementById("backtestForm");
     const backtestStockPoolInput = document.getElementById("backtestStockPoolInput");
     const backtestStartDateInput = document.getElementById("backtestStartDateInput");
@@ -1057,9 +1108,12 @@ def _overview_script(
     function renderSummary(payload) {
       const items = payload.cards || [];
       const statuses = payload.validation_summary || {};
+      const intelligent = payload.intelligent_screening || {};
       summaryGrid.innerHTML = [
         renderSummaryCard("跟踪股票数", items.length),
         renderSummaryCard("默认股票池", (payload.default_stock_pool || []).length),
+        renderSummaryCard("智能推荐数", intelligent.final_recommendations || 0),
+        renderSummaryCard("热点主题数", intelligent.news_cluster_count || 0),
         renderSummaryCard("止盈触发", statuses.take_profit_hit || 0),
         renderSummaryCard("止损触发", statuses.stop_loss_hit || 0),
         renderSummaryCard("等待条件成熟", statuses.watching_setup || 0),
@@ -1136,6 +1190,13 @@ def _overview_script(
             .filter(Boolean)
         )
       );
+    }
+
+    function formatConfidencePercent(value) {
+      const number = Number(value);
+      if (!Number.isFinite(number)) return "—";
+      const normalized = number > 1 ? number : number * 100;
+      return `${normalized.toFixed(1)}%`;
     }
 
     function readBacktestTemplates() {
@@ -1246,6 +1307,43 @@ def _overview_script(
           <button class="chip-action" type="button" data-remove-ts-code="${escapeHtml(tsCode)}">移除</button>
         </div>
       `).join("")}</div>`;
+    }
+
+    function renderIntelligentRecommendations(items) {
+      if (!items || !items.length) {
+        return '<div class="empty">还没有智能选股结果。点击上方按钮后，这里会显示推荐股票和智能摘要。</div>';
+      }
+      return `<div class="recommendation-list">${items.map(item => {
+        const sourceTag = item.source_tag || "今日Top3";
+        const repeatTag = item.is_repeat_pick ? ' · 连续入选' : '';
+        return `
+        <a class="recommendation-item" href="${buildStockDetailHref(item.ts_code)}">
+          <div class="row">
+            <strong>${escapeHtml(item.ts_code)}${item.name ? ` · ${escapeHtml(item.name)}` : ""}</strong>
+            <span class="badge hold">${escapeHtml(Number(item.recommendation_score || item.score || 0).toFixed(1))} 分</span>
+          </div>
+          <div class="subtle">${escapeHtml(sourceTag + repeatTag)} · 技术信号：${escapeHtml(item.technical_signal || "信号待确认")} · 置信度 ${escapeHtml(formatConfidencePercent(item.confidence))}</div>
+          <div>${escapeHtml(item.recommendation || "建议继续观察")}</div>
+          <div class="subtle">${escapeHtml(item.summary || "")}</div>
+        </a>`;
+      }).join("")}</div>`;
+    }
+
+    function renderIntelligentOverview(payload) {
+      if (!intelligentScreeningSummary || !intelligentRecommendations || !intelligentReportSummary) return;
+      const intelligent = payload || {};
+      intelligentScreeningSummary.innerHTML = [
+        renderSummaryCard("执行策略数", intelligent.strategy_count || 0, "单只股票的策略数表示它被多少个筛选策略同时命中"),
+        renderSummaryCard("候选股票数", intelligent.total_stocks || 0),
+        renderSummaryCard("今日 Top3", intelligent.today_top_count || 0),
+        renderSummaryCard("昨日延续", intelligent.continuation_count || 0)
+      ].join("");
+      intelligentRecommendations.innerHTML = renderIntelligentRecommendations(intelligent.top_recommendations || []);
+      intelligentReportSummary.innerHTML = `
+        <div><strong>${escapeHtml(intelligent.report_title || "智能选股报告")}</strong></div>
+        <div class="subtle" style="margin-top:8px;">${escapeHtml(intelligent.generated_at ? `最近刷新：${intelligent.generated_at}` : "暂无最近运行时间")}</div>
+        <div style="margin-top:10px;">${escapeHtml(intelligent.report_summary || "运行一次智能选股后，这里会显示最新摘要。")}</div>
+      `;
     }
 
     function renderCard(item) {
@@ -1504,6 +1602,29 @@ def _overview_script(
       `;
     }
 
+    async function triggerIntelligentScreening() {
+      runIntelligentScreeningButton.disabled = true;
+      intelligentScreeningStatus.textContent = "正在启动智能选股...";
+      try {
+        const response = await fetch("/screen/intelligent/jobs", {
+          method: "POST"
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.detail || "启动智能选股失败");
+        }
+        intelligentScreeningStatus.textContent = "智能选股已启动，正在跳转...";
+        const jobId = payload.job_id || payload.job?.job_id;
+        if (jobId) {
+          window.sessionStorage.setItem("octts:intelligent-screening:pending-job-id", jobId);
+        }
+        window.location.href = jobId ? `/intelligent-screening?job_id=${encodeURIComponent(jobId)}` : "/intelligent-screening";
+      } catch (error) {
+        intelligentScreeningStatus.textContent = `启动失败：${error.message}`;
+        runIntelligentScreeningButton.disabled = false;
+      }
+    }
+
     async function loadDashboard() {
       const payload = INITIAL_DASHBOARD_PAYLOAD || await (async () => {
         const response = await fetch("/dashboard/data");
@@ -1511,6 +1632,7 @@ def _overview_script(
       })();
       generatedAt.textContent = payload.generated_at ? `最近更新：${payload.generated_at}` : "暂无数据，请先触发一次分析。";
       renderSummary(payload);
+      renderIntelligentOverview(payload.intelligent_screening || {});
       if (IS_INTERACTIVE && defaultStockPool) {
         renderDefaultStockPool(payload.default_stock_pool || []);
       }
@@ -1717,6 +1839,9 @@ def _overview_script(
       renderBacktestTemplateOptions();
       manualAnalyzeForm.addEventListener("submit", triggerManualAnalysis);
       backtestForm.addEventListener("submit", runBacktest);
+      runIntelligentScreeningButton.addEventListener("click", () => {
+        triggerIntelligentScreening();
+      });
       saveBacktestTemplateButton.addEventListener("click", () => {
         saveCurrentBacktestTemplate();
       });
@@ -1769,6 +1894,7 @@ def _detail_script(
     const validationSummary = document.getElementById("validationSummary");
     const detailMetrics = document.getElementById("detailMetrics");
     const detailHistory = document.getElementById("detailHistory");
+    const detailIntelligentInsight = document.getElementById("detailIntelligentInsight");
     const detailEvidence = document.getElementById("detailEvidence");
     const detailRisks = document.getElementById("detailRisks");
     const detailOpenclawStatus = document.getElementById("detailOpenclawStatus");
@@ -1777,6 +1903,7 @@ def _detail_script(
     const reanalyzeSymbolButton = document.getElementById("reanalyzeSymbolButton");
     const detailActionStatus = document.getElementById("detailActionStatus");
     let currentPositionStatus = "watching";
+    let currentStockPool = [];
 
     function renderHero(symbol) {{
       return `
@@ -1813,6 +1940,38 @@ def _detail_script(
         renderSummaryCard("持仓跟踪", summary.tracking_position || 0),
         renderSummaryCard("已进入区间", summary.entered || 0)
       ].join("");
+    }}
+
+    function renderIntelligentInsight(insight) {{
+      if (!insight || (!insight.in_today_top3 && !insight.in_yesterday_review && !insight.overall_assessment)) {{
+        return '<div class="empty">暂无当日智能选股建议，当前页以历史分析为主。</div>';
+      }}
+      const action = insight.action_plan || {{}};
+      const highlights = (insight.core_highlights || []).map(item => `<li>${{escapeHtml(item)}} </li>`).join("") || '<li>暂无</li>';
+      const risks = (insight.risk_warnings || []).map(item => `<li>${{escapeHtml(item)}} </li>`).join("") || '<li>暂无</li>';
+      const versus = insight.yesterday_vs_today || {{}};
+      return `
+        <div class="stack">
+          <div class="detail-grid compact">
+            <div class="detail-panel"><div class="detail-label">来源</div><div class="detail-value">${{escapeHtml(insight.source_tag || '—')}}</div></div>
+            <div class="detail-panel"><div class="detail-label">推荐分 / 综合分</div><div class="detail-value">${{formatValue(insight.recommendation_score)}} / ${{formatValue(insight.overall_score)}}<div class="mini-label">推荐分=执行优先级，综合分=AI基础判断</div></div></div>
+            <div class="detail-panel"><div class="detail-label">置信度</div><div class="detail-value">${{formatValue(insight.confidence)}}</div></div>
+          </div>
+          <div class="detail-grid compact">
+            <div class="detail-panel"><div class="detail-label">买入区间</div><div class="detail-value">${{escapeHtml(action.entry_zone || '待观察')}}</div></div>
+            <div class="detail-panel"><div class="detail-label">止损</div><div class="detail-value">${{escapeHtml(action.stop_loss || '待观察')}}</div></div>
+            <div class="detail-panel"><div class="detail-label">止盈</div><div class="detail-value">${{escapeHtml(action.take_profit || '待观察')}}</div></div>
+            <div class="detail-panel"><div class="detail-label">短期节奏</div><div class="detail-value">${{escapeHtml(action.holding_horizon || '1-5个交易日')}}</div></div>
+            <div class="detail-panel"><div class="detail-label">失效条件</div><div class="detail-value">${{escapeHtml(action.invalid_condition || '待观察')}}</div></div>
+            <div class="detail-panel"><div class="detail-label">今日结论 / 跟踪状态</div><div class="detail-value">${{escapeHtml(versus.today_verdict || '暂无')}} / ${{escapeHtml(versus.review_status || '暂无')}}</div></div>
+          </div>
+          <div><strong>核心亮点</strong><ul>${{highlights}}</ul></div>
+          <div><strong>风险提示</strong><ul>${{risks}}</ul></div>
+          <div><strong>技术信号</strong><div class="subtle">${{escapeHtml(insight.technical_signal || '暂无')}}</div></div>
+          <div><strong>综合评价</strong><div class="subtle">${{escapeHtml(insight.overall_assessment || insight.recommendation_text || '暂无')}}</div></div>
+          <div><strong>昨日 vs 今日</strong><div class="subtle">昨日推荐分 ${{formatValue(versus.previous_recommendation_score)}}，昨日综合分 ${{formatValue(versus.previous_overall_score)}}，结论：${{escapeHtml(versus.today_verdict || versus.review_status || '暂无')}}</div></div>
+        </div>
+      `;
     }}
 
     function renderMetrics(symbol) {{
@@ -1857,9 +2016,12 @@ def _detail_script(
           throw new Error(payload.detail || "保存失败");
         }}
         currentPositionStatus = payload.position_status || nextStatus;
+        currentStockPool = payload.stock_pool || currentStockPool;
         positionStatusSelect.value = currentPositionStatus;
         if (detailActionStatus) {{
-          detailActionStatus.textContent = `持仓状态已保存为${{currentPositionStatus === "holding" ? "已持有" : "未持有"}}。`;
+          detailActionStatus.textContent = currentPositionStatus === "holding"
+            ? "已标记为持有，并自动加入默认股票池。"
+            : `持仓状态已保存为${{currentPositionStatus === "holding" ? "已持有" : "未持有"}}。`;
         }}
       }} catch (error) {{
         positionStatusSelect.value = previousStatus;
@@ -1931,10 +2093,14 @@ def _detail_script(
       renderValidationSummary(payload.validation_summary || {{}});
       renderMetrics(symbol);
       detailHistory.innerHTML = renderHistoryTimeline(symbol.history);
+      if (detailIntelligentInsight) {{
+        detailIntelligentInsight.innerHTML = renderIntelligentInsight(payload.intelligent_screening_insight || {{}});
+      }}
       detailEvidence.innerHTML = renderList(symbol.decision.evidence || []);
       detailRisks.innerHTML = renderList(symbol.memory.key_risks || []);
       detailOpenclawStatus.innerHTML = renderAutomationStatus(payload.openclaw_status);
       currentPositionStatus = payload.position_status || "watching";
+      currentStockPool = payload.default_stock_pool || [];
       if (positionStatusSelect) {{
         positionStatusSelect.value = currentPositionStatus;
       }}

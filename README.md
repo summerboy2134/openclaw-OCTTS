@@ -59,6 +59,16 @@ OCTTS_AUTOMATION_MORNING_TIME=09:35
 OCTTS_AUTOMATION_AFTERNOON_TIME=14:35
 OCTTS_AUTOMATION_REVIEW_TIME=20:30
 OCTTS_AUTOMATION_NOTIFY=true
+
+# 选股系统配置
+OCTTS_SCREENING_ENABLED=true
+OCTTS_SCREENING_TIME=15:35
+OCTTS_SCREENING_STRATEGIES=oversold_bounce,volume_breakout,golden_cross
+OCTTS_SCREENING_NOTIFY=true
+
+# 定时邮件配置
+OCTTS_EMAIL_ENABLED=true
+OCTTS_EMAIL_SEND_TIME=20:45
 ```
 
 `DEEPSEEK_API_KEY` / `DEEPSEEK_MODEL` / `DEEPSEEK_BASE_URL` are still accepted as legacy aliases, but new deployments should prefer `LLM_*`.
@@ -173,6 +183,14 @@ Example values:
 - `morning,afternoon,review`
 
 If you already use OpenClaw or system cron, you can disable the built-in scheduler and keep external orchestration.
+
+Time config responsibilities:
+
+- `OCTTS_SCREENING_TIME`: weekday run time for automatic intelligent screening only.
+- `OCTTS_AUTOMATION_REVIEW_TIME`: weekday run time for the regular review analysis phase.
+- `OCTTS_EMAIL_SEND_TIME`: weekday run time for scheduled report email delivery.
+
+Automatic intelligent screening continues to use `OCTTS_SCREENING_TIME`; it does not reuse `OCTTS_AUTOMATION_REVIEW_TIME`.
 
 ## OpenClaw
 

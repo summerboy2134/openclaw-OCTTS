@@ -8,6 +8,94 @@ from typing import Optional
 from octts.schemas.report import AnalysisPhase, HistoricalAnalysisRecord, MemorySummary, PositionStatus, PriceSnapshot
 
 
+def build_intelligent_screening_report_prompt(
+    *,
+    market_data: dict[str, object],
+    news_clusters: list[dict[str, object]],
+    screening_context: dict[str, object],
+) -> tuple[str, str]:
+    system_prompt = (
+        "你是一名严格遵守排序约束的 A 股智能选股复盘分析助手。"
+        "你的任务是解释系统已经给出的排序与分数，不允许改写排序，不允许擅自调整推荐先后。"
+        "你只能输出一个合法 JSON 对象，不要输出 Markdown，不要输出代码块，不要解释。"
+        "如果证据不足，使用保守描述、null、空数组或观察区间，不要编造精准价位。"
+    )
+
+    payload = {
+        "task": "基于智能选股上下文生成结构化报告",
+        "market_data": market_data,
+        "news_clusters": news_clusters,
+        "screening_context": screening_context,
+        "field_semantics": {
+            "overall_score": "多维综合分",
+            "recommendation_score": "最终推荐排序分，解释排序时优先参考该字段",
+            "priority_score": "与综合分兼容的展示优先级字段",
+            "overall_confidence": "分析置信度",
+            "display_confidence": "前端展示置信度",
+            "strategy_count": "命中策略数量",
+            "news_mentioned": "是否命中新闻催化",
+            "score_change": "与上一交易日推荐分变化",
+            "source_tag": "来源标签，如今日Top3/昨日延续/今日候选",
+        },
+        "instructions": [
+            "不能改写系统排序，你的任务是解释为什么排这样。",
+            "推荐分高但综合分一般时，要优先从新闻催化、策略共振、短线交易性解释。",
+            "综合分高但推荐分不高时，要解释质量好但交易性一般。",
+            "短线建议必须基于输入中的 close、entry_price、技术描述、支撑阻力或总结信息；若证据不足，只能给观察区间。",
+            "对昨日 Top3 今日复评，需要说明延续/转弱/失效，并尽量输出失误候选与可能缺失的因子。",
+        ],
+        "output_schema": {
+            "focus_stocks": [
+                {
+                    "ts_code": "string",
+                    "name": "string",
+                    "core_highlights": ["string"],
+                    "risk_warnings": ["string"],
+                    "overall_assessment": "string",
+                    "action_plan": {
+                        "action_bias": "买入|观察|减仓|不参与",
+                        "entry_zone": "string|null",
+                        "take_profit": "string|null",
+                        "stop_loss": "string|null",
+                        "holding_horizon": "string|null",
+                        "invalid_condition": "string|null",
+                    },
+                }
+            ],
+            "yesterday_reviews": [
+                {
+                    "ts_code": "string",
+                    "name": "string",
+                    "yesterday_conclusion": "string",
+                    "today_verdict": "延续|转弱|失效|观察",
+                    "status": "延续|转弱|失效|观察",
+                    "analysis": "string",
+                    "miss_reason_candidates": ["string"],
+                    "missing_factor_candidates": ["string"],
+                }
+            ],
+            "comparison": {
+                "basic_rank": ["ts_code"],
+                "technical_rank": ["ts_code"],
+                "risk_rank": ["ts_code"],
+                "trading_rank": ["ts_code"],
+                "best_short_term": "ts_code",
+                "most_robust": "ts_code",
+                "highest_risk": "ts_code",
+            },
+            "overall_action": {
+                "headline": "string",
+                "market_view": "string",
+                "risk_summary": "string",
+                "action_items": ["string"],
+            },
+        },
+    }
+
+    return system_prompt, json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+
 def build_report_prompt(
     *,
     phase: AnalysisPhase,
@@ -26,7 +114,7 @@ def build_report_prompt(
         "不要输出 Markdown，不要输出代码块，不要输出解释文字。"
         "所有 key 必须使用双引号。"
         "如果缺少信息，请使用 null、空数组或保守结论，不要省略必填字段。"
-        "输出要精炼，优先保留关键信号、关键价位和主要依据。"
+        "输出要清晰完整，在保证结构化的前提下适当展开关键信号、关键价位和主要依据。"
     )
 
     previous_payload = previous_memory.model_dump(mode="json") if previous_memory else {
@@ -160,14 +248,14 @@ def build_report_prompt(
             "如果 symbol_context.position_status 为 watching，优先在 buy 与 avoid 中做决策；若暂不入场但存在明确触发位，可使用 avoid 并给出 entry_zone 作为观察区间。",
             "如果 symbol_context.is_default_pool_symbol 为 true 且 position_status 为空，也要尽量给出可执行参考；只有在边界不清晰时才使用 avoid。",
             "给出可执行但克制的操作建议，不要承诺收益。",
-            "trend_judgement 控制在 50 字内。",
-            "trend_breakdown 中每个 reason 控制在 70 字内。",
-            "operation_advice 控制在 60 字内。",
-            "risk_warning 最多 3 条，每条控制在 45 字内。",
-            "observation_points 最多 3 条，每条控制在 45 字内。",
-            "decision.rationale 控制在 80 字内，decision.evidence 最多 3 条。",
-            "prediction_windows 每条 rationale 控制在 60 字内。",
-            "summary_markdown 控制在 200 字内，memory.summary 控制在 120 字内。",
+            "trend_judgement 控制在 80 字内。",
+            "trend_breakdown 中每个 reason 控制在 110 字内。",
+            "operation_advice 控制在 90 字内。",
+            "risk_warning 最多 4 条，每条控制在 60 字内。",
+            "observation_points 最多 4 条，每条控制在 60 字内。",
+            "decision.rationale 控制在 120 字内，decision.evidence 最多 4 条。",
+            "prediction_windows 每条 rationale 控制在 90 字内。",
+            "summary_markdown 控制在 320 字内，memory.summary 控制在 180 字内。",
         ],
     }
 

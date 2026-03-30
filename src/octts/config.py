@@ -54,7 +54,7 @@ class Settings(BaseSettings):
 
     request_timeout_seconds: int = Field(default=60, alias="OCTTS_REQUEST_TIMEOUT_SECONDS")
     llm_temperature: float = Field(default=0.2, alias="OCTTS_LLM_TEMPERATURE")
-    llm_max_tokens: int = Field(default=3000, alias="OCTTS_LLM_MAX_TOKENS")
+    llm_max_tokens: int = Field(default=4500, alias="OCTTS_LLM_MAX_TOKENS")
     llm_json_mode: bool = Field(default=True, alias="OCTTS_LLM_JSON_MODE")
     llm_retry_attempts: int = Field(default=3, alias="OCTTS_LLM_RETRY_ATTEMPTS")
     automation_enabled: bool = Field(default=False, alias="OCTTS_AUTOMATION_ENABLED")
@@ -74,6 +74,25 @@ class Settings(BaseSettings):
     smtp_use_tls: bool = Field(default=True, alias="OCTTS_SMTP_USE_TLS")
     email_subject_prefix: str = Field(default="OCTTS", alias="OCTTS_EMAIL_SUBJECT_PREFIX")
 
+    # 选股相关配置
+    screening_enabled: bool = Field(default=False, alias="OCTTS_SCREENING_ENABLED")
+    screening_time: str = Field(default="15:35", alias="OCTTS_SCREENING_TIME")
+    screening_strategies_raw: str = Field(default="", alias="OCTTS_SCREENING_STRATEGIES")
+    screening_notify: bool = Field(default=True, alias="OCTTS_SCREENING_NOTIFY")
+    screening_top_n: int = Field(default=20, alias="OCTTS_SCREENING_TOP_N")
+
+    # 数据库配置
+    database_url: str = Field(
+        default="sqlite:///octts_screening.db",
+        alias="OCTTS_DATABASE_URL",
+        description="数据库连接字符串，支持SQLite/PostgreSQL/MySQL"
+    )
+    use_database: bool = Field(
+        default=True,  # 默认使用SQLite数据库
+        alias="OCTTS_USE_DATABASE",
+        description="是否使用数据库存储（默认使用SQLite，零配置）"
+    )
+
     @property
     def stock_pool(self) -> list[str]:
         return [item.strip() for item in self.stock_pool_raw.split(",") if item.strip()]
@@ -88,6 +107,13 @@ class Settings(BaseSettings):
     @property
     def email_recipients(self) -> list[str]:
         return [item.strip() for item in self.email_recipients_raw.split(",") if item.strip()]
+
+    @property
+    def screening_strategies(self) -> list[str]:
+        """获取要运行的选股策略列表"""
+        if not self.screening_strategies_raw:
+            return []  # 空列表表示运行所有策略
+        return [item.strip() for item in self.screening_strategies_raw.split(",") if item.strip()]
 
     @property
     def deepseek_api_key(self) -> Optional[str]:

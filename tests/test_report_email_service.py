@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+from typing import Dict, Optional
 from zipfile import ZipFile
 
 from octts.config import Settings
@@ -74,14 +76,15 @@ def _build_record(ts_code: str, generated_at: datetime) -> HistoricalAnalysisRec
 
 class CapturingEmailClient:
     def __init__(self) -> None:
-        self.payload: dict[str, object] | None = None
+        self.payload: Optional[Dict[str, object]] = None
 
-    def send_message(self, *, subject, body, recipients, attachments) -> None:
+    def send_message(self, *, subject, body, recipients, attachments=None, html_content=None) -> None:
         self.payload = {
             "subject": subject,
             "body": body,
             "recipients": recipients,
             "attachments": attachments,
+            "html_content": html_content,
         }
 
 
@@ -142,3 +145,50 @@ def test_export_latest_report_zip_filters_requested_stock_pool(tmp_path) -> None
     with ZipFile(BytesIO(archive_bytes)) as archive:
         names = sorted(archive.namelist())
     assert names == ["index.html", "stocks/000001.SZ.html"]
+
+
+def test_send_intelligent_screening_email_includes_offline_zip(tmp_path) -> None:
+    settings = Settings(
+        OCTTS_EMAIL_RECIPIENTS="test@example.com",
+        OCTTS_MEMORY_BACKEND="file",
+        OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+        OCTTS_HISTORY_DIR_PATH=str(tmp_path / "history"),
+    )
+    history_store = FileHistoryStore(str(tmp_path / "history"))
+    position_store = FilePositionStore(str(tmp_path / "positions.json"))
+    now = datetime(2026, 3, 18, 12, 0, tzinfo=UTC)
+    history_store.append(_build_record("600000.SH", now))
+    snapshot_dir = tmp_path / "history" / "intelligent_screening"
+    snapshot_dir.mkdir(parents=True)
+    (snapshot_dir / "latest.json").write_text(
+        '{"generated_at":"2026-03-18T12:00:00+00:00","screening_results":{"frontlist_count":1},"recommendation_pool":{"frontlist":[],"shadow":[],"shadow_symbols":[]},"ai_analyses":{"600000.SH":{"name":"Name-600000.SH","score":88,"overall_confidence":0.8,"recommendation":"继续观察","summary":"摘要","technical_signal":"多头"}},"news_clusters":[],"intelligent_report":{"title":"智能报告","summary":"摘要"}}',
+        encoding="utf-8",
+    )
+    exporter = ReportExporter(settings=settings, history_store=history_store, position_store=position_store)
+    email_client = CapturingEmailClient()
+    service = ReportEmailService(
+        settings=settings,
+        history_store=history_store,
+        report_exporter=exporter,
+        email_client=email_client,
+    )
+
+    asyncio.run(
+        service.send_intelligent_screening_email(
+            subject="智能选股",
+            html_content="<html><body>summary</body></html>",
+            body="plain body",
+        )
+    )
+
+    assert email_client.payload is not None
+    assert email_client.payload["html_content"] == "<html><body>summary</body></html>"
+    attachment = email_client.payload["attachments"][0]
+    assert attachment[0].endswith(".zip")
+    with ZipFile(BytesIO(attachment[1])) as archive:
+        names = sorted(archive.namelist())
+        index_html = archive.read("index.html").decode("utf-8")
+    assert names == ["dashboard.html", "index.html", "stocks/600000.SH.html"]
+    assert "./dashboard.html" in index_html
+    assert 'href="/dashboard"' not in index_html
+    assert "/screen/intelligent/jobs" not in index_html

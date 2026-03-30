@@ -1,13 +1,24 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-from typing import Any, Optional
+import json
+import logging
+import time
+from datetime import datetime, timedelta, time as dt_time
+from pathlib import Path
+from typing import Any, Optional, List, Dict
 
 from octts.config import Settings
 from octts.schemas.backtest import DailyBar
 from octts.schemas.report import AnalysisPhase, PriceSnapshot
 
 MAX_RECENT_TRADE_DATE_FALLBACKS = 3
+PRO_BAR_EMPTY_RESULT_MESSAGES = (
+    "single positional indexer is out-of-bounds",
+    "out-of-bounds",
+)
+logger = logging.getLogger(__name__)
+SCREENING_SNAPSHOT_REQUIRED_BASIC_FIELDS = {"ts_code", "close", "total_mv", "turnover_rate", "volume_ratio"}
+SCREENING_SNAPSHOT_MIN_BASIC_FIELDS = 2
 
 
 class TushareClient:
@@ -26,10 +37,19 @@ class TushareClient:
         import tushare.pro.client as _client
         _client.DataApi._DataApi__http_url = "http://tushare.xyz"
 
-        ts.set_token(settings.tushare_token)
+        self._safe_set_token(ts, settings.tushare_token)
         self._ts = ts
         self._pro = ts.pro_api(settings.tushare_token)
         self._settings = settings
+
+    def _safe_set_token(self, ts_module, token: str) -> None:
+        try:
+            ts_module.set_token(token)
+        except Exception as exc:
+            # Some wrappers persist the token under the user home directory. When that
+            # write is blocked, authenticated requests can still succeed via pro_api.
+            if "Operation not permitted" not in str(exc) and "Permission denied" not in str(exc):
+                raise
 
     def fetch_snapshot(
         self,
@@ -73,24 +93,72 @@ class TushareClient:
         return sorted(str(item) for item in df["cal_date"].tolist())
 
     def fetch_daily_bars(self, *, ts_code: str, start_date: str, end_date: str) -> list[DailyBar]:
+        rows = self.fetch_daily_batch(ts_codes=[ts_code], start_date=start_date, end_date=end_date).get(ts_code, [])
+        records = [DailyBar.model_validate(_serialize_daily_bar(row)) for row in rows]
+        records.sort(key=lambda item: item.trade_date)
+        return records
+
+    def fetch_daily_data(self, *, ts_code: str, start_date: str, end_date: str) -> List[Dict[str, Any]]:
+        """Return daily bars as dictionaries for legacy callers."""
+        return [bar.model_dump(mode="json") for bar in self.fetch_daily_bars(ts_code=ts_code, start_date=start_date, end_date=end_date)]
+
+    def fetch_stock_info(self, ts_code: str) -> Dict[str, Any]:
+        """Fetch basic stock metadata."""
         try:
-            df = self._call_pro_bar(
+            df = self._pro.stock_basic(
                 ts_code=ts_code,
-                asset="E",
-                start_date=start_date,
-                end_date=end_date,
-                freq="D",
-                adj="qfq",
+                fields="ts_code,symbol,name,area,industry,market,list_date",
+            )
+        except Exception:
+            return {"ts_code": ts_code}
+
+        if df is None or df.empty:
+            return {"ts_code": ts_code}
+        return df.iloc[0].to_dict()
+
+    def fetch_financial_indicators(self, ts_code: str) -> List[Dict[str, Any]]:
+        """Fetch recent financial indicators for AI analysis."""
+        try:
+            df = self._pro.fina_indicator(
+                ts_code=ts_code,
+                fields="ts_code,end_date,eps,dt_eps,roe,roe_dt,netprofit_margin,grossprofit_margin,assets_turn,op_income_yoy,netprofit_yoy",
             )
         except Exception:
             return []
 
         if df is None or df.empty:
             return []
+        return df.to_dict(orient="records")
 
-        records = [DailyBar.model_validate(_serialize_daily_bar(row)) for row in df.to_dict(orient="records")]
-        records.sort(key=lambda item: item.trade_date)
-        return records
+    def fetch_income_statements(self, ts_code: str) -> List[Dict[str, Any]]:
+        """Fetch recent income statement rows for loss-risk checks."""
+        try:
+            df = self._pro.income(
+                ts_code=ts_code,
+                fields="ts_code,end_date,n_income_attr_p,profit_dedt",
+            )
+        except Exception:
+            return []
+
+        if df is None or df.empty:
+            return []
+        return df.to_dict(orient="records")
+
+    def fetch_moneyflow(self, ts_code: str, *, trade_date: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Fetch recent moneyflow records."""
+        try:
+            if trade_date:
+                start_date = (datetime.strptime(trade_date, "%Y%m%d") - timedelta(days=20)).strftime("%Y%m%d")
+                end_date = trade_date
+                df = self._pro.moneyflow(ts_code=ts_code, start_date=start_date, end_date=end_date)
+            else:
+                df = self._pro.moneyflow(ts_code=ts_code)
+        except Exception:
+            return []
+
+        if df is None or df.empty:
+            return []
+        return df.to_dict(orient="records")
 
     def _build_snapshot(
         self,
@@ -200,21 +268,15 @@ class TushareClient:
         end_date = target_trade_date
         anchor_date = datetime.strptime(end_date, "%Y%m%d")
         start_date = (anchor_date - timedelta(days=max(self._settings.default_lookback_days, 20))).strftime("%Y%m%d")
-        df = self._call_pro_bar(
-            ts_code=ts_code,
-            asset="E",
-            start_date=start_date,
-            end_date=end_date,
-            freq="D",
-            adj="qfq",
-        )
-        record = _pick_trade_date_record(
-            df,
-            target_trade_date=target_trade_date,
-            oldest_allowed_trade_date=oldest_allowed_trade_date,
-        )
-        if record:
-            return record
+        rows = self.fetch_daily_batch(ts_codes=[ts_code], start_date=start_date, end_date=end_date).get(ts_code, [])
+        if rows:
+            record = _pick_trade_date_record(
+                rows,
+                target_trade_date=target_trade_date,
+                oldest_allowed_trade_date=oldest_allowed_trade_date,
+            )
+            if record:
+                return record
 
         raise ValueError(f"No daily market data returned for {ts_code} near {target_trade_date}.")
 
@@ -234,21 +296,6 @@ class TushareClient:
             df = None
 
         if df is None or df.empty:
-            end_dt = datetime.now()
-            start_dt = end_dt - timedelta(days=2)
-            try:
-                df = self._call_pro_bar(
-                    ts_code=ts_code,
-                    asset="E",
-                    start_date=start_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                    end_date=end_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                    freq=self._settings.minute_freq.lower(),
-                    adj="qfq",
-                )
-            except Exception:
-                return []
-
-        if df is None or df.empty:
             return []
 
         records = [row for row in df.to_dict(orient="records")]
@@ -258,7 +305,7 @@ class TushareClient:
     def _fetch_realtime_daily(
         self, *, ts_code: str, trade_date: str, previous_daily: Optional[dict[str, Any]] = None
     ) -> Optional[dict[str, Any]]:
-        fetch_quote = getattr(self._ts, "get_realtime_quotes", None)
+        fetch_quote = getattr(getattr(self, "_ts", None), "get_realtime_quotes", None)
         if fetch_quote is None:
             return None
         try:
@@ -278,22 +325,10 @@ class TushareClient:
         start_date = (anchor_date - timedelta(days=max(self._settings.default_lookback_days, 20) * 2)).strftime(
             "%Y%m%d"
         )
-        try:
-            df = self._call_pro_bar(
-                ts_code=ts_code,
-                asset="E",
-                start_date=start_date,
-                end_date=end_date,
-                freq="D",
-                adj="qfq",
-            )
-        except Exception:
+        rows = self.fetch_daily_batch(ts_codes=[ts_code], start_date=start_date, end_date=end_date).get(ts_code, [])
+        if not rows:
             return []
-
-        if df is None or df.empty:
-            return []
-        df = _sort_frame_by_trade_date_desc(df)
-        return [row for row in df.head(max(self._settings.default_lookback_days, 20)).to_dict(orient="records")]
+        return rows[: max(self._settings.default_lookback_days, 20)]
 
     def _fetch_weekly_summary(self, *, ts_code: str, trade_date: Optional[str]) -> list[dict[str, Any]]:
         end_date = trade_date or datetime.now().strftime("%Y%m%d")
@@ -354,7 +389,314 @@ class TushareClient:
         except TypeError as exc:
             if "unexpected keyword argument 'api'" not in str(exc):
                 raise
-            return self._ts.pro_bar(**kwargs)
+            try:
+                return self._ts.pro_bar(**kwargs)
+            except Exception as fallback_exc:
+                if not self._is_empty_pro_bar_error(fallback_exc):
+                    raise
+                self._log_empty_pro_bar(kwargs)
+                return None
+        except Exception as exc:
+            if not self._is_empty_pro_bar_error(exc):
+                raise
+            self._log_empty_pro_bar(kwargs)
+            return None
+
+    def _is_empty_pro_bar_error(self, exc: Exception) -> bool:
+        message = str(exc)
+        return any(fragment in message for fragment in PRO_BAR_EMPTY_RESULT_MESSAGES)
+
+    def _log_empty_pro_bar(self, kwargs: dict[str, Any]) -> None:
+        logger.debug("pro_bar returned no usable rows: %s", kwargs)
+
+    def get_or_build_screening_snapshot(self, trade_date: str) -> Dict[str, Any]:
+        normalized_trade_date = self._resolve_target_trade_date(trade_date)
+        snapshot = self._read_screening_snapshot(normalized_trade_date)
+        if snapshot is not None:
+            stale_reason = self._screening_snapshot_stale_reason(normalized_trade_date, snapshot)
+            if stale_reason is None:
+                logger.info("Screening snapshot hit: trade_date=%s", normalized_trade_date)
+                return snapshot
+            logger.info(stale_reason)
+
+        logger.info("Screening snapshot build start: trade_date=%s", normalized_trade_date)
+        stocks = self.fetch_stock_list(list_status="L")
+        ts_codes = [stock.get("ts_code") for stock in stocks if stock.get("ts_code")]
+        daily_basic = self.fetch_daily_basic_batch(ts_codes=ts_codes, trade_date=normalized_trade_date)
+        snapshot = {
+            "trade_date": normalized_trade_date,
+            "created_at": datetime.now().isoformat(),
+            "stocks": stocks,
+            "daily_basic": daily_basic,
+            "daily": {},
+        }
+        invalid_reason = self._screening_snapshot_invalid_reason(snapshot)
+        if invalid_reason is None:
+            self._write_screening_snapshot(normalized_trade_date, snapshot)
+        else:
+            logger.warning(
+                "Screening snapshot build incomplete: trade_date=%s, reason=%s, skip_cache_write=true",
+                normalized_trade_date,
+                invalid_reason,
+            )
+        logger.info(
+            "Screening snapshot build complete: trade_date=%s, stocks=%s, basic=%s, cached_daily=%s",
+            normalized_trade_date,
+            len(stocks),
+            len(daily_basic),
+            len(snapshot["daily"]),
+        )
+        return snapshot
+
+    def _screening_snapshot_path(self, trade_date: str) -> Path:
+        return Path(self._settings.history_dir_path) / "screening_cache" / f"{trade_date}.json"
+
+    def _read_screening_snapshot(self, trade_date: str) -> Optional[Dict[str, Any]]:
+        path = self._screening_snapshot_path(trade_date)
+        if not path.exists():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                snapshot = json.load(f)
+        except Exception as exc:
+            logger.warning("Screening snapshot read failed: %s (%s)", trade_date, exc)
+            return None
+        invalid_reason = self._screening_snapshot_invalid_reason(snapshot)
+        if invalid_reason is not None:
+            logger.warning(
+                "Screening snapshot invalid: trade_date=%s, reason=%s, rebuild=true",
+                trade_date,
+                invalid_reason,
+            )
+            return None
+        return snapshot
+
+    def _write_screening_snapshot(self, trade_date: str, snapshot: Dict[str, Any]) -> None:
+        path = self._screening_snapshot_path(trade_date)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False)
+
+    def _screening_snapshot_invalid_reason(self, snapshot: Any) -> Optional[str]:
+        if not isinstance(snapshot, dict):
+            return "snapshot_not_dict"
+
+        stocks = snapshot.get("stocks")
+        if not isinstance(stocks, list) or not stocks:
+            return "stocks_missing"
+
+        stock_codes = [stock.get("ts_code") for stock in stocks if isinstance(stock, dict) and stock.get("ts_code")]
+        if not stock_codes:
+            return "stocks_missing_ts_code"
+
+        daily_basic = snapshot.get("daily_basic")
+        if not isinstance(daily_basic, dict) or not daily_basic:
+            return "daily_basic_missing"
+
+        matched_basics = []
+        for ts_code in stock_codes:
+            basic = daily_basic.get(ts_code)
+            if isinstance(basic, dict):
+                matched_basics.append(basic)
+
+        if not matched_basics:
+            return "daily_basic_no_matching_ts_code"
+
+        has_complete_basic = any(self._screening_snapshot_basic_complete(basic) for basic in matched_basics)
+        if not has_complete_basic:
+            return "daily_basic_missing_required_fields"
+
+        return None
+
+    def _screening_snapshot_basic_complete(self, basic: Dict[str, Any]) -> bool:
+        fields = {key for key, value in basic.items() if value is not None and key in SCREENING_SNAPSHOT_REQUIRED_BASIC_FIELDS}
+        return len(fields) >= SCREENING_SNAPSHOT_MIN_BASIC_FIELDS
+
+    def _screening_snapshot_stale_reason(self, trade_date: str, snapshot: Dict[str, Any]) -> Optional[str]:
+        if trade_date != _today_trade_date():
+            return None
+        now = datetime.now()
+        close_cutoff = datetime.combine(now.date(), dt_time(hour=16))
+        if now < close_cutoff:
+            return None
+        snapshot_time = self._screening_snapshot_created_at(trade_date, snapshot)
+        if snapshot_time is None or snapshot_time >= close_cutoff:
+            return None
+        return (
+            "Screening snapshot stale after close: trade_date=%s, snapshot_time=%s, close_cutoff=%s, rebuild=true"
+            % (trade_date, snapshot_time.isoformat(), close_cutoff.isoformat())
+        )
+
+    def _screening_snapshot_created_at(self, trade_date: str, snapshot: Dict[str, Any]) -> Optional[datetime]:
+        created_at = snapshot.get("created_at")
+        if isinstance(created_at, str):
+            try:
+                return datetime.fromisoformat(created_at)
+            except ValueError:
+                pass
+        path = self._screening_snapshot_path(trade_date)
+        if not path.exists():
+            return None
+        try:
+            return datetime.fromtimestamp(path.stat().st_mtime)
+        except OSError:
+            return None
+
+    # 批量数据获取方法 - 用于股票筛选功能
+    def fetch_stock_list(self, *, list_status: str = "L") -> List[Dict[str, Any]]:
+        """
+        获取股票列表
+
+        Args:
+            list_status: 上市状态 L上市 D退市 P暂停上市
+
+        Returns:
+            股票列表
+        """
+        started_at = time.time()
+        logger.info("Tushare fetch_stock_list start: list_status=%s", list_status)
+        try:
+            df = self._pro.stock_basic(
+                exchange="",
+                list_status=list_status,
+                fields="ts_code,symbol,name,area,industry,market,list_date"
+            )
+            if df is None or df.empty:
+                logger.info("Tushare fetch_stock_list complete: 0 rows in %.2fs", time.time() - started_at)
+                return []
+            rows = df.to_dict(orient="records")
+            logger.info("Tushare fetch_stock_list complete: %s rows in %.2fs", len(rows), time.time() - started_at)
+            return rows
+        except Exception as exc:
+            logger.error("Tushare fetch_stock_list failed after %.2fs: %s", time.time() - started_at, exc)
+            return []
+
+    def fetch_daily_basic_batch(
+        self,
+        *,
+        ts_codes: List[str],
+        trade_date: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        批量获取日线基础指标
+
+        Args:
+            ts_codes: 股票代码列表
+            trade_date: 交易日期
+
+        Returns:
+            {ts_code: daily_basic_data} 的字典
+        """
+        started_at = time.time()
+        logger.info(
+            "Tushare fetch_daily_basic_batch start: %s symbols, trade_date=%s",
+            len(ts_codes),
+            trade_date,
+        )
+        result = {}
+        candidate_trade_dates = self._candidate_trade_dates(target_trade_date=trade_date)
+
+        # 分批处理，每批最多1000个，减少请求次数
+        batch_size = 1000
+        for i in range(0, len(ts_codes), batch_size):
+            batch_codes = ts_codes[i:i + batch_size]
+
+            for candidate_trade_date in candidate_trade_dates:
+                missing_codes = [ts_code for ts_code in batch_codes if ts_code not in result]
+                if not missing_codes:
+                    break
+
+                try:
+                    df = self._pro.daily_basic(
+                        ts_code=",".join(missing_codes),
+                        trade_date=candidate_trade_date,
+                        fields="ts_code,close,turnover_rate,turnover_rate_f,volume_ratio,pe,pe_ttm,pb,total_mv"
+                    )
+                    if df is not None and not df.empty:
+                        for _, row in df.iterrows():
+                            ts_code = row.get("ts_code")
+                            if ts_code and ts_code not in result:
+                                result[ts_code] = row.to_dict()
+                except Exception:
+                    pass
+
+            # 如果批量失败或部分缺失，尝试单个获取
+            missing_codes = [ts_code for ts_code in batch_codes if ts_code not in result]
+            for ts_code in missing_codes:
+                for candidate_trade_date in candidate_trade_dates:
+                    try:
+                        df = self._pro.daily_basic(ts_code=ts_code, trade_date=candidate_trade_date)
+                        if df is not None and not df.empty:
+                            result[ts_code] = df.iloc[0].to_dict()
+                            break
+                    except Exception:
+                        continue
+
+        logger.info(
+            "Tushare fetch_daily_basic_batch complete: %s/%s symbols in %.2fs",
+            len(result),
+            len(ts_codes),
+            time.time() - started_at,
+        )
+        return result
+
+    def fetch_daily_batch(
+        self,
+        *,
+        ts_codes: List[str],
+        start_date: str,
+        end_date: str,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        批量获取日线数据
+
+        Args:
+            ts_codes: 股票代码列表
+            start_date: 开始日期
+            end_date: 结束日期
+
+        Returns:
+            {ts_code: [daily_data]} 的字典
+        """
+        started_at = time.time()
+        logger.info(
+            "Tushare fetch_daily_batch start: %s symbols, %s -> %s",
+            len(ts_codes),
+            start_date,
+            end_date,
+        )
+        result = {ts_code: [] for ts_code in ts_codes}
+
+        # 分批处理
+        batch_size = 50
+        for i in range(0, len(ts_codes), batch_size):
+            batch_codes = ts_codes[i:i + batch_size]
+
+            for ts_code in batch_codes:
+                try:
+                    df = self._call_pro_bar(
+                        ts_code=ts_code,
+                        asset="E",
+                        start_date=start_date,
+                        end_date=end_date,
+                        freq="D",
+                        adj="qfq"
+                    )
+                except Exception:
+                    continue
+                if df is None or df.empty:
+                    continue
+                df = _sort_frame_by_trade_date_desc(df)
+                result[ts_code] = df.to_dict(orient="records")
+
+        non_empty = sum(1 for items in result.values() if items)
+        logger.info(
+            "Tushare fetch_daily_batch complete: %s/%s symbols with data in %.2fs",
+            non_empty,
+            len(ts_codes),
+            time.time() - started_at,
+        )
+        return result
 
 
 def _safe_float(value: Any) -> Optional[float]:
