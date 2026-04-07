@@ -119,14 +119,13 @@ class ReportExporter:
                     intelligent_report=payload.get("intelligent_report") or {},
                     recommendation_summary=payload.get("recommendation_summary") or {},
                     recommendation_methodology=payload.get("recommendation_methodology") or {},
+                    report_context=payload.get("report_context") or {},
                     generated_at=payload.get("generated_at"),
                     dashboard_href="./dashboard.html",
                     backtest_href=None,
                     refresh_href="./index.html",
                     jobs_api_base="",
                     autorun_enabled=False,
-                    stock_detail_href_prefix="./stocks/",
-                    stock_detail_href_suffix=".html",
                 ),
             )
             archive.writestr(
@@ -220,15 +219,16 @@ def _load_intelligent_dashboard_payload(settings: Settings, trade_date: Optional
         try:
             with open(snapshot_path, "r", encoding="utf-8") as file:
                 payload = json.load(file)
-            return {
-                "generated_at": payload.get("generated_at"),
-                "screening_results": payload.get("screening_results", {}),
-                "recommendation_pool": payload.get("recommendation_pool", {}),
-                "ai_analyses": payload.get("ai_analyses", {}),
-                "news_clusters": payload.get("news_clusters", []),
-                "intelligent_report": payload.get("intelligent_report"),
-                "report_context": payload.get("report_context", {}),
-            }
+            if payload.get("snapshot_type") == "intelligent_screening":
+                return {
+                    "generated_at": payload.get("generated_at"),
+                    "screening_results": payload.get("screening_results", {}),
+                    "recommendation_pool": payload.get("recommendation_pool", {}),
+                    "ai_analyses": payload.get("ai_analyses", {}),
+                    "news_clusters": payload.get("news_clusters", []),
+                    "intelligent_report": payload.get("intelligent_report"),
+                    "report_context": payload.get("report_context", {}),
+                }
         except Exception:
             pass
     return {
@@ -276,25 +276,24 @@ def _build_recommendation_methodology_payload(settings: Settings) -> dict[str, A
         "strategy_count": len(strategy_items),
         "strategies": strategy_items,
         "candidate_selection": [
-            "先汇总所有启用策略的候选股票，优先保留多策略同时命中的标的。",
-            "默认先过滤 ST 名称标的与近年连续亏损风险较高的标的。",
-            "候选股需满足技术评分不低于 45。",
-            "候选股需满足成交量比不低于 1.0，优先考虑放量标的。",
-            "若 RSI 高于 85 或低于 15，则视为过热/过冷，先过滤。",
-            "候选池按优先级收敛为持续跟踪池 Top10，其中前台 Top5 作为默认展示名单。",
+            "先汇总所有启用策略命中的股票，优先保留多策略共振、技术结构更完整的标的。",
+            "默认先过滤 ST 名称标的、连续亏损风险较高标的，以及明显不符合基础技术条件的候选。",
+            "候选阶段优先看技术评分、量价配合、均线结构与资金承接，不只看单一强势。",
+            "前置过滤保持适度，重点风险控制放在策略命中后的统一评估与排序阶段。",
+            "候选池最终收敛为今日 Top10 展示名单，其中今日 Top3 使用更严格的风控口径。",
         ],
         "ai_analysis": [
-            "默认只对前台 Top3 与高关注股票补充执行 AI 分析，shadow 仅保留规则跟踪，不调用 LLM。",
-            "分析页面会同步展示技术面、基本面、市场情绪、新闻舆情四个维度的结果。",
-            "AI 还会给出 overall_confidence 作为最终推荐分数的置信度权重。",
+            "默认只对今日 Top3 与高关注股票补充执行 AI 分析，shadow 仅保留规则跟踪，不调用 LLM。",
+            "分析页面同步展示技术面、基本面、市场情绪、新闻舆情四个维度，并补充短线执行建议。",
+            "AI 给出的 overall_confidence 会参与最终排序，用于区分高把握度与低把握度信号。",
         ],
         "score_formula": [
-            "基础分 = AI 综合分数 overall_score。",
-            "若股票出现在高重要性新闻热点中，额外加 3 分。",
-            "每多命中 1 个策略，额外加 5 分。",
-            "再叠加小幅行业近 3 日资金氛围修正，基于所属行业近 3 日净流入与净流入占比做温和加减分。",
-            "最终分数 = (AI 综合分数 + 新闻加分 + 多策略加分 + 行业近 3 日资金氛围修正) × AI 置信度。",
-            "最终分数达到 55 分才会进入最终推荐池。",
+            "基础分来自 AI 综合分数 overall_score，并结合多维分析结果形成初始排序，最终分数会在此基础上叠加加分与风控扣分。",
+            "若股票出现在高重要性新闻热点中，会获得适度新闻加分（通常加 3 分）；多策略共振也会带来额外加分。",
+            "行业近 3 日资金氛围会做温和修正，但不会替代个股本身的强弱与风险判断。",
+            "系统会额外评估末端风险，重点关注近 3 日资金承接、换手是否相对近期激增、量比是否异常、近 5 日累计涨幅是否偏大、价格是否处于 20 日高位。",
+            "若识别到连续上涨后放量分歧的末端风险，会在最终排序中明确扣分，高风险标的还可能被排除出今日展示。",
+            "Top3 使用比 Top10 更严格的风险阈值，尽量减少追涨末端标的进入最前排。",
         ],
         "recommendation_levels": [
             {"label": "强烈推荐", "rule": "最终分数 ≥ 80", "description": "多维度共振，建议重点关注"},
@@ -303,10 +302,10 @@ def _build_recommendation_methodology_payload(settings: Settings) -> dict[str, A
             {"label": "谨慎", "rule": "最终分数 < 60", "description": "暂不建议操作"},
         ],
         "tracking_metrics": [
-            "入场价格统一使用推荐日收盘价。",
-            "自动回填 T+1 / T+3 / T+5 / T+10 收益。",
-            "10 日最大回撤按推荐日收盘价为基准计算。",
-            "5 日胜率定义为 return_5d > 0。",
-            "默认基准为沪深300（000300.SH），用于计算 5 日超额收益。",
+            "入场价格统一使用推荐日收盘价，并自动回填 T+1 / T+3 / T+5 / T+10 收益。",
+            "昨日 Top3 会在今日继续复盘，即使不再属于强势推荐，也保留对比与归因。",
+            "10 日最大回撤按推荐日收盘价为基准计算，用来观察高波动与追涨回撤风险。",
+            "5 日胜率定义为 return_5d > 0，默认基准为沪深300（000300.SH），用于计算超额收益。",
+            "持续跟踪不仅看涨跌结果，也看分数变化、风险变化与是否出现末端分歧信号。",
         ],
     }

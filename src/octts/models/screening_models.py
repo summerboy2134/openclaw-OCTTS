@@ -271,6 +271,7 @@ class RecommendationPoolState(Base):
     name = Column(String(50))
     recommendation_score = Column(Float, default=0.0)
     priority_score = Column(Float, default=0.0)
+    overall_score = Column(Float)
     hit_streak_days = Column(Integer, default=0)
     miss_streak_days = Column(Integer, default=0)
     in_frontlist = Column(Boolean, default=False)
@@ -285,16 +286,58 @@ class RecommendationPoolState(Base):
     last_frontlist_date = Column(Date)
     times_entered_frontlist = Column(Integer, default=0)
     technical_score = Column(Float)
+    fundamental_score = Column(Float)
+    sentiment_score = Column(Float)
+    news_score = Column(Float)
+    base_score = Column(Float)
+    sentiment_adjustment = Column(Float)
+    news_adjustment = Column(Float)
+    score_model = Column(String(50))
     close = Column(Float)
     pct_change = Column(Float)
     volume_ratio = Column(Float)
     turnover_rate = Column(Float)
     strategy_count = Column(Integer, default=0)
+    divergence_score = Column(Float)
+    strategy_consistency_label = Column(String(50))
     news_mentioned = Column(Boolean, default=False)
+    industry = Column(String(50))
+    industry_heat_score = Column(Float)
+    industry_flow_bias = Column(String(20))
+    distribution_risk_score = Column(Float)
+    distribution_risk_flags = Column(JSON)
+    moneyflow_3d_value = Column(Float)
+    turnover_spike_ratio = Column(Float)
+    recent_runup_5d = Column(Float)
+    continuation_bias_score = Column(Float)
+    continuation_positive_flags = Column(JSON)
+    continuation_negative_flags = Column(JSON)
+    top3_risk_penalty = Column(Float)
+    short_term_contradiction_penalty = Column(Float)
+    final_display_recommendation_score = Column(Float)
+    top3_status = Column(String(20), default='normal')
+    top3_reason = Column(Text)
+    late_stage_momentum_flag = Column(Boolean, default=False)
+    candidate_risk_blocked = Column(Boolean, default=False)
     ai_confidence = Column(Float)
+    display_confidence = Column(Float)
     technical_signal = Column(String(200))
+    summary = Column(Text)
     recommendation_text = Column(Text)
     entry_price = Column(Float)
+    recommend_rank = Column(Integer)
+    previous_recommendation_score = Column(Float)
+    previous_overall_score = Column(Float)
+    previous_confidence = Column(Float)
+    score_change = Column(Float)
+    today_present = Column(Boolean, default=True)
+    absence_reason = Column(Text)
+    action_plan = Column(JSON)
+    review_status = Column(String(20))
+    yesterday_conclusion = Column(Text)
+    today_verdict = Column(Text)
+    miss_reason_candidates = Column(JSON)
+    missing_factor_candidates = Column(JSON)
     created_at = Column(DateTime, default=datetime.now, nullable=False)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
 
@@ -380,16 +423,59 @@ class DatabaseManager:
                 'last_frontlist_date': "ALTER TABLE recommendation_pool_states ADD COLUMN last_frontlist_date DATE",
                 'times_entered_frontlist': "ALTER TABLE recommendation_pool_states ADD COLUMN times_entered_frontlist INTEGER DEFAULT 0",
                 'technical_score': "ALTER TABLE recommendation_pool_states ADD COLUMN technical_score FLOAT",
+                'fundamental_score': "ALTER TABLE recommendation_pool_states ADD COLUMN fundamental_score FLOAT",
+                'sentiment_score': "ALTER TABLE recommendation_pool_states ADD COLUMN sentiment_score FLOAT",
+                'news_score': "ALTER TABLE recommendation_pool_states ADD COLUMN news_score FLOAT",
+                'base_score': "ALTER TABLE recommendation_pool_states ADD COLUMN base_score FLOAT",
+                'sentiment_adjustment': "ALTER TABLE recommendation_pool_states ADD COLUMN sentiment_adjustment FLOAT",
+                'news_adjustment': "ALTER TABLE recommendation_pool_states ADD COLUMN news_adjustment FLOAT",
+                'score_model': "ALTER TABLE recommendation_pool_states ADD COLUMN score_model VARCHAR(50)",
+                'overall_score': "ALTER TABLE recommendation_pool_states ADD COLUMN overall_score FLOAT",
                 'close': "ALTER TABLE recommendation_pool_states ADD COLUMN close FLOAT",
                 'pct_change': "ALTER TABLE recommendation_pool_states ADD COLUMN pct_change FLOAT",
                 'volume_ratio': "ALTER TABLE recommendation_pool_states ADD COLUMN volume_ratio FLOAT",
                 'turnover_rate': "ALTER TABLE recommendation_pool_states ADD COLUMN turnover_rate FLOAT",
                 'strategy_count': "ALTER TABLE recommendation_pool_states ADD COLUMN strategy_count INTEGER DEFAULT 0",
+                'divergence_score': "ALTER TABLE recommendation_pool_states ADD COLUMN divergence_score FLOAT",
+                'strategy_consistency_label': "ALTER TABLE recommendation_pool_states ADD COLUMN strategy_consistency_label VARCHAR(50)",
                 'news_mentioned': "ALTER TABLE recommendation_pool_states ADD COLUMN news_mentioned BOOLEAN DEFAULT 0",
+                'industry': "ALTER TABLE recommendation_pool_states ADD COLUMN industry VARCHAR(50)",
+                'industry_heat_score': "ALTER TABLE recommendation_pool_states ADD COLUMN industry_heat_score FLOAT",
+                'industry_flow_bias': "ALTER TABLE recommendation_pool_states ADD COLUMN industry_flow_bias VARCHAR(20)",
+                'distribution_risk_score': "ALTER TABLE recommendation_pool_states ADD COLUMN distribution_risk_score FLOAT",
+                'distribution_risk_flags': "ALTER TABLE recommendation_pool_states ADD COLUMN distribution_risk_flags JSON",
+                'moneyflow_3d_value': "ALTER TABLE recommendation_pool_states ADD COLUMN moneyflow_3d_value FLOAT",
+                'turnover_spike_ratio': "ALTER TABLE recommendation_pool_states ADD COLUMN turnover_spike_ratio FLOAT",
+                'recent_runup_5d': "ALTER TABLE recommendation_pool_states ADD COLUMN recent_runup_5d FLOAT",
+                'continuation_bias_score': "ALTER TABLE recommendation_pool_states ADD COLUMN continuation_bias_score FLOAT",
+                'continuation_positive_flags': "ALTER TABLE recommendation_pool_states ADD COLUMN continuation_positive_flags JSON",
+                'continuation_negative_flags': "ALTER TABLE recommendation_pool_states ADD COLUMN continuation_negative_flags JSON",
+                'top3_risk_penalty': "ALTER TABLE recommendation_pool_states ADD COLUMN top3_risk_penalty FLOAT",
+                'short_term_contradiction_penalty': "ALTER TABLE recommendation_pool_states ADD COLUMN short_term_contradiction_penalty FLOAT",
+                'final_display_recommendation_score': "ALTER TABLE recommendation_pool_states ADD COLUMN final_display_recommendation_score FLOAT",
+                'top3_status': "ALTER TABLE recommendation_pool_states ADD COLUMN top3_status VARCHAR(20) DEFAULT 'normal'",
+                'top3_reason': "ALTER TABLE recommendation_pool_states ADD COLUMN top3_reason TEXT",
+                'late_stage_momentum_flag': "ALTER TABLE recommendation_pool_states ADD COLUMN late_stage_momentum_flag BOOLEAN DEFAULT 0",
+                'candidate_risk_blocked': "ALTER TABLE recommendation_pool_states ADD COLUMN candidate_risk_blocked BOOLEAN DEFAULT 0",
                 'ai_confidence': "ALTER TABLE recommendation_pool_states ADD COLUMN ai_confidence FLOAT",
+                'display_confidence': "ALTER TABLE recommendation_pool_states ADD COLUMN display_confidence FLOAT",
                 'technical_signal': "ALTER TABLE recommendation_pool_states ADD COLUMN technical_signal VARCHAR(200)",
+                'summary': "ALTER TABLE recommendation_pool_states ADD COLUMN summary TEXT",
                 'recommendation_text': "ALTER TABLE recommendation_pool_states ADD COLUMN recommendation_text TEXT",
                 'entry_price': "ALTER TABLE recommendation_pool_states ADD COLUMN entry_price FLOAT",
+                'recommend_rank': "ALTER TABLE recommendation_pool_states ADD COLUMN recommend_rank INTEGER",
+                'previous_recommendation_score': "ALTER TABLE recommendation_pool_states ADD COLUMN previous_recommendation_score FLOAT",
+                'previous_overall_score': "ALTER TABLE recommendation_pool_states ADD COLUMN previous_overall_score FLOAT",
+                'previous_confidence': "ALTER TABLE recommendation_pool_states ADD COLUMN previous_confidence FLOAT",
+                'score_change': "ALTER TABLE recommendation_pool_states ADD COLUMN score_change FLOAT",
+                'today_present': "ALTER TABLE recommendation_pool_states ADD COLUMN today_present BOOLEAN DEFAULT 1",
+                'absence_reason': "ALTER TABLE recommendation_pool_states ADD COLUMN absence_reason TEXT",
+                'action_plan': "ALTER TABLE recommendation_pool_states ADD COLUMN action_plan JSON",
+                'review_status': "ALTER TABLE recommendation_pool_states ADD COLUMN review_status VARCHAR(20)",
+                'yesterday_conclusion': "ALTER TABLE recommendation_pool_states ADD COLUMN yesterday_conclusion TEXT",
+                'today_verdict': "ALTER TABLE recommendation_pool_states ADD COLUMN today_verdict TEXT",
+                'miss_reason_candidates': "ALTER TABLE recommendation_pool_states ADD COLUMN miss_reason_candidates JSON",
+                'missing_factor_candidates': "ALTER TABLE recommendation_pool_states ADD COLUMN missing_factor_candidates JSON",
                 'updated_at': "ALTER TABLE recommendation_pool_states ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP",
             },
             'recommendation_items': {
@@ -597,7 +683,7 @@ class DatabaseManager:
                     ts_code=item.ts_code,
                     name=item.name or "",
                     close=item.close or 0.0,
-                    pct_change=item.pct_change or 0.0,
+                    pct_change=item.pct_change,
                     volume_ratio=item.volume_ratio or 0.0,
                     turnover_rate=item.turnover_rate or 0.0,
                     rsi=item.rsi,
@@ -738,6 +824,7 @@ class DatabaseManager:
                 record.name = state.name
                 record.recommendation_score = state.recommendation_score
                 record.priority_score = state.priority_score
+                record.overall_score = state.overall_score
                 record.hit_streak_days = state.hit_streak_days
                 record.miss_streak_days = state.miss_streak_days
                 record.in_frontlist = state.in_frontlist
@@ -752,16 +839,58 @@ class DatabaseManager:
                 record.last_frontlist_date = state.last_frontlist_date
                 record.times_entered_frontlist = state.times_entered_frontlist
                 record.technical_score = state.technical_score
+                record.fundamental_score = state.fundamental_score
+                record.sentiment_score = state.sentiment_score
+                record.news_score = state.news_score
+                record.base_score = state.base_score
+                record.sentiment_adjustment = state.sentiment_adjustment
+                record.news_adjustment = state.news_adjustment
+                record.score_model = state.score_model
                 record.close = state.close
                 record.pct_change = state.pct_change
                 record.volume_ratio = state.volume_ratio
                 record.turnover_rate = state.turnover_rate
                 record.strategy_count = state.strategy_count
+                record.divergence_score = getattr(state, 'divergence_score', None)
+                record.strategy_consistency_label = getattr(state, 'strategy_consistency_label', None)
                 record.news_mentioned = bool(state.news_mentioned)
+                record.industry = state.industry
+                record.industry_heat_score = state.industry_heat_score
+                record.industry_flow_bias = state.industry_flow_bias
+                record.distribution_risk_score = state.distribution_risk_score
+                record.distribution_risk_flags = list(state.distribution_risk_flags or [])
+                record.moneyflow_3d_value = state.moneyflow_3d_value
+                record.turnover_spike_ratio = state.turnover_spike_ratio
+                record.recent_runup_5d = state.recent_runup_5d
+                record.continuation_bias_score = state.continuation_bias_score
+                record.continuation_positive_flags = list(state.continuation_positive_flags or [])
+                record.continuation_negative_flags = list(state.continuation_negative_flags or [])
+                record.top3_risk_penalty = state.top3_risk_penalty
+                record.short_term_contradiction_penalty = state.short_term_contradiction_penalty
+                record.final_display_recommendation_score = state.final_display_recommendation_score
+                record.top3_status = getattr(state, 'top3_status', 'normal') or 'normal'
+                record.top3_reason = getattr(state, 'top3_reason', None)
+                record.late_stage_momentum_flag = bool(state.late_stage_momentum_flag)
+                record.candidate_risk_blocked = bool(state.candidate_risk_blocked)
                 record.ai_confidence = state.ai_confidence
+                record.display_confidence = state.display_confidence
                 record.technical_signal = state.technical_signal
+                record.summary = state.summary
                 record.recommendation_text = state.recommendation_text
                 record.entry_price = state.entry_price
+                record.recommend_rank = state.recommend_rank
+                record.previous_recommendation_score = state.previous_recommendation_score
+                record.previous_overall_score = state.previous_overall_score
+                record.previous_confidence = state.previous_confidence
+                record.score_change = state.score_change
+                record.today_present = bool(state.today_present)
+                record.absence_reason = state.absence_reason
+                record.action_plan = dict(state.action_plan or {})
+                record.review_status = state.review_status
+                record.yesterday_conclusion = state.yesterday_conclusion
+                record.today_verdict = state.today_verdict
+                record.miss_reason_candidates = list(state.miss_reason_candidates or [])
+                record.missing_factor_candidates = list(state.missing_factor_candidates or [])
                 record.updated_at = datetime.now()
                 persisted.append(self._serialize_recommendation_pool_state(record))
 
@@ -785,7 +914,10 @@ class DatabaseManager:
             rows = session.query(RecommendationPoolState).filter(
                 RecommendationPoolState.trade_date == target_date
             ).order_by(
-                RecommendationPoolState.recommend_rank.asc(),
+                RecommendationPoolState.recommend_rank.asc().nullslast(),
+                RecommendationPoolState.recommendation_score.desc(),
+                RecommendationPoolState.overall_score.desc().nullslast(),
+                RecommendationPoolState.priority_score.desc(),
                 RecommendationPoolState.ts_code.asc(),
             ).all()
             return [self._serialize_recommendation_pool_state(row) for row in rows]
@@ -821,7 +953,10 @@ class DatabaseManager:
             if front_only is not None:
                 query = query.filter(RecommendationPoolState.in_frontlist == front_only)
             query = query.order_by(
-                RecommendationPoolState.recommend_rank.asc(),
+                RecommendationPoolState.recommend_rank.asc().nullslast(),
+                RecommendationPoolState.recommendation_score.desc(),
+                RecommendationPoolState.overall_score.desc().nullslast(),
+                RecommendationPoolState.priority_score.desc(),
                 RecommendationPoolState.ts_code.asc(),
             )
             if limit is not None:
@@ -994,6 +1129,7 @@ class DatabaseManager:
             'name': item.name,
             'recommendation_score': item.recommendation_score,
             'priority_score': item.priority_score,
+            'overall_score': item.overall_score,
             'hit_streak_days': item.hit_streak_days,
             'miss_streak_days': item.miss_streak_days,
             'in_frontlist': bool(item.in_frontlist),
@@ -1008,18 +1144,58 @@ class DatabaseManager:
             'last_frontlist_date': item.last_frontlist_date.isoformat() if item.last_frontlist_date else None,
             'times_entered_frontlist': item.times_entered_frontlist,
             'technical_score': item.technical_score,
+            'fundamental_score': item.fundamental_score,
+            'sentiment_score': item.sentiment_score,
+            'news_score': item.news_score,
+            'base_score': item.base_score,
+            'sentiment_adjustment': item.sentiment_adjustment,
+            'news_adjustment': item.news_adjustment,
+            'score_model': item.score_model,
             'close': item.close,
             'pct_change': item.pct_change,
             'volume_ratio': item.volume_ratio,
             'turnover_rate': item.turnover_rate,
             'strategy_count': item.strategy_count,
+            'divergence_score': item.divergence_score,
+            'strategy_consistency_label': item.strategy_consistency_label,
             'news_mentioned': bool(item.news_mentioned),
+            'industry': item.industry,
+            'industry_heat_score': item.industry_heat_score,
+            'industry_flow_bias': item.industry_flow_bias,
+            'distribution_risk_score': item.distribution_risk_score,
+            'distribution_risk_flags': list(item.distribution_risk_flags or []),
+            'moneyflow_3d_value': item.moneyflow_3d_value,
+            'turnover_spike_ratio': item.turnover_spike_ratio,
+            'recent_runup_5d': item.recent_runup_5d,
+            'continuation_bias_score': item.continuation_bias_score,
+            'continuation_positive_flags': list(item.continuation_positive_flags or []),
+            'continuation_negative_flags': list(item.continuation_negative_flags or []),
+            'top3_risk_penalty': item.top3_risk_penalty,
+            'short_term_contradiction_penalty': item.short_term_contradiction_penalty,
+            'final_display_recommendation_score': item.final_display_recommendation_score,
+            'top3_status': item.top3_status,
+            'top3_reason': item.top3_reason,
+            'late_stage_momentum_flag': bool(item.late_stage_momentum_flag),
+            'candidate_risk_blocked': bool(item.candidate_risk_blocked),
             'ai_confidence': item.ai_confidence,
+            'display_confidence': item.display_confidence,
             'technical_signal': item.technical_signal,
+            'summary': item.summary,
             'recommendation_text': item.recommendation_text,
             'entry_price': item.entry_price,
-            'previous_recommendation_score': getattr(item, 'previous_recommendation_score', None),
-            'score_change': getattr(item, 'score_change', None),
+            'recommend_rank': item.recommend_rank,
+            'previous_recommendation_score': item.previous_recommendation_score,
+            'previous_overall_score': item.previous_overall_score,
+            'previous_confidence': item.previous_confidence,
+            'score_change': item.score_change,
+            'today_present': bool(item.today_present),
+            'absence_reason': item.absence_reason,
+            'action_plan': dict(item.action_plan or {}),
+            'review_status': item.review_status,
+            'yesterday_conclusion': item.yesterday_conclusion,
+            'today_verdict': item.today_verdict,
+            'miss_reason_candidates': list(item.miss_reason_candidates or []),
+            'missing_factor_candidates': list(item.missing_factor_candidates or []),
         }
 
     @staticmethod

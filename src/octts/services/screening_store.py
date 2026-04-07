@@ -9,6 +9,16 @@ from octts.config import Settings
 from octts.schemas.screener import ScreenResult, TrackedRecommendationState
 
 
+def _recommendation_pool_sort_key(item: Dict[str, Any]) -> tuple:
+    return (
+        item.get("recommend_rank") is None,
+        int(item.get("recommend_rank") or 9999),
+        -float(item.get("recommendation_score") or 0.0),
+        -float(item.get("overall_score") or item.get("priority_score") or 0.0),
+        item.get("ts_code") or "",
+    )
+
+
 class ScreeningStore:
     """选股结果存储服务"""
 
@@ -323,7 +333,7 @@ class ScreeningStore:
             payload = {
                 "trade_date": trade_key,
                 "generated_at": datetime.now().isoformat(),
-                "states": sorted(serialized_states, key=lambda item: item.get("recommend_rank") or 9999),
+                "states": sorted(serialized_states, key=_recommendation_pool_sort_key),
             }
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -346,7 +356,7 @@ class ScreeningStore:
         states = self.load_recommendation_pool_state(trade_date=trade_date)
         if front_only is not None:
             states = [item for item in states if bool(item.get("in_frontlist")) == front_only]
-        states = sorted(states, key=lambda item: item.get("recommend_rank") or 9999)
+        states = sorted(states, key=_recommendation_pool_sort_key)
         if limit is not None:
             states = states[:limit]
         return states

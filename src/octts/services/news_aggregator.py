@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 from enum import Enum
+from urllib.parse import quote_plus
 import json
 
 import httpx
@@ -14,6 +15,7 @@ from bs4 import BeautifulSoup
 
 from octts.config import Settings
 from octts.clients.llm_client import LLMClient
+from octts.services.intelligent_screening_job_manager import maybe_await_progress_callback
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,17 @@ class NewsCluster:
     importance: float
     summary: str
     key_stocks: List[str]  # 主要影响的股票
+
+
+@dataclass
+class StockLiveNewsItem:
+    """重点个股实时资讯条目"""
+    title: str
+    summary: str
+    source: str
+    url: str
+    publish_time: Optional[str]
+    category: str
 
 
 class NewsCollector:
@@ -131,17 +144,116 @@ class EastMoneyNewsCollector(NewsCollector):
 
     def __init__(self):
         super().__init__(NewsSource.EASTMONEY)
-        self.api_url = "http://finance.eastmoney.com/api/news"
+        self.api_url = "https://search-api-web.eastmoney.com/search/jsonp"
 
     async def collect(self) -> List[NewsItem]:
         """采集东方财富新闻"""
-        # 预留接口，当前未接入具体源。
         return []
+
+
+class EastMoneyStockNewsCollector(NewsCollector):
+    """东方财富个股新闻/公告采集器"""
+
+    def __init__(self):
+        super().__init__(NewsSource.EASTMONEY)
+        self.api_url = "https://search-api-web.eastmoney.com/search/jsonp"
+
+    async def collect_stock_news(
+        self,
+        *,
+        keyword: str,
+        limit: int = 3,
+    ) -> List[StockLiveNewsItem]:
+        if not keyword:
+            return []
+        params = {
+            "cb": "jQuery3510875346244069884_1710000000000",
+            "param": json.dumps(
+                {
+                    "uid": "",
+                    "keyword": keyword,
+                    "type": ["cmsArticleWeb", "notice"],
+                    "client": "web",
+                    "clientType": "web",
+                    "pageIndex": 1,
+                    "pageSize": max(limit * 2, 6),
+                    "searchScope": "default",
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            "_": str(int(datetime.now().timestamp() * 1000)),
+        }
+        timeout = httpx.Timeout(connect=5.0, read=8.0, write=5.0, pool=5.0)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Referer": "https://so.eastmoney.com/",
+        }
+
+        async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
+            try:
+                response = await client.get(self.api_url, params=params)
+                response.raise_for_status()
+                return self._parse_stock_news_response(response.text, limit=limit)
+            except Exception as e:
+                self.logger.warning("Failed to collect EastMoney stock news for %s: %s", keyword, e)
+                return []
+
+    def _parse_stock_news_response(self, payload: str, *, limit: int) -> List[StockLiveNewsItem]:
+        start = payload.find("(")
+        end = payload.rfind(")")
+        if start == -1 or end == -1 or end <= start:
+            return []
+        try:
+            data = json.loads(payload[start + 1:end])
+        except Exception:
+            return []
+
+        results: List[StockLiveNewsItem] = []
+        seen = set()
+        for item in data.get("result", {}).get("cmsArticleWeb", []) + data.get("result", {}).get("notice", []):
+            title = self._clean_html_text(item.get("title") or item.get("titlecolor") or "")
+            summary = self._clean_html_text(item.get("content") or item.get("summary") or "")
+            source = self._clean_html_text(item.get("mediaName") or item.get("source") or self.source.value)
+            raw_url = str(item.get("url") or item.get("shareUrl") or "").strip()
+            url = raw_url if raw_url.startswith("http") else f"https://so.eastmoney.com/news/s?keyword={quote_plus(title or summary)}"
+            publish_time = self._normalize_publish_time(item.get("date") or item.get("showTime") or item.get("pubTime"))
+            category = "公告" if item.get("artType") == "notice" or item.get("noticeType") else "新闻"
+            dedupe_key = (title, url)
+            if not title or dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            results.append(
+                StockLiveNewsItem(
+                    title=title,
+                    summary=summary,
+                    source=source or self.source.value,
+                    url=url,
+                    publish_time=publish_time,
+                    category=category,
+                )
+            )
+            if len(results) >= limit:
+                break
+        return results
+
+    @staticmethod
+    def _clean_html_text(value: str) -> str:
+        return BeautifulSoup(str(value or ""), "html.parser").get_text(" ", strip=True)
+
+    @staticmethod
+    def _normalize_publish_time(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
 
 
 class NewsAggregator:
     """新闻聚合器"""
 
+    _CLUSTER_SAMPLE_LIMIT = 12
     _IMPORTANT_SOURCES = {
         NewsSource.CAILIAN,
         NewsSource.WALLSTREET,
@@ -179,10 +291,12 @@ class NewsAggregator:
     def __init__(
         self,
         settings: Settings,
-        llm_client: Optional[LLMClient] = None
+        llm_client: Optional[LLMClient] = None,
+        progress_callback: Optional[Any] = None,
     ):
         self.settings = settings
         self.llm_client = llm_client or LLMClient(settings)
+        self.progress_callback = progress_callback
 
         # 初始化采集器
         self.collectors = [
@@ -190,6 +304,7 @@ class NewsAggregator:
             EastMoneyNewsCollector(),
             # 添加更多采集器...
         ]
+        self.stock_news_collector = EastMoneyStockNewsCollector()
 
         # 缓存已处理的新闻
         self._processed_hashes = set()
@@ -274,6 +389,24 @@ class NewsAggregator:
                 total_batches,
                 len(batch),
             )
+            await maybe_await_progress_callback(
+                self.progress_callback,
+                {
+                    "status": "running",
+                    "current_step": 1,
+                    "total_steps": 6,
+                    "step_name": "新闻采集",
+                    "progress_percent": min(17, 14 + batch_number),
+                    "message": "正在分析新闻重要性（第 {0}/{1} 批）...".format(batch_number, max(total_batches, 1)),
+                    "details": {
+                        "phase": "importance_analysis",
+                        "batch": batch_number,
+                        "total_batches": total_batches,
+                        "batch_size": len(batch),
+                        "selected_items": len(filtered_items),
+                    },
+                },
+            )
 
             news_texts = []
             for idx, item in enumerate(batch):
@@ -347,14 +480,57 @@ class NewsAggregator:
         Returns:
             新闻聚类列表
         """
-        if len(news_items) < min_cluster_size:
+        original_count = len(news_items)
+        if original_count < min_cluster_size:
+            logger.info(
+                "Skip news clustering: original_count=%s below min_cluster_size=%s",
+                original_count,
+                min_cluster_size,
+            )
             return []
 
-        # 使用LLM进行语义聚类
+        candidate_items = self._select_cluster_candidates(news_items)
+        selected_count = len(candidate_items)
+        was_trimmed = selected_count < original_count
+
+        logger.info(
+            "News clustering start: original_count=%s, selected_count=%s, sample_limit=%s, trimmed=%s",
+            original_count,
+            selected_count,
+            self._CLUSTER_SAMPLE_LIMIT,
+            was_trimmed,
+        )
+
+        if selected_count < min_cluster_size:
+            logger.info(
+                "Skip news clustering after sampling: selected_count=%s below min_cluster_size=%s",
+                selected_count,
+                min_cluster_size,
+            )
+            return []
+
+        await maybe_await_progress_callback(
+            self.progress_callback,
+            {
+                "status": "running",
+                "current_step": 1,
+                "total_steps": 6,
+                "step_name": "新闻采集",
+                "progress_percent": 19,
+                "message": "正在进行新闻主题聚类...",
+                "details": {
+                    "phase": "clustering",
+                    "original_count": original_count,
+                    "selected_count": selected_count,
+                    "trimmed": was_trimmed,
+                },
+            },
+        )
+
         prompt = f"""
         请对以下新闻进行主题聚类分析：
 
-        {self._format_news_for_clustering(news_items[:50])}  # 限制数量
+        {self._format_news_for_clustering(candidate_items)}
 
         要求：
         1. 将相似主题的新闻归为一类
@@ -383,11 +559,10 @@ class NewsAggregator:
 
             clusters = []
             for cluster_data in result.get("clusters", []):
-                # 收集该聚类的新闻
                 indices = cluster_data.get("news_indices", [])
                 cluster_news = [
-                    news_items[i - 1] for i in indices
-                    if 0 < i <= len(news_items)
+                    candidate_items[i - 1] for i in indices
+                    if 0 < i <= len(candidate_items)
                 ]
 
                 if len(cluster_news) >= min_cluster_size:
@@ -403,11 +578,22 @@ class NewsAggregator:
                     )
                     clusters.append(cluster)
 
+            logger.info(
+                "News clustering complete: selected_count=%s, cluster_count=%s, trimmed=%s",
+                selected_count,
+                len(clusters),
+                was_trimmed,
+            )
+            return clusters
         except Exception as e:
-            logger.error(f"Failed to cluster news: {e}")
+            logger.error(
+                "Failed to cluster news: original_count=%s, selected_count=%s, trimmed=%s, error=%s",
+                original_count,
+                selected_count,
+                was_trimmed,
+                e,
+            )
             return []
-
-        return clusters
 
     def _prefilter_importance_candidates(self, news_items: List[NewsItem]) -> List[NewsItem]:
         selected: List[NewsItem] = []
@@ -444,6 +630,19 @@ class NewsAggregator:
                 item.related_stocks = item.related_stocks or []
         return selected
 
+    def _select_cluster_candidates(self, news_items: List[NewsItem]) -> List[NewsItem]:
+        indexed_items = list(enumerate(news_items))
+        ranked_items = sorted(
+            indexed_items,
+            key=lambda pair: (
+                -(pair[1].importance if pair[1].importance is not None else 0.5),
+                pair[0],
+            ),
+        )
+        selected_pairs = ranked_items[:self._CLUSTER_SAMPLE_LIMIT]
+        selected_pairs.sort(key=lambda pair: pair[0])
+        return [item for _, item in selected_pairs]
+
     def _extract_stock_codes(self, text: str) -> List[str]:
         import re
 
@@ -460,6 +659,71 @@ class NewsAggregator:
                 f"{idx + 1}. {item.title} ({item.source.value})"
             )
         return "\n".join(lines)
+
+    async def collect_focus_stock_live_context(
+        self,
+        *,
+        today_top3: Optional[List[Dict[str, Any]]] = None,
+        yesterday_top3_review: Optional[List[Dict[str, Any]]] = None,
+        per_stock_limit: int = 3,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        return {
+            "today_top3_live_context": await self._collect_live_context_group(
+                today_top3 or [],
+                per_stock_limit=per_stock_limit,
+            ),
+            "yesterday_top3_live_context": [],
+        }
+
+    async def _collect_live_context_group(
+        self,
+        stocks: List[Dict[str, Any]],
+        *,
+        per_stock_limit: int,
+    ) -> List[Dict[str, Any]]:
+        normalized_stocks = [item for item in stocks[:6] if item.get("ts_code")]
+        if not normalized_stocks:
+            return []
+        tasks = [
+            self._collect_single_stock_live_context(item, per_stock_limit=per_stock_limit)
+            for item in normalized_stocks
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        payloads: List[Dict[str, Any]] = []
+        for result in results:
+            if isinstance(result, dict):
+                payloads.append(result)
+            elif isinstance(result, Exception):
+                logger.warning("Focus stock live context collection failed: %s", result)
+        return payloads
+
+    async def _collect_single_stock_live_context(
+        self,
+        stock: Dict[str, Any],
+        *,
+        per_stock_limit: int,
+    ) -> Dict[str, Any]:
+        code = str(stock.get("ts_code") or "").strip().upper()
+        name = str(stock.get("name") or "").strip()
+        keyword = name or code
+        items = await self.stock_news_collector.collect_stock_news(keyword=keyword, limit=per_stock_limit)
+        return {
+            "ts_code": code,
+            "name": name,
+            "query": keyword,
+            "items": [self._serialize_stock_live_news_item(item) for item in items],
+        }
+
+    @staticmethod
+    def _serialize_stock_live_news_item(item: StockLiveNewsItem) -> Dict[str, Any]:
+        summary = str(item.summary or "").strip()
+        if len(summary) > 120:
+            summary = summary[:117].rstrip() + "..."
+        return {
+            "title": item.title,
+            "summary": summary,
+            "publish_time": item.publish_time,
+        }
 
     def _parse_json_response(self, response: str) -> Dict[str, Any]:
         """解析JSON响应"""

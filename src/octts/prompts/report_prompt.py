@@ -8,7 +8,7 @@ from typing import Optional
 from octts.schemas.report import AnalysisPhase, HistoricalAnalysisRecord, MemorySummary, PositionStatus, PriceSnapshot
 
 
-def build_intelligent_screening_report_prompt(
+def build_today_screening_report_prompt(
     *,
     market_data: dict[str, object],
     news_clusters: list[dict[str, object]],
@@ -17,15 +17,19 @@ def build_intelligent_screening_report_prompt(
     system_prompt = (
         "你是一名严格遵守排序约束的 A 股智能选股复盘分析助手。"
         "你的任务是解释系统已经给出的排序与分数，不允许改写排序，不允许擅自调整推荐先后。"
-        "你只能输出一个合法 JSON 对象，不要输出 Markdown，不要输出代码块，不要解释。"
-        "如果证据不足，使用保守描述、null、空数组或观察区间，不要编造精准价位。"
+        "你只能输出一个合法 JSON 对象，不要输出 Markdown、代码块或额外解释。"
+        "优先保证 JSON 完整闭合、字段齐全、内容收敛可读；证据不足时使用保守描述、null、空数组或观察区间，不要编造精准价位。"
     )
 
     payload = {
-        "task": "基于智能选股上下文生成结构化报告",
+        "task": "基于今日 Top3 与主题上下文生成结构化报告",
         "market_data": market_data,
         "news_clusters": news_clusters,
-        "screening_context": screening_context,
+        "screening_context": {
+            "today_top3": screening_context.get("today_top3") or [],
+            "today_top3_live_context": screening_context.get("today_top3_live_context") or [],
+            "comparison_candidates": screening_context.get("comparison_candidates") or [],
+        },
         "field_semantics": {
             "overall_score": "多维综合分",
             "recommendation_score": "最终推荐排序分，解释排序时优先参考该字段",
@@ -35,20 +39,41 @@ def build_intelligent_screening_report_prompt(
             "strategy_count": "命中策略数量",
             "news_mentioned": "是否命中新闻催化",
             "score_change": "与上一交易日推荐分变化",
-            "source_tag": "来源标签，如今日Top3/昨日延续/今日候选",
+            "source_tag": "来源标签，如今日Top3/今日候选/昨日复盘",
         },
         "instructions": [
             "不能改写系统排序，你的任务是解释为什么排这样。",
-            "推荐分高但综合分一般时，要优先从新闻催化、策略共振、短线交易性解释。",
-            "综合分高但推荐分不高时，要解释质量好但交易性一般。",
-            "短线建议必须基于输入中的 close、entry_price、技术描述、支撑阻力或总结信息；若证据不足，只能给观察区间。",
-            "对昨日 Top3 今日复评，需要说明延续/转弱/失效，并尽量输出失误候选与可能缺失的因子。",
+            "只生成 focus_stocks、comparison、overall_action 三块，不要输出 yesterday_reviews。",
+            "优先用 recommendation_score、overall_score、technical_score、fundamental_score、sentiment_score、news_score、strategy_count、score_change、overall_confidence 解释排序来源。",
+            "推荐分高但综合分一般时，优先解释新闻催化、策略共振、短线交易性；综合分高但推荐分一般时，解释质量较好但交易性一般。",
+            "若输入存在 distribution_risk_score、distribution_risk_flags、moneyflow_3d_value、turnover_spike_ratio、recent_runup_5d、late_stage_momentum_flag、industry_flow_bias、industry_heat_score，必须写出加分、扣分与风险含义。",
+            "focus_stocks 必须逐只覆盖 today_top3；comparison 只基于 today_top3。",
+            "若 today_top3_live_context 中存在对应个股的实时资讯，focus_analysis 必须优先引用其中的新闻、公告与发布时间线索；若为空，再回退到 news_clusters 与个股自身字段。",
+            "focus_analysis 必须是完整段落，不要堆标签；控制在约 450-650 中文字，完整但收敛。",
+            "focus_analysis 要优先按这个顺序组织：先写市场表现概览（今日涨跌、日内强弱、当前处于启动/加速/高位分歧/调整/修复哪个阶段），再写主营逻辑或基本面质地，再写技术位置与量价结构、资金承接、板块与主题共振，最后写主要风险与操作前提。段落要真正围绕该股输入数据做判断，避免三只股票复用同样开头或同样结论句。",
+            "focus_analysis 要尽量回答四个问题：这只股票今天是强还是弱、为什么走到当前位置、当前主要催化是什么、接下来最该防什么风险。",
+            "若输入中存在 close/open/high/low/pct_change/turnover_rate/amount/amplitude/recent_runup_5d 等市场表现字段，要明确写出冲高回落、高位震荡、放量分歧、强势延续、回踩整理等阶段判断，不要只写笼统的技术面偏强/偏弱。",
+            "若输入中存在 business_summary、latest_revenue_yoy、latest_profit_yoy、pe_ttm、industry_pe_median 等基本面或估值字段，要明确判断基本面是否支持当前涨幅、是否存在估值透支或基本面与股价背离。",
+            "若输入中存在 catalyst_summary、main_fund_flow_1d、main_fund_flow_3d、main_fund_flow_10d、margin_balance_change_10d 等催化或资金字段，要区分主催化与次催化，并写出资金承接还是资金分歧。",
+            "focus_stocks 的 market_performance_view 与 catalyst_and_capital_view 应尽量输出 2-3 句短摘要，作为总览和重点分析之间的桥接层；证据不足时可保守但不要空泛重复。focus_analysis 不要机械重复这两个字段原句，而要在其基础上进一步归纳、串联和判断。",
+            "focus_stocks 的 core_highlights 控制为 2-3 条，risk_warnings 控制为 2 条，overall_assessment 用 1-2 句给出完整结论。",
+            "今日 Top3 重点写清：市场表现阶段、排序原因、基本面或行业逻辑、技术位置与量价、近3日资金承接、近5日涨幅与分歧风险、市场/主题共振、短线建议。若无法联网补充外部信息，就严格基于输入里的价格、资金、财务、主营摘要、主题线索做推演，并明确写出这些已知信息支持了什么判断、又缺了什么关键验证。",
+            "短线建议必须基于输入中的 close、entry_price、技术描述、支撑阻力或总结信息；证据不足时只给观察区间。",
+            "主题新闻输出优先概括市场总线、核心主线、风险扰动、观察线；overall_action 中的 market_view、risk_summary、action_items 要简明可执行。",
+            "theme_focuses 若能稳定判断再输出，数量控制在 4-6 条；证据不足可返回空数组，不要编造。",
         ],
         "output_schema": {
             "focus_stocks": [
                 {
                     "ts_code": "string",
                     "name": "string",
+                    "score_rationale": "解释 recommendation_score / overall_score 的主要加分、减分来源",
+                    "fundamental_view": "基本面、质地、业绩或行业逻辑判断",
+                    "market_context_view": "大盘、板块、主题环境与个股匹配度判断",
+                    "trading_context_view": "技术结构、位置、量能、节奏、承接情况",
+                    "market_performance_view": "2-3句，概括今日涨跌、日内走势、当前阶段判断",
+                    "catalyst_and_capital_view": "2-3句，概括主催化、次催化、资金承接或资金分歧",
+                    "focus_analysis": "完整段落，约 500-800 中文字，优先包含市场表现概览、主营/基本面逻辑、催化与资金、主要风险、操作前提",
                     "core_highlights": ["string"],
                     "risk_warnings": ["string"],
                     "overall_assessment": "string",
@@ -58,20 +83,8 @@ def build_intelligent_screening_report_prompt(
                         "take_profit": "string|null",
                         "stop_loss": "string|null",
                         "holding_horizon": "string|null",
-                        "invalid_condition": "string|null",
-                    },
-                }
-            ],
-            "yesterday_reviews": [
-                {
-                    "ts_code": "string",
-                    "name": "string",
-                    "yesterday_conclusion": "string",
-                    "today_verdict": "延续|转弱|失效|观察",
-                    "status": "延续|转弱|失效|观察",
-                    "analysis": "string",
-                    "miss_reason_candidates": ["string"],
-                    "missing_factor_candidates": ["string"],
+                        "invalid_condition": "string|null"
+                    }
                 }
             ],
             "comparison": {
@@ -81,18 +94,91 @@ def build_intelligent_screening_report_prompt(
                 "trading_rank": ["ts_code"],
                 "best_short_term": "ts_code",
                 "most_robust": "ts_code",
-                "highest_risk": "ts_code",
+                "highest_risk": "ts_code"
             },
             "overall_action": {
                 "headline": "string",
                 "market_view": "string",
                 "risk_summary": "string",
                 "action_items": ["string"],
-            },
-        },
+                "theme_focuses": [
+                    {
+                        "theme": "string",
+                        "tier": "主线|次主线|观察|风险",
+                        "summary": "string",
+                        "continuity_view": "string",
+                        "related_stocks": ["string"]
+                    }
+                ]
+            }
+        }
     }
 
     return system_prompt, json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def build_yesterday_review_report_prompt(
+    *,
+    news_clusters: list[dict[str, object]],
+    screening_context: dict[str, object],
+) -> tuple[str, str]:
+    system_prompt = (
+        "你是一名严格遵守排序约束的 A 股智能选股复盘分析助手。"
+        "你的任务是解释系统已经给出的复盘对象与结论，不允许擅自新增推荐。"
+        "你只能输出一个合法 JSON 对象，不要输出 Markdown、代码块或额外解释。"
+        "优先保证 JSON 完整闭合、字段齐全、内容收敛可读；证据不足时使用保守描述、null、空数组或观察区间，不要编造精准价位。"
+    )
+
+    payload = {
+        "task": "基于昨日 Top3 复盘上下文生成结构化复盘",
+        "news_clusters": news_clusters,
+        "screening_context": {
+            "yesterday_top3_review": screening_context.get("yesterday_top3_review") or [],
+            "yesterday_top3_live_context": screening_context.get("yesterday_top3_live_context") or [],
+        },
+        "instructions": [
+            "只生成 yesterday_reviews 一块，不要输出 focus_stocks、comparison、overall_action。",
+            "yesterday_reviews 必须逐只覆盖 yesterday_top3_review。",
+            "若 yesterday_top3_review 为空，必须返回空数组，不要自行编造昨日复盘内容。",
+            "review_analysis 必须是完整段落，不要堆标签；控制在约 220-380 中文字，完整但收敛。",
+            "昨日复盘重点写清：昨日逻辑今天是否兑现、强弱变化来自哪些因素、当前更适合继续跟踪/减仓/放弃/观察、下一步风险与操作。",
+            "若个股未重新进入 today_top3 或今日候选，必须明确它只是复盘跟踪对象，不是今日继续推荐。",
+            "review_analysis 必须明确回答四件事：昨日逻辑有没有兑现、今天变化来自哪里、当前状态该怎么处理、接下来重点观察什么延续/失效信号；避免只做泛化总结。",
+            "若有新闻簇背景，可作为市场环境辅助；若证据不足，保守表达，不要编造。",
+        ],
+        "output_schema": {
+            "yesterday_reviews": [
+                {
+                    "ts_code": "string",
+                    "name": "string",
+                    "yesterday_conclusion": "string",
+                    "today_verdict": "一句明确结论，需说明当前处于继续强势/降级跟踪/转弱/失效中的哪种状态",
+                    "status": "延续|转弱|失效|观察",
+                    "strength_change": "相对昨日的强弱变化与来源",
+                    "market_context_view": "今日市场环境是否仍支持原逻辑",
+                    "review_analysis": "完整复盘段落，约 220-380 中文字",
+                    "analysis": "不少于两句，需交代昨日逻辑今天是否兑现、当前风险和操作取向",
+                    "miss_reason_candidates": ["string"],
+                    "missing_factor_candidates": ["string"]
+                }
+            ]
+        }
+    }
+
+    return system_prompt, json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def build_intelligent_screening_report_prompt(
+    *,
+    market_data: dict[str, object],
+    news_clusters: list[dict[str, object]],
+    screening_context: dict[str, object],
+) -> tuple[str, str]:
+    return build_today_screening_report_prompt(
+        market_data=market_data,
+        news_clusters=news_clusters,
+        screening_context=screening_context,
+    )
 
 
 

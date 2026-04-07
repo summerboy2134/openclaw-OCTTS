@@ -1,8 +1,11 @@
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
+
 from octts.config import Settings
 from octts.clients.tushare_client import TushareClient
-from typing import Any, Dict, List, Optional, Tuple
 
 
 class RecordingTushareClient(TushareClient):
@@ -48,8 +51,9 @@ class RecordingTushareClient(TushareClient):
         return "PF Bank"
 
 
-def test_build_snapshot_aligns_related_data_to_resolved_trade_date() -> None:
+def test_build_snapshot_aligns_related_data_to_resolved_trade_date(monkeypatch) -> None:
     client = RecordingTushareClient()
+    monkeypatch.setattr("octts.clients.tushare_client._today_trade_date", lambda: "20260327")
 
     snapshot = client._build_snapshot(
         ts_code="600000.SH",
@@ -161,6 +165,7 @@ def test_call_pro_bar_returns_none_for_out_of_bounds_error(monkeypatch) -> None:
     client = object.__new__(TushareClient)
     client._pro = object()
     debug_calls: list[tuple[str, dict[str, object]]] = []
+    info_calls: list[tuple[str, object, object, object, object]] = []
 
     class ProBarBroken:
         def pro_bar(self, **kwargs):
@@ -172,14 +177,41 @@ def test_call_pro_bar_returns_none_for_out_of_bounds_error(monkeypatch) -> None:
         "octts.clients.tushare_client.logger.debug",
         lambda message, kwargs: debug_calls.append((message, kwargs.copy())),
     )
+    monkeypatch.setattr(
+        "octts.clients.tushare_client.logger.info",
+        lambda message, ts_code, start_date, end_date, freq: info_calls.append(
+            (message, ts_code, start_date, end_date, freq)
+        ),
+    )
 
-    result = client._call_pro_bar(ts_code="600000.SH", asset="E", freq="D")
+    result = client._call_pro_bar(
+        ts_code="600000.SH",
+        asset="E",
+        start_date="20260301",
+        end_date="20260318",
+        freq="D",
+    )
 
     assert result is None
     assert debug_calls == [
         (
             "pro_bar returned no usable rows: %s",
-            {"ts_code": "600000.SH", "asset": "E", "freq": "D"},
+            {
+                "ts_code": "600000.SH",
+                "asset": "E",
+                "start_date": "20260301",
+                "end_date": "20260318",
+                "freq": "D",
+            },
+        )
+    ]
+    assert info_calls == [
+        (
+            "Tushare pro_bar empty result: ts_code=%s, start_date=%s, end_date=%s, freq=%s",
+            "600000.SH",
+            "20260301",
+            "20260318",
+            "D",
         )
     ]
 
@@ -220,6 +252,43 @@ def test_fetch_daily_batch_returns_empty_list_for_out_of_bounds_errors() -> None
         ],
     }
     assert calls == ["000001.SZ", "600000.SH"]
+
+
+def test_fetch_daily_batch_logs_warning_when_all_symbols_return_empty(monkeypatch) -> None:
+    client = object.__new__(TushareClient)
+    client._settings = Settings(TUSHARE_TOKEN="token", OCTTS_MEMORY_BACKEND="file", OCTTS_MEMORY_FILE_PATH="memory.json")
+    warning_calls: list[tuple[str, object, object, object]] = []
+
+    def fake_call_pro_bar(**kwargs):
+        del kwargs
+        return None
+
+    client._call_pro_bar = fake_call_pro_bar
+    monkeypatch.setattr(
+        "octts.clients.tushare_client.logger.warning",
+        lambda message, symbols, start_date, end_date: warning_calls.append(
+            (message, symbols, start_date, end_date)
+        ),
+    )
+
+    result = client.fetch_daily_batch(
+        ts_codes=["000001.SZ", "600000.SH"],
+        start_date="20260301",
+        end_date="20260318",
+    )
+
+    assert result == {
+        "000001.SZ": [],
+        "600000.SH": [],
+    }
+    assert warning_calls == [
+        (
+            "Tushare fetch_daily_batch returned no data: symbols=%s, start_date=%s, end_date=%s",
+            2,
+            "20260301",
+            "20260318",
+        )
+    ]
 
 
 def test_fetch_daily_picks_latest_trade_date_when_frame_order_is_ascending(monkeypatch) -> None:
@@ -281,11 +350,13 @@ def test_fetch_daily_basic_batch_falls_back_to_recent_trade_date(monkeypatch) ->
 
     class DailyBasicOnly:
         def __init__(self) -> None:
-            self.calls: list[tuple[str, str]] = []
+            self.calls: list[tuple[Optional[str], str]] = []
 
-        def daily_basic(self, *, ts_code: str, trade_date: str, fields: Optional[str] = None):
+        def daily_basic(self, *, trade_date: str, fields: Optional[str] = None, ts_code: Optional[str] = None):
             del fields
             self.calls.append((ts_code, trade_date))
+            if ts_code is None:
+                return pd.DataFrame()
             if trade_date == "20260318":
                 return pd.DataFrame()
             return pd.DataFrame(
@@ -307,6 +378,8 @@ def test_fetch_daily_basic_batch_falls_back_to_recent_trade_date(monkeypatch) ->
 
     assert result["600000.SH"]["close"] == 10.2
     assert client._pro.calls == [
+        (None, "20260318"),
+        (None, "20260317"),
         ("600000.SH", "20260318"),
         ("600000.SH", "20260317"),
     ]
@@ -465,6 +538,22 @@ class ScreeningSnapshotClient(TushareClient):
         )
         self._ts = object()
         self.build_calls = 0
+        self.history_calls: List[tuple[List[str], str, int]] = []
+        self.daily_basic_payload: Dict[str, Dict[str, Any]] = {
+            "600000.SH": {"ts_code": "600000.SH", "close": 10.5, "turnover_rate": 1.2, "total_mv": 1200000, "volume_ratio": 1.4},
+            "000001.SZ": {"ts_code": "000001.SZ", "close": 12.3, "turnover_rate": 0.9, "volume_ratio": 1.1},
+        }
+        self.daily_history_payload: Dict[str, List[Dict[str, Any]]] = {
+            "600000.SH": [
+                {"ts_code": "600000.SH", "trade_date": "20260327", "close": 10.5, "pct_chg": 1.2, "turnover_rate": 1.2},
+                {"ts_code": "600000.SH", "trade_date": "20260326", "close": 10.2, "pct_chg": 0.8, "turnover_rate": 1.0},
+                {"ts_code": "600000.SH", "trade_date": "20260325", "close": 10.0, "pct_chg": 1.1, "turnover_rate": 0.9},
+            ],
+            "000001.SZ": [
+                {"ts_code": "000001.SZ", "trade_date": "20260327", "close": 12.3, "pct_chg": 0.6, "turnover_rate": 0.9},
+                {"ts_code": "000001.SZ", "trade_date": "20260326", "close": 12.1, "pct_chg": 0.4, "turnover_rate": 0.8},
+            ],
+        }
 
     def _resolve_target_trade_date(self, trade_date: Optional[str]) -> str:
         assert trade_date is not None
@@ -479,11 +568,18 @@ class ScreeningSnapshotClient(TushareClient):
         ]
 
     def fetch_daily_basic_batch(self, *, ts_codes: List[str], trade_date: str) -> Dict[str, Dict[str, Any]]:
-        del ts_codes, trade_date
-        return {
-            "600000.SH": {"ts_code": "600000.SH", "close": 10.5, "turnover_rate": 1.2, "total_mv": 1200000},
-            "000001.SZ": {"ts_code": "000001.SZ", "close": 12.3, "turnover_rate": 0.9, "volume_ratio": 1.1},
-        }
+        del trade_date
+        return {ts_code: payload for ts_code, payload in self.daily_basic_payload.items() if ts_code in ts_codes}
+
+    def fetch_screening_daily_history_batch(
+        self,
+        *,
+        ts_codes: List[str],
+        trade_date: str,
+        lookback_days: int = 60,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        self.history_calls.append((list(ts_codes), trade_date, lookback_days))
+        return {ts_code: rows for ts_code, rows in self.daily_history_payload.items() if ts_code in ts_codes}
 
 
 def test_screening_snapshot_rebuilds_today_cache_created_before_close(monkeypatch, tmp_path) -> None:
@@ -520,14 +616,18 @@ def test_screening_snapshot_rebuilds_today_cache_created_before_close(monkeypatc
     snapshot = client.get_or_build_screening_snapshot(trade_date)
 
     assert client.build_calls == 1
+    assert snapshot["snapshot_version"] == 2
     assert snapshot["stocks"] == [
         {"ts_code": "600000.SH", "name": "PF Bank"},
         {"ts_code": "000001.SZ", "name": "SZ Bank"},
     ]
     assert snapshot["daily_basic"] == {
-        "600000.SH": {"ts_code": "600000.SH", "close": 10.5, "turnover_rate": 1.2, "total_mv": 1200000},
+        "600000.SH": {"ts_code": "600000.SH", "close": 10.5, "turnover_rate": 1.2, "total_mv": 1200000, "volume_ratio": 1.4},
         "000001.SZ": {"ts_code": "000001.SZ", "close": 12.3, "turnover_rate": 0.9, "volume_ratio": 1.1},
     }
+    assert len(snapshot["daily"]["600000.SH"]) == 3
+    assert len(snapshot["daily"]["000001.SZ"]) == 2
+    assert client.history_calls == [(["600000.SH", "000001.SZ"], trade_date, 60)]
 
 
 def test_screening_snapshot_rebuilds_invalid_today_cache_created_after_close(monkeypatch, tmp_path) -> None:
@@ -576,7 +676,7 @@ def test_screening_snapshot_hits_valid_today_cache_created_after_close(monkeypat
     snapshot_path = client._screening_snapshot_path(trade_date)
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot_path.write_text(
-        '{"trade_date":"20260327","created_at":"2026-03-27T16:05:00","stocks":[{"ts_code":"000001.SZ","name":"SZ Bank"}],"daily_basic":{"000001.SZ":{"ts_code":"000001.SZ","close":12.3,"turnover_rate":0.9}},"daily":{}}',
+        '{"snapshot_version":2,"trade_date":"20260327","created_at":"2026-03-27T16:05:00","stocks":[{"ts_code":"000001.SZ","name":"SZ Bank"}],"daily_basic":{"000001.SZ":{"ts_code":"000001.SZ","close":12.3,"turnover_rate":0.9,"volume_ratio":1.1}},"daily":{"000001.SZ":[{"trade_date":"20260327","close":12.3},{"trade_date":"20260326","close":12.1}]}}',
         encoding="utf-8",
     )
 
@@ -615,7 +715,7 @@ def test_screening_snapshot_uses_file_mtime_when_created_at_missing(monkeypatch,
     snapshot_path = client._screening_snapshot_path(trade_date)
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot_path.write_text(
-        '{"trade_date":"20260327","stocks":[{"ts_code":"000001.SZ","name":"SZ Bank"}],"daily_basic":{"000001.SZ":{"ts_code":"000001.SZ","close":12.3,"turnover_rate":0.9}},"daily":{}}',
+        '{"snapshot_version":2,"trade_date":"20260327","stocks":[{"ts_code":"000001.SZ","name":"SZ Bank"}],"daily_basic":{"000001.SZ":{"ts_code":"000001.SZ","close":12.3,"turnover_rate":0.9,"volume_ratio":1.1}},"daily":{"000001.SZ":[{"trade_date":"20260327","close":12.3},{"trade_date":"20260326","close":12.1}]}}',
         encoding="utf-8",
     )
     mtime = datetime(2026, 3, 27, 16, 10, 0).timestamp()
@@ -694,7 +794,7 @@ def test_screening_snapshot_hits_valid_historical_cache(monkeypatch, tmp_path) -
     snapshot_path = client._screening_snapshot_path(trade_date)
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot_path.write_text(
-        '{"trade_date":"20260326","created_at":"2026-03-26T10:00:00","stocks":[{"ts_code":"000001.SZ","name":"SZ Bank"}],"daily_basic":{"000001.SZ":{"ts_code":"000001.SZ","close":12.3,"turnover_rate":0.9}},"daily":{}}',
+        '{"snapshot_version":2,"trade_date":"20260326","created_at":"2026-03-26T10:00:00","stocks":[{"ts_code":"000001.SZ","name":"SZ Bank"}],"daily_basic":{"000001.SZ":{"ts_code":"000001.SZ","close":12.3,"turnover_rate":0.9,"volume_ratio":1.1}},"daily":{"000001.SZ":[{"trade_date":"20260326","close":12.3},{"trade_date":"20260325","close":12.0}]}}',
         encoding="utf-8",
     )
 
@@ -729,6 +829,7 @@ def test_screening_snapshot_skips_writing_invalid_build(tmp_path) -> None:
     client = ScreeningSnapshotClient(tmp_path)
     trade_date = "20260327"
     snapshot = {
+        "snapshot_version": 2,
         "trade_date": trade_date,
         "created_at": "2026-03-27T16:30:00",
         "stocks": [{"ts_code": "600000.SH", "name": "PF Bank"}],
@@ -739,3 +840,280 @@ def test_screening_snapshot_skips_writing_invalid_build(tmp_path) -> None:
     client._write_screening_snapshot(trade_date, snapshot)
 
     assert client._read_screening_snapshot(trade_date) is None
+
+
+def test_screening_snapshot_build_returns_invalid_payload_without_writing_cache(tmp_path) -> None:
+    client = ScreeningSnapshotClient(tmp_path)
+    trade_date = "20260327"
+    client.daily_basic_payload = {"600000.SH": {"ts_code": "600000.SH", "turnover_rate": 1.2}}
+    client.daily_history_payload = {}
+
+    snapshot = client.get_or_build_screening_snapshot(trade_date)
+
+    assert client.build_calls == 1
+    assert snapshot["daily"] == {}
+    assert client._screening_snapshot_invalid_reason(snapshot) == "daily_no_matching_ts_code"
+    assert not client._read_screening_snapshot(trade_date)
+
+
+def test_fetch_screening_daily_history_batch_builds_qfq_history_and_enriches_latest_basic(monkeypatch) -> None:
+    client = object.__new__(TushareClient)
+    client._settings = Settings(TUSHARE_TOKEN="token", OCTTS_MEMORY_BACKEND="file", OCTTS_MEMORY_FILE_PATH="memory.json")
+
+    class BatchOnly:
+        def daily(self, *, trade_date: str):
+            if trade_date == "20260326":
+                return pd.DataFrame(
+                    [
+                        {
+                            "ts_code": "600000.SH",
+                            "trade_date": "20260326",
+                            "close": 10.0,
+                            "high": 10.5,
+                            "low": 9.8,
+                            "vol": 1000,
+                            "amount": 10000,
+                            "pct_chg": 1.0,
+                        },
+                        {
+                            "ts_code": "000001.SZ",
+                            "trade_date": "20260326",
+                            "close": 20.0,
+                            "high": 20.4,
+                            "low": 19.5,
+                            "vol": 2000,
+                            "amount": 30000,
+                            "pct_chg": -0.5,
+                        },
+                    ]
+                )
+            if trade_date == "20260327":
+                return pd.DataFrame(
+                    [
+                        {
+                            "ts_code": "600000.SH",
+                            "trade_date": "20260327",
+                            "close": 12.0,
+                            "high": 12.4,
+                            "low": 11.8,
+                            "vol": 1200,
+                            "amount": 15000,
+                            "pct_chg": 2.0,
+                        },
+                        {
+                            "ts_code": "000001.SZ",
+                            "trade_date": "20260327",
+                            "close": None,
+                            "high": 20.6,
+                            "low": 19.8,
+                            "vol": 1800,
+                            "amount": 28000,
+                            "pct_chg": 0.3,
+                        },
+                        {
+                            "ts_code": "300001.SZ",
+                            "trade_date": "20260327",
+                            "close": 30.0,
+                            "high": 30.5,
+                            "low": 29.8,
+                            "vol": 900,
+                            "amount": 12000,
+                            "pct_chg": 1.2,
+                        },
+                    ]
+                )
+            return pd.DataFrame()
+
+        def adj_factor(self, *, trade_date: str):
+            if trade_date == "20260326":
+                return pd.DataFrame(
+                    [
+                        {"ts_code": "600000.SH", "trade_date": "20260326", "adj_factor": 1.0},
+                        {"ts_code": "000001.SZ", "trade_date": "20260326", "adj_factor": 2.0},
+                    ]
+                )
+            if trade_date == "20260327":
+                return pd.DataFrame(
+                    [
+                        {"ts_code": "600000.SH", "trade_date": "20260327", "adj_factor": 1.2},
+                        {"ts_code": "000001.SZ", "trade_date": "20260327", "adj_factor": 2.2},
+                        {"ts_code": "300001.SZ", "trade_date": "20260327", "adj_factor": 3.0},
+                    ]
+                )
+            return pd.DataFrame()
+
+    client._pro = BatchOnly()
+
+    monkeypatch.setattr(
+        client,
+        "fetch_trading_dates",
+        lambda *, start_date, end_date: ["20260326", "20260327"],
+    )
+    monkeypatch.setattr(
+        client,
+        "fetch_daily_basic_batch",
+        lambda *, ts_codes, trade_date: {
+            "600000.SH": {"turnover_rate": 1.2, "volume_ratio": 1.4},
+            "000001.SZ": {"turnover_rate": 0.9, "volume_ratio": 1.1},
+        },
+    )
+    monkeypatch.setattr(
+        client,
+        "_fetch_screening_daily_basic_rows_by_trade_dates",
+        lambda *, ts_codes, trading_dates: {
+            "600000.SH": {
+                "20260327": {"turnover_rate": 1.2, "volume_ratio": 1.4},
+                "20260326": {"turnover_rate": 1.0, "volume_ratio": 1.2},
+            },
+            "000001.SZ": {
+                "20260326": {"turnover_rate": 0.8, "volume_ratio": 1.0},
+            },
+        },
+    )
+
+    result = client.fetch_screening_daily_history_batch(
+        ts_codes=["600000.SH", "000001.SZ"],
+        trade_date="20260327",
+    )
+
+    assert [row["trade_date"] for row in result["600000.SH"]] == ["20260327", "20260326"]
+    assert result["600000.SH"][0]["turnover_rate"] == 1.2
+    assert result["600000.SH"][0]["volume_ratio"] == 1.4
+    assert result["600000.SH"][0]["close"] == 12.0
+    assert result["600000.SH"][1]["turnover_rate"] == 1.0
+    assert result["600000.SH"][1]["volume_ratio"] == 1.2
+    assert result["600000.SH"][1]["close"] == 12.0
+    assert result["600000.SH"][1]["high"] == 12.6
+    assert round(result["600000.SH"][1]["low"], 4) == 11.76
+    assert len(result["000001.SZ"]) == 1
+    assert result["000001.SZ"][0]["trade_date"] == "20260326"
+    assert result["000001.SZ"][0]["turnover_rate"] == 0.8
+    assert result["000001.SZ"][0]["volume_ratio"] == 1.0
+    assert result["000001.SZ"][0]["close"] == 22.0
+    assert result["000001.SZ"][0]["high"] == 22.44
+    assert round(result["000001.SZ"][0]["low"], 4) == 21.45
+    assert result["000001.SZ"][0]["vol"] == 2000.0
+    assert result["000001.SZ"][0]["amount"] == 30000.0
+    assert result["000001.SZ"][0]["pct_chg"] == -0.5
+
+
+def test_fetch_screening_daily_history_batch_uses_previous_adj_factor_when_latest_day_factor_missing(monkeypatch) -> None:
+    client = object.__new__(TushareClient)
+    client._settings = Settings(TUSHARE_TOKEN="token", OCTTS_MEMORY_BACKEND="file", OCTTS_MEMORY_FILE_PATH="memory.json")
+
+    class BatchOnly:
+        def daily(self, *, trade_date: str):
+            if trade_date == "20260326":
+                return pd.DataFrame(
+                    [
+                        {
+                            "ts_code": "600000.SH",
+                            "trade_date": "20260326",
+                            "close": 10.0,
+                            "high": 10.5,
+                            "low": 9.8,
+                            "vol": 1000,
+                            "amount": 10000,
+                            "pct_chg": 1.0,
+                        }
+                    ]
+                )
+            if trade_date == "20260327":
+                return pd.DataFrame(
+                    [
+                        {
+                            "ts_code": "600000.SH",
+                            "trade_date": "20260327",
+                            "close": 12.0,
+                            "high": 12.4,
+                            "low": 11.8,
+                            "vol": 1200,
+                            "amount": 15000,
+                            "pct_chg": 2.0,
+                        }
+                    ]
+                )
+            return pd.DataFrame()
+
+        def adj_factor(self, *, trade_date: str):
+            if trade_date == "20260326":
+                return pd.DataFrame(
+                    [
+                        {"ts_code": "600000.SH", "trade_date": "20260326", "adj_factor": 1.0},
+                    ]
+                )
+            if trade_date == "20260327":
+                return pd.DataFrame()
+            return pd.DataFrame()
+
+    client._pro = BatchOnly()
+
+    monkeypatch.setattr(
+        client,
+        "fetch_trading_dates",
+        lambda *, start_date, end_date: ["20260326", "20260327"],
+    )
+    monkeypatch.setattr(
+        client,
+        "fetch_daily_basic_batch",
+        lambda *, ts_codes, trade_date: {
+            "600000.SH": {"turnover_rate": 1.2, "volume_ratio": 1.4},
+        },
+    )
+    monkeypatch.setattr(
+        client,
+        "_fetch_screening_daily_basic_rows_by_trade_dates",
+        lambda *, ts_codes, trading_dates: {
+            "600000.SH": {
+                "20260327": {"turnover_rate": 1.2, "volume_ratio": 1.4},
+                "20260326": {"turnover_rate": 1.0, "volume_ratio": 1.1},
+            },
+        },
+    )
+
+    result = client.fetch_screening_daily_history_batch(
+        ts_codes=["600000.SH"],
+        trade_date="20260327",
+    )
+
+    assert [row["trade_date"] for row in result["600000.SH"]] == ["20260327", "20260326"]
+    assert result["600000.SH"][0]["close"] == 12.0
+    assert result["600000.SH"][1]["close"] == 10.0
+    assert result["600000.SH"][0]["turnover_rate"] == 1.2
+    assert result["600000.SH"][0]["volume_ratio"] == 1.4
+    assert result["600000.SH"][1]["turnover_rate"] == 1.0
+    assert result["600000.SH"][1]["volume_ratio"] == 1.1
+
+
+def test_screening_snapshot_invalid_reason_rejects_missing_history_rows(tmp_path) -> None:
+    client = ScreeningSnapshotClient(tmp_path)
+    snapshot = {
+        "snapshot_version": 2,
+        "trade_date": "20260327",
+        "stocks": [{"ts_code": "600000.SH"}],
+        "daily_basic": {"600000.SH": {"ts_code": "600000.SH", "close": 10.5, "turnover_rate": 1.2}},
+        "daily": {"600000.SH": [{"trade_date": "20260327", "close": 10.5}]},
+    }
+
+    assert client._screening_snapshot_invalid_reason(snapshot) == "daily_history_insufficient"
+
+
+def test_screening_snapshot_invalid_reason_rejects_old_version_and_accepts_valid_history(tmp_path) -> None:
+    client = ScreeningSnapshotClient(tmp_path)
+
+    invalid_snapshot = {
+        "trade_date": "20260327",
+        "stocks": [{"ts_code": "600000.SH"}],
+        "daily_basic": {"600000.SH": {"ts_code": "600000.SH", "close": 10.5, "turnover_rate": 1.2}},
+        "daily": {"600000.SH": [{"trade_date": "20260327", "close": 10.5}, {"trade_date": "20260326", "close": 10.2}]},
+    }
+    valid_snapshot = {
+        "snapshot_version": 2,
+        "trade_date": "20260327",
+        "stocks": [{"ts_code": "600000.SH"}],
+        "daily_basic": {"600000.SH": {"ts_code": "600000.SH", "close": 10.5, "turnover_rate": 1.2}},
+        "daily": {"600000.SH": [{"trade_date": "20260327", "close": 10.5}, {"trade_date": "20260326", "close": 10.2}]},
+    }
+
+    assert client._screening_snapshot_invalid_reason(invalid_snapshot) == "snapshot_version_mismatch"
+    assert client._screening_snapshot_invalid_reason(valid_snapshot) is None

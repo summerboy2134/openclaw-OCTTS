@@ -55,7 +55,14 @@ class StockScreeningScheduler:
         results = {}
         total_stocks = 0
         trade_date = self.screener._get_latest_trade_date()
+        logger.info("Daily stock screening resolve trade_date: %s", trade_date)
         market_snapshot = self.screener.client.get_or_build_screening_snapshot(trade_date)
+        logger.info(
+            "Daily stock screening snapshot ready: stocks=%s, basic=%s, cached_daily=%s",
+            len(market_snapshot.get("stocks", [])),
+            len(market_snapshot.get("daily_basic", {})),
+            sum(1 for items in market_snapshot.get("daily", {}).values() if items),
+        )
 
         logger.info(
             "Daily stock screening: %s strategies queued, shared trade_date=%s",
@@ -179,6 +186,7 @@ class StockScreeningScheduler:
 
         snapshot = {
             "generated_at": report.get("report_time") or datetime.now().isoformat(),
+            "snapshot_type": "daily_screening_compat",
             "screening_results": {
                 "strategy_count": len([result for result in screening_results.values() if result is not None]),
                 "total_stocks": total_stocks,
@@ -199,17 +207,19 @@ class StockScreeningScheduler:
             "intelligent_report": {
                 "report_id": report.get("report_id", ""),
                 "title": "定时选股结果（兼容快照）",
-                "summary": f"本次自动任务产出的是普通定时选股结果，已兼容写入智能页 latest 快照。共命中 {total_stocks} 只股票。",
+                "summary": f"本次自动任务产出的是普通定时选股结果，保存在兼容快照中。共命中 {total_stocks} 只股票。",
                 "sections": [],
                 "recommendations": [],
                 "key_points": [],
             },
         }
 
-        snapshot_path = Path(self.settings.history_dir_path) / "intelligent_screening" / "latest.json"
-        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(snapshot_path, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f, ensure_ascii=False, indent=2)
+        snapshot_dir = Path(self.settings.history_dir_path) / "intelligent_screening"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        for file_name in ("daily_screening_compat_latest.json", "latest.json"):
+            snapshot_path = snapshot_dir / file_name
+            with open(snapshot_path, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=False, indent=2)
 
     async def _send_notifications(self, report: Dict[str, Any]) -> None:
         """发送选股结果通知"""

@@ -4,10 +4,11 @@ import html
 import json
 import logging
 import re
+import time
 from datetime import date, datetime, timedelta
 from uuid import uuid4
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from octts.clients.email_client import EmailClient
 from octts.clients.wecom_client import WeComClient
@@ -30,9 +31,28 @@ logger = logging.getLogger(__name__)
 TOP_RECOMMENDATION_LIMIT = 10
 TODAY_TOP_LIMIT = 3
 WINDOW_RECOMMENDATION_TAG = "今日候选"
+LLM_REVIEW_CANDIDATE_LIMIT = 6
 REPEAT_CONFIDENCE_BONUS = 0.08
 MAX_CONFIDENCE = 0.98
 INDUSTRY_FLOW_SCORE_CAP = 3.0
+DISTRIBUTION_RISK_BLOCK_SCORE = 3.5
+TOP3_MAX_DISTRIBUTION_RISK_SCORE = 2.1
+TOP10_MAX_DISTRIBUTION_RISK_SCORE = 3.2
+TOP3_RISK_PENALTY_MULTIPLIER = 12.0
+TOP10_RISK_PENALTY_MULTIPLIER = 8.5
+TOP3_DIVERGENCE_PENALTY_MULTIPLIER = 0.25
+TOP3_CONTRADICTION_PENALTY = 8.0
+CONTINUATION_BIAS_MAX_ABS = 6.0
+REPEAT_PICK_CONTINUATION_BONUS = 1.5
+DISTRIBUTION_TURNOVER_SPIKE_HIGH = 1.6
+DISTRIBUTION_TURNOVER_SPIKE_VERY_HIGH = 2.1
+DISTRIBUTION_VOLUME_RATIO_HIGH = 2.5
+DISTRIBUTION_RECENT_RUNUP_HIGH = 10.0
+DISTRIBUTION_PRICE_POSITION_HIGH = 0.88
+THEME_SUPPORT_SCORE_STRONG = 3.4
+THEME_SUPPORT_SCORE_MEDIUM = 2.0
+UNSUPPORTED_HIGH_POSITION_EXTRA_PENALTY = 3.8
+JUSTIFIED_TURNOVER_RELIEF = 1.8
 
 
 class EnhancedScreeningScheduler:
@@ -54,7 +74,7 @@ class EnhancedScreeningScheduler:
         self.screener = screener or StockScreener(settings)
         self.store = store or ScreeningStore(settings)
         self.analyzer = analyzer or MultiDimensionalAnalyzer(settings)
-        self.news_aggregator = news_aggregator or NewsAggregator(settings)
+        self.news_aggregator = news_aggregator or NewsAggregator(settings, progress_callback=progress_callback)
         self.report_generator = report_generator or IntelligentReportGenerator(
             settings,
             analyzer=self.analyzer
@@ -112,10 +132,27 @@ class EnhancedScreeningScheduler:
             details={"news_count": len(news_items)},
         )
         logger.info("Step 1.2: Starting news importance analysis for %s items", len(news_items))
+        await self._report_progress(
+            current_step=1,
+            total_steps=total_steps,
+            step_name="新闻采集",
+            progress_percent=14,
+            message="正在分析新闻重要性...",
+            details={"news_count": len(news_items), "phase": "importance_analysis"},
+        )
         news_items = await self.news_aggregator.analyze_importance(news_items)
         logger.info("Step 1.2 complete")
+        await self._report_progress(
+            current_step=1,
+            total_steps=total_steps,
+            step_name="新闻采集",
+            progress_percent=18,
+            message="新闻重要性分析完成，正在进行主题聚类...",
+            details={"news_count": len(news_items), "phase": "clustering"},
+        )
         logger.info("Step 1.3: Starting news clustering for %s items", len(news_items))
         news_clusters = await self.news_aggregator.cluster_news(news_items)
+        self._latest_news_clusters = news_clusters
         logger.info("Step 1.3 complete: Generated %s clusters", len(news_clusters))
         await self._report_progress(
             current_step=1,
@@ -148,18 +185,22 @@ class EnhancedScreeningScheduler:
             details={"strategy_count": len(screening_results)},
         )
 
-        # 3. AI深度分析展示窗口股票
-        logger.info("Step 3: AI analysis for display stocks")
+        # 3. AI深度分析今日候选窗口 + 昨日 Top3 复盘集合
+        logger.info("Step 3: AI analysis for today candidate window and yesterday Top3 review set")
         candidate_limit = max(TOP_RECOMMENDATION_LIMIT, self.settings.screening_top_n)
         candidate_codes = self._get_top_stocks(screening_results, limit=candidate_limit)
         eligible_candidate_codes = self._filter_out_tracked_and_holding_codes(candidate_codes)
-        analysis_target_codes = eligible_candidate_codes[:TOP_RECOMMENDATION_LIMIT]
+        analysis_target_codes = self._build_analysis_target_codes(
+            trade_date=datetime.strptime(trade_date, "%Y%m%d").date(),
+            candidate_codes=eligible_candidate_codes,
+            screening_results=screening_results,
+        )
         await self._report_progress(
             current_step=3,
             total_steps=total_steps,
             step_name="AI 深度分析",
             progress_percent=42,
-            message="正在分析当前 Top10 展示窗口股票...",
+            message="正在分析今日 Top3 + 昨日 Top3 复盘集合...",
             details={"total_items": len(analysis_target_codes), "completed_items": 0},
         )
         ai_analyses = await self._analyze_top_stocks(
@@ -170,6 +211,7 @@ class EnhancedScreeningScheduler:
 
         # 4. 结合新闻和技术面筛选
         logger.info("Step 4: Combining news and technical analysis")
+        step4_started_at = time.perf_counter()
         await self._report_progress(
             current_step=4,
             total_steps=total_steps,
@@ -178,20 +220,37 @@ class EnhancedScreeningScheduler:
             message="正在融合新闻、技术和 AI 分析结果...",
             details={"analyzed_items": len(ai_analyses)},
         )
+        snapshot_started_at = time.perf_counter()
         market_snapshot = self.screener.client.get_or_build_screening_snapshot(trade_date)
+        logger.info(
+            "Step 4.1 complete: screening snapshot ready in %.2fs, cache_status=%s, trade_date=%s, stocks=%s, basic=%s, cached_daily=%s",
+            time.perf_counter() - snapshot_started_at,
+            self._describe_snapshot_cache_status(market_snapshot, trade_date),
+            trade_date,
+            len(market_snapshot.get("stocks", [])) if isinstance(market_snapshot, dict) else 0,
+            len(market_snapshot.get("daily_basic", {})) if isinstance(market_snapshot, dict) else 0,
+            len(market_snapshot.get("daily", {})) if isinstance(market_snapshot, dict) else 0,
+        )
+        combine_started_at = time.perf_counter()
         final_recommendations = await self._combine_analysis(
             screening_results,
             ai_analyses,
             news_clusters,
             market_snapshot=market_snapshot,
         )
+        logger.info(
+            "Step 4.2 complete: combine analysis finished in %.2fs, recommendations=%s",
+            time.perf_counter() - combine_started_at,
+            len(final_recommendations),
+        )
+        logger.info("Step 4 complete: total %.2fs", time.perf_counter() - step4_started_at)
         pool_states = self._build_recommendation_pool_states(
             trade_date=datetime.strptime(trade_date, "%Y%m%d").date(),
             screening_results=screening_results,
             final_recommendations=final_recommendations,
             candidate_codes=eligible_candidate_codes,
         )
-        self.store.upsert_recommendation_pool_states(pool_states)
+        persisted_pool_states = self.store.upsert_recommendation_pool_states(pool_states)
 
         # 5. 生成智能报告
         logger.info("Step 5: Generating intelligent report")
@@ -204,11 +263,35 @@ class EnhancedScreeningScheduler:
             details={"final_recommendations": len(final_recommendations)},
         )
         market_data = await self._get_market_data()
+        await self._report_progress(
+            current_step=5,
+            total_steps=total_steps,
+            step_name="生成报告",
+            progress_percent=90,
+            message="市场数据已准备，正在组装报告上下文...",
+            details={"final_recommendations": len(final_recommendations), "phase": "build_context"},
+        )
         report_context = self._build_report_context(
             trade_date=datetime.strptime(trade_date, "%Y%m%d").date(),
-            pool_states=[item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item) for item in pool_states],
+            pool_states=persisted_pool_states or self.store.list_recommendation_pool(
+                trade_date=datetime.strptime(trade_date, "%Y%m%d").date()
+            ),
             ai_analyses=ai_analyses,
             final_recommendations=final_recommendations,
+        )
+        report_context.update(
+            await self.news_aggregator.collect_focus_stock_live_context(
+                today_top3=report_context.get("today_top3") or [],
+                yesterday_top3_review=report_context.get("yesterday_top3_review") or [],
+            )
+        )
+        await self._report_progress(
+            current_step=5,
+            total_steps=total_steps,
+            step_name="生成报告",
+            progress_percent=92,
+            message="正在调用模型生成报告正文...",
+            details={"final_recommendations": len(final_recommendations), "phase": "llm_report_generation"},
         )
         report = await self.report_generator.generate_morning_report(
             news_clusters=news_clusters,
@@ -354,6 +437,8 @@ class EnhancedScreeningScheduler:
             )
             return analyses
 
+        news_context = self._build_news_score_context(getattr(self, "_latest_news_clusters", []) or [])
+
         # 并行分析所有股票
         logger.info(f"Starting parallel analysis for {total_items} stocks")
         tasks = []
@@ -362,7 +447,8 @@ class EnhancedScreeningScheduler:
             task = self.analyzer.analyze(
                 code,
                 enable_iterations=True,
-                max_iterations=3
+                max_iterations=2,
+                news_context=news_context,
             )
             tasks.append((code, task))
 
@@ -386,6 +472,19 @@ class EnhancedScreeningScheduler:
             try:
                 analysis = await task
                 analyses[code] = analysis
+                logger.info(
+                    "AI analysis result for %s: keys=%s, overall_score=%s, overall_confidence=%s, summary=%s, recommendation=%s, technical_score=%s, fundamental_score=%s, sentiment_score=%s, news_score=%s",
+                    code,
+                    sorted(list(analysis.keys())) if isinstance(analysis, dict) else type(analysis).__name__,
+                    analysis.get("overall_score") if isinstance(analysis, dict) else None,
+                    analysis.get("overall_confidence") if isinstance(analysis, dict) else None,
+                    (str(analysis.get("summary"))[:200] if isinstance(analysis, dict) and analysis.get("summary") is not None else None),
+                    (str(analysis.get("recommendation"))[:200] if isinstance(analysis, dict) and analysis.get("recommendation") is not None else None),
+                    analysis.get("technical_score") if isinstance(analysis, dict) else None,
+                    analysis.get("fundamental_score") if isinstance(analysis, dict) else None,
+                    analysis.get("sentiment_score") if isinstance(analysis, dict) else None,
+                    analysis.get("news_score") if isinstance(analysis, dict) else None,
+                )
                 logger.info(f"Successfully analyzed {code}")
             except Exception as e:
                 logger.error(f"Failed to analyze {code}: {e}", exc_info=True)
@@ -444,21 +543,91 @@ class EnhancedScreeningScheduler:
         Returns:
             {股票代码: {推荐信息}}
         """
+        started_at = time.perf_counter()
         final_recommendations = {}
         stock_map = self._build_screened_stock_map(screening_results)
         all_market_stock_map = self._build_all_market_stock_map(market_snapshot)
+        logger.info(
+            "Step 4 combine start: candidate_stocks=%s, ai_analyses=%s, news_clusters=%s, all_market_stocks=%s",
+            len(stock_map),
+            len(ai_analyses),
+            len(news_clusters),
+            len(all_market_stock_map),
+        )
         industry_adjustments = self._build_industry_flow_adjustments(
             stock_map,
             all_market_stock_map=all_market_stock_map,
+            market_snapshot=market_snapshot,
         )
+        distribution_risk_map = self._build_distribution_risk_map(stock_map, market_snapshot=market_snapshot)
+        logger.info(
+            "Step 4 risk map built: total=%s, with_score=%s, blocked=%s, sample=%s",
+            len(distribution_risk_map),
+            sum(1 for item in distribution_risk_map.values() if item.get("distribution_risk_score") is not None),
+            sum(1 for item in distribution_risk_map.values() if item.get("candidate_risk_blocked")),
+            [
+                {
+                    "code": risk_code,
+                    "score": risk_payload.get("distribution_risk_score"),
+                    "moneyflow_3d_value": risk_payload.get("moneyflow_3d_value"),
+                    "recent_runup_5d": risk_payload.get("recent_runup_5d"),
+                    "turnover_spike_ratio": risk_payload.get("turnover_spike_ratio"),
+                    "blocked": risk_payload.get("candidate_risk_blocked"),
+                }
+                for risk_code, risk_payload in list(distribution_risk_map.items())[:5]
+            ],
+        )
+        debug_codes = ["603182.SH", "688618.SH", "300692.SZ"]
+        logger.info(
+            "Step 4 risk map debug: %s",
+            {
+                code: distribution_risk_map.get(code)
+                for code in debug_codes
+                if code in distribution_risk_map
+            },
+        )
+        previous_states: Dict[str, Dict[str, Any]] = {}
+        previous_top3_codes = set()
+        try:
+            current_trade_date = datetime.strptime(self.screener._get_latest_trade_date(), "%Y%m%d").date()
+            previous_trade_date = self.store.get_previous_recommendation_pool_trade_date(current_trade_date)
+            if previous_trade_date:
+                previous_states = {
+                    item.get("ts_code"): item
+                    for item in self.store.load_recommendation_pool_state(trade_date=previous_trade_date)
+                    if item.get("ts_code")
+                }
+                previous_top3_codes = set(self._get_previous_top3_codes(current_trade_date))
+        except Exception:
+            previous_states = {}
+            previous_top3_codes = set()
 
         # 从新闻中提取热点股票
         news_hot_stocks = self._extract_news_hot_stocks(news_clusters)
+        theme_support_map = self._build_theme_support_map(
+            stock_map,
+            news_clusters=news_clusters,
+            news_hot_stocks=news_hot_stocks,
+            industry_adjustments=industry_adjustments,
+            distribution_risk_map=distribution_risk_map,
+            screening_results=screening_results,
+        )
 
         # 遍历AI分析结果
         for code, analysis in ai_analyses.items():
             confidence = analysis.get("overall_confidence", 0)
             score = analysis.get("overall_score", 50)
+            if code in {"002269.SZ", "301226.SZ", "600222.SH"}:
+                logger.info(
+                    "Step 4 combine candidate %s: has_real_ai=%s, analysis_keys=%s, overall_score=%s, base_score=%s, technical_score=%s, distribution_risk=%s",
+                    code,
+                    self._has_real_ai_overall_score(analysis),
+                    sorted(list(analysis.keys())) if isinstance(analysis, dict) else [],
+                    analysis.get("overall_score") if isinstance(analysis, dict) else None,
+                    analysis.get("base_score") if isinstance(analysis, dict) else None,
+                    analysis.get("technical_score") if isinstance(analysis, dict) else None,
+                    distribution_risk_map.get(code),
+                )
 
             # 计算综合得分
             # 基础分 = AI分析分数
@@ -477,16 +646,50 @@ class EnhancedScreeningScheduler:
 
             industry_adjustment = industry_adjustments.get(code, {})
             industry_heat_score = float(industry_adjustment.get("industry_heat_score") or 0.0)
-            adjusted_final_score = final_score + industry_heat_score
-            weighted_score = adjusted_final_score * confidence
+            distribution_risk = distribution_risk_map.get(code, {})
+            theme_support = theme_support_map.get(code, {})
+            distribution_risk_score = float(distribution_risk.get("distribution_risk_score") or 0.0)
+            extra_risk_penalty = 0.0
+            if distribution_risk.get("latest_weakening_flag"):
+                extra_risk_penalty += 2.0
+            if distribution_risk.get("high_level_pullback_flag"):
+                extra_risk_penalty += 2.2
+            if distribution_risk.get("theme_support_absent_flag"):
+                extra_risk_penalty += 1.2
+            if theme_support.get("unsupported_high_position_flag"):
+                extra_risk_penalty += UNSUPPORTED_HIGH_POSITION_EXTRA_PENALTY
+            if theme_support.get("leader_turnover_justified_flag"):
+                extra_risk_penalty -= JUSTIFIED_TURNOVER_RELIEF
+            ranking_risk_penalty = round(max(0.0, distribution_risk_score * TOP10_RISK_PENALTY_MULTIPLIER + extra_risk_penalty), 2)
+            continuation_bias_score, continuation_positive_flags, continuation_negative_flags = self._build_continuation_bias(
+                code,
+                analysis,
+                distribution_risk=distribution_risk,
+                theme_support=theme_support,
+                industry_adjustment=industry_adjustment,
+                strategy_count=appearance_count,
+                previous_state=previous_states.get(code),
+                is_previous_top3=code in previous_top3_codes,
+            )
+            adjusted_final_score = final_score + industry_heat_score - ranking_risk_penalty
+            weighted_score = (adjusted_final_score + continuation_bias_score) * confidence
+            passes_threshold = (
+                distribution_risk_score < TOP10_MAX_DISTRIBUTION_RISK_SCORE
+                and not bool(theme_support.get("unsupported_high_position_flag"))
+                and (weighted_score >= 55 or adjusted_final_score >= 60 or final_score >= 65)
+            )
 
-            if weighted_score >= 55:  # 适度放宽综合得分阈值
+            if passes_threshold:  # 避免低置信度将中高分标的全部压没
                 final_recommendations[code] = {
                     "score": weighted_score,
                     "overall_score": score,
                     "final_score": final_score,
                     "adjusted_final_score": adjusted_final_score,
                     "weighted_score": weighted_score,
+                    "ranking_risk_penalty": ranking_risk_penalty,
+                    "continuation_bias_score": continuation_bias_score,
+                    "continuation_positive_flags": continuation_positive_flags,
+                    "continuation_negative_flags": continuation_negative_flags,
                     "ai_confidence": confidence,
                     "ai_summary": analysis.get("summary", ""),
                     "technical_signal": analysis.get("technical_signal", ""),
@@ -494,6 +697,10 @@ class EnhancedScreeningScheduler:
                     "fundamental_score": analysis.get("fundamental_score"),
                     "sentiment_score": analysis.get("sentiment_score"),
                     "news_score": analysis.get("news_score"),
+                    "base_score": analysis.get("base_score"),
+                    "sentiment_adjustment": analysis.get("sentiment_adjustment"),
+                    "news_adjustment": analysis.get("news_adjustment"),
+                    "score_model": analysis.get("score_model"),
                     "news_mentioned": code in news_hot_stocks,
                     "strategy_count": appearance_count,
                     "industry": industry_adjustment.get("industry"),
@@ -502,11 +709,49 @@ class EnhancedScreeningScheduler:
                     "industry_positive_ratio": industry_adjustment.get("industry_positive_ratio"),
                     "industry_3d_net_inflow": industry_adjustment.get("industry_3d_net_inflow"),
                     "industry_flow_value": industry_adjustment.get("industry_flow_value"),
+                    "theme_support_score": theme_support.get("theme_support_score"),
+                    "theme_support_label": theme_support.get("theme_support_label"),
+                    "theme_support_sources": list(theme_support.get("theme_support_sources") or []),
+                    "unsupported_high_position_flag": bool(theme_support.get("unsupported_high_position_flag", False)),
+                    "leader_turnover_justified_flag": bool(theme_support.get("leader_turnover_justified_flag", False)),
+                    "distribution_risk_score": distribution_risk_score,
+                    "distribution_risk_flags": list(distribution_risk.get("distribution_risk_flags") or []),
+                    "moneyflow_3d_value": distribution_risk.get("moneyflow_3d_value"),
+                    "turnover_spike_ratio": distribution_risk.get("turnover_spike_ratio"),
+                    "recent_runup_5d": distribution_risk.get("recent_runup_5d"),
+                    "late_stage_momentum_flag": bool(distribution_risk.get("late_stage_momentum_flag", False)),
+                    "latest_weakening_flag": bool(distribution_risk.get("latest_weakening_flag", False)),
+                    "high_level_pullback_flag": bool(distribution_risk.get("high_level_pullback_flag", False)),
+                    "theme_support_absent_flag": bool(distribution_risk.get("theme_support_absent_flag", False)),
+                    "candidate_risk_blocked": bool(distribution_risk.get("candidate_risk_blocked", False)),
+                    "action_bias": None,
+                    "recommendation_text": self._generate_recommendation(
+                        weighted_score,
+                        analysis,
+                        distribution_risk=distribution_risk,
+                    ),
                     "recommendation": self._generate_recommendation(
                         weighted_score,
-                        analysis
+                        analysis,
+                        distribution_risk=distribution_risk,
                     )
                 }
+                if code in {"603182.SH", "688618.SH", "300692.SZ"}:
+                    logger.info(
+                        "Step 4 final recommendation debug for %s: %s",
+                        code,
+                        {
+                            "overall_score": final_recommendations[code].get("overall_score"),
+                            "base_score": final_recommendations[code].get("base_score"),
+                            "summary": final_recommendations[code].get("ai_summary"),
+                            "distribution_risk_score": final_recommendations[code].get("distribution_risk_score"),
+                            "moneyflow_3d_value": final_recommendations[code].get("moneyflow_3d_value"),
+                            "recent_runup_5d": final_recommendations[code].get("recent_runup_5d"),
+                            "turnover_spike_ratio": final_recommendations[code].get("turnover_spike_ratio"),
+                            "candidate_risk_blocked": final_recommendations[code].get("candidate_risk_blocked"),
+                            "weighted_score": final_recommendations[code].get("weighted_score"),
+                        },
+                    )
 
         # 按分数排序
         sorted_recommendations = dict(
@@ -516,8 +761,120 @@ class EnhancedScreeningScheduler:
                 reverse=True
             )
         )
+        logger.info(
+            "Step 4 combine complete: recommendations=%s, ai_analyses=%s, industry_adjustments=%s, duration=%.2fs",
+            len(sorted_recommendations),
+            len(ai_analyses),
+            len(industry_adjustments),
+            time.perf_counter() - started_at,
+        )
 
         return sorted_recommendations
+
+    @classmethod
+    def _build_continuation_bias(
+        cls,
+        code: str,
+        analysis: Dict[str, Any],
+        *,
+        distribution_risk: Dict[str, Any],
+        theme_support: Dict[str, Any],
+        industry_adjustment: Dict[str, Any],
+        strategy_count: int,
+        previous_state: Optional[Dict[str, Any]],
+        is_previous_top3: bool,
+    ) -> Any:
+        positive_flags: List[str] = []
+        negative_flags: List[str] = []
+        score = 0.0
+
+        moneyflow_3d_value = float(distribution_risk.get("moneyflow_3d_value") or 0.0)
+        if moneyflow_3d_value > 0:
+            score += 1.2
+            positive_flags.append("3日资金承接为正")
+            if moneyflow_3d_value >= 5000:
+                score += 0.8
+                positive_flags.append("3日资金承接偏强")
+        elif moneyflow_3d_value < 0:
+            score -= 1.0
+            negative_flags.append("3日资金承接转弱")
+
+        industry_heat_score = float(industry_adjustment.get("industry_heat_score") or 0.0)
+        if industry_heat_score >= 2.0:
+            score += 0.9
+            positive_flags.append("板块热度支撑")
+        elif industry_heat_score <= -0.5:
+            score -= 0.6
+            negative_flags.append("板块热度偏弱")
+
+        if strategy_count >= 2:
+            score += 0.7
+            positive_flags.append("多策略共振")
+
+        technical_signal = str(analysis.get("technical_signal") or "")
+        if cls._contains_any_keyword(technical_signal, ["突破", "走强", "多头", "放量", "启动"]):
+            score += 0.8
+            positive_flags.append("技术形态偏向延续")
+
+        if bool(theme_support.get("leader_turnover_justified_flag", False)):
+            score += 0.6
+            positive_flags.append("龙头换手具备承接")
+
+        recent_runup_5d = float(distribution_risk.get("recent_runup_5d") or 0.0)
+        if recent_runup_5d >= 10.0:
+            score -= 1.1
+            negative_flags.append("近5日涨幅偏大")
+        elif recent_runup_5d <= 6.0:
+            score += 0.4
+            positive_flags.append("短线位置未明显透支")
+
+        turnover_spike_ratio = float(distribution_risk.get("turnover_spike_ratio") or 0.0)
+        if turnover_spike_ratio >= 2.1:
+            score -= 1.0
+            negative_flags.append("换手放大过快")
+        elif 0 < turnover_spike_ratio <= 1.35:
+            score += 0.4
+            positive_flags.append("换手节奏相对健康")
+
+        distribution_risk_score = float(distribution_risk.get("distribution_risk_score") or 0.0)
+        if distribution_risk_score >= 2.0:
+            score -= 1.2
+            negative_flags.append("分歧派发风险偏高")
+        elif distribution_risk_score <= 1.0:
+            score += 0.5
+            positive_flags.append("分歧风险可控")
+
+        if bool(distribution_risk.get("latest_weakening_flag", False)):
+            score -= 1.0
+            negative_flags.append("尾盘转弱")
+        if bool(distribution_risk.get("high_level_pullback_flag", False)):
+            score -= 1.1
+            negative_flags.append("高位回落")
+        if bool(distribution_risk.get("theme_support_absent_flag", False)):
+            score -= 0.8
+            negative_flags.append("题材支持不足")
+        if bool(theme_support.get("unsupported_high_position_flag", False)):
+            score -= 1.2
+            negative_flags.append("高位缺乏板块支撑")
+
+        if is_previous_top3:
+            previous_score = float((previous_state or {}).get("recommendation_score") or 0.0)
+            current_score = float(analysis.get("overall_score") or 0.0)
+            score_change = (previous_state or {}).get("score_change")
+            if score_change is not None and float(score_change) >= 0 and distribution_risk_score < TOP10_MAX_DISTRIBUTION_RISK_SCORE:
+                score += REPEAT_PICK_CONTINUATION_BONUS
+                positive_flags.append("昨日Top3延续未走坏")
+            elif previous_score and current_score >= previous_score and not bool(distribution_risk.get("latest_weakening_flag", False)):
+                score += 1.0
+                positive_flags.append("昨日Top3强度延续")
+            elif distribution_risk_score >= TOP10_MAX_DISTRIBUTION_RISK_SCORE or bool(distribution_risk.get("latest_weakening_flag", False)) or bool(distribution_risk.get("high_level_pullback_flag", False)):
+                negative_flags.append("昨日Top3但今日风险走弱")
+
+        if bool(distribution_risk.get("candidate_risk_blocked", False)):
+            score = min(score, 0.0)
+
+        score = round(max(-CONTINUATION_BIAS_MAX_ABS, min(CONTINUATION_BIAS_MAX_ABS, score)), 2)
+        return score, positive_flags, negative_flags
 
     @staticmethod
     def _build_screened_stock_map(screening_results: Dict[str, ScreenResult]) -> Dict[str, Any]:
@@ -536,6 +893,7 @@ class EnhancedScreeningScheduler:
         stocks = market_snapshot.get("stocks")
         if not isinstance(stocks, list):
             return {}
+        daily_basic = market_snapshot.get("daily_basic") if isinstance(market_snapshot.get("daily_basic"), dict) else {}
         stock_map: Dict[str, Dict[str, Any]] = {}
         for stock in stocks:
             if not isinstance(stock, dict):
@@ -543,7 +901,11 @@ class EnhancedScreeningScheduler:
             ts_code = str(stock.get("ts_code") or "").strip()
             if not ts_code:
                 continue
-            stock_map.setdefault(ts_code, stock)
+            merged_stock = dict(stock)
+            basic = daily_basic.get(ts_code)
+            if isinstance(basic, dict):
+                merged_stock.update(basic)
+            stock_map.setdefault(ts_code, merged_stock)
         return stock_map
 
     def _build_industry_flow_adjustments(
@@ -551,19 +913,27 @@ class EnhancedScreeningScheduler:
         stock_map: Dict[str, Any],
         *,
         all_market_stock_map: Optional[Dict[str, Dict[str, Any]]] = None,
+        market_snapshot: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Dict[str, Any]]:
+        started_at = time.perf_counter()
         candidate_industries = set()
         for stock in stock_map.values():
             industry = self._extract_industry_name(stock)
             if industry:
                 candidate_industries.add(industry)
 
+        logger.info(
+            "Step 4 industry heat start: candidate_stocks=%s, candidate_industries=%s",
+            len(stock_map),
+            len(candidate_industries),
+        )
         if not candidate_industries:
             return {}
 
         industry_totals = self._build_industry_flow_totals(
             candidate_industries,
             all_market_stock_map=all_market_stock_map or {},
+            market_snapshot=market_snapshot,
         )
 
         adjustments: Dict[str, Dict[str, Any]] = {}
@@ -580,8 +950,14 @@ class EnhancedScreeningScheduler:
                 "industry_heat_score": metrics["industry_heat_score"],
                 "industry_flow_bias": metrics["industry_flow_bias"],
                 "industry_positive_ratio": metrics["industry_positive_ratio"],
-                "industry_flow_value": metrics["industry_3d_net_inflow"],
+                "industry_flow_value": metrics["industry_flow_value"],
             }
+        logger.info(
+            "Step 4 industry heat complete: matched_industries=%s, adjusted_stocks=%s, duration=%.2fs",
+            len(industry_totals),
+            len(adjustments),
+            time.perf_counter() - started_at,
+        )
         return adjustments
 
     def _build_industry_flow_totals(
@@ -589,7 +965,9 @@ class EnhancedScreeningScheduler:
         industries: set[str],
         *,
         all_market_stock_map: Dict[str, Dict[str, Any]],
+        market_snapshot: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Dict[str, Any]]:
+        started_at = time.perf_counter()
         industry_groups: Dict[str, List[str]] = {industry: [] for industry in industries}
         for ts_code, stock in all_market_stock_map.items():
             industry = self._extract_industry_name(stock)
@@ -597,30 +975,451 @@ class EnhancedScreeningScheduler:
                 continue
             industry_groups[industry].append(ts_code)
 
+        daily_basic_map = {}
+        daily_map: Dict[str, List[Dict[str, Any]]] = {}
+        if isinstance(market_snapshot, dict):
+            raw_daily_basic = market_snapshot.get("daily_basic")
+            if isinstance(raw_daily_basic, dict):
+                daily_basic_map = raw_daily_basic
+            raw_daily = market_snapshot.get("daily")
+            if isinstance(raw_daily, dict):
+                daily_map = raw_daily
+        logger.info(
+            "Step 4 industry totals mode: mode=snapshot_based, industries=%s, snapshot_basic=%s, snapshot_daily=%s, fallback_moneyflow=disabled",
+            len(industry_groups),
+            len(daily_basic_map),
+            len(daily_map),
+        )
+
         metrics_map: Dict[str, Dict[str, Any]] = {}
         for industry, ts_codes in industry_groups.items():
             if not ts_codes:
                 continue
-            stock_flows = [self._build_stock_moneyflow_summary(ts_code) for ts_code in ts_codes]
-            valid_flows = [item for item in stock_flows if item is not None]
-            if not valid_flows:
+            industry_started_at = time.perf_counter()
+            metrics = self._build_snapshot_based_industry_metrics(
+                industry,
+                ts_codes,
+                daily_basic_map,
+                daily_map,
+                all_market_stock_map,
+            )
+            if not metrics:
+                logger.info(
+                    "Step 4 industry skipped: industry=%s, stocks=%s, reason=no_snapshot_metrics",
+                    industry,
+                    len(ts_codes),
+                )
                 continue
-            total_inflow = sum(item["recent_3d_net_inflow"] for item in valid_flows)
-            positive_ratio = sum(item["positive_flag"] for item in valid_flows) / len(valid_flows)
-            normalized_flow = 0.0
-            if total_inflow > 0:
-                normalized_flow = 1.0
-            elif total_inflow < 0:
-                normalized_flow = -1.0
-            raw_score = (positive_ratio - 0.5) * 4 + normalized_flow
-            industry_heat_score = max(-INDUSTRY_FLOW_SCORE_CAP, min(INDUSTRY_FLOW_SCORE_CAP, round(raw_score, 2)))
-            metrics_map[industry] = {
-                "industry_3d_net_inflow": round(total_inflow, 2),
-                "industry_positive_ratio": round(positive_ratio, 4),
-                "industry_flow_bias": self._describe_industry_flow_bias(industry_heat_score),
-                "industry_heat_score": industry_heat_score,
-            }
+            metrics_map[industry] = metrics
+            logger.info(
+                "Step 4 industry aggregated: industry=%s, stocks=%s, used=%s, pct_count=%s, pct_sources=%s, positive_ratio=%.4f, heat_score=%.2f, duration=%.2fs",
+                industry,
+                len(ts_codes),
+                metrics.get("industry_stock_count", 0),
+                metrics.get("industry_pct_count", 0),
+                metrics.get("industry_pct_sources", {}),
+                metrics.get("industry_positive_ratio", 0.0),
+                metrics.get("industry_heat_score", 0.0),
+                time.perf_counter() - industry_started_at,
+            )
+        logger.info(
+            "Step 4 industry totals complete: hit_industries=%s/%s, duration=%.2fs",
+            len(metrics_map),
+            len(industry_groups),
+            time.perf_counter() - started_at,
+        )
         return metrics_map
+
+    def _build_snapshot_based_industry_metrics(
+        self,
+        industry: str,
+        ts_codes: List[str],
+        daily_basic_map: Dict[str, Dict[str, Any]],
+        daily_map: Dict[str, List[Dict[str, Any]]],
+        all_market_stock_map: Dict[str, Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        used_count = 0
+        positive_count = 0
+        pct_sum = 0.0
+        amount_sum = 0.0
+        turnover_sum = 0.0
+        volume_ratio_sum = 0.0
+
+        pct_count = 0
+        pct_source_counts = {
+            "daily.pct_chg": 0,
+            "daily.pct_change": 0,
+            "basic.pct_chg": 0,
+            "basic.pct_change": 0,
+            "stock.pct_change": 0,
+            "missing": 0,
+        }
+        for ts_code in ts_codes:
+            basic = daily_basic_map.get(ts_code)
+            stock_snapshot = all_market_stock_map.get(ts_code) or {}
+            if not isinstance(basic, dict):
+                basic = {}
+            if not isinstance(stock_snapshot, dict):
+                stock_snapshot = {}
+            if not basic and not stock_snapshot:
+                continue
+            used_count += 1
+            daily_records = daily_map.get(ts_code) or []
+            latest_daily = daily_records[0] if daily_records and isinstance(daily_records[0], dict) else {}
+            pct_chg = self._safe_float(latest_daily.get("pct_chg"))
+            if pct_chg is not None:
+                pct_source_counts["daily.pct_chg"] += 1
+            else:
+                pct_chg = self._safe_float(latest_daily.get("pct_change"))
+                if pct_chg is not None:
+                    pct_source_counts["daily.pct_change"] += 1
+                else:
+                    pct_chg = self._safe_float(basic.get("pct_chg"))
+                    if pct_chg is not None:
+                        pct_source_counts["basic.pct_chg"] += 1
+                    else:
+                        pct_chg = self._safe_float(basic.get("pct_change"))
+                        if pct_chg is not None:
+                            pct_source_counts["basic.pct_change"] += 1
+                        else:
+                            pct_chg = self._safe_float(stock_snapshot.get("pct_change"))
+                            if pct_chg is not None:
+                                pct_source_counts["stock.pct_change"] += 1
+                            else:
+                                pct_source_counts["missing"] += 1
+            amount = self._safe_float(basic.get("amount"))
+            if amount is None:
+                amount = self._safe_float(stock_snapshot.get("amount"))
+            if amount is None:
+                amount = self._safe_float(latest_daily.get("amount"))
+            turnover_rate = self._safe_float(basic.get("turnover_rate"))
+            volume_ratio = self._safe_float(basic.get("volume_ratio"))
+
+            if pct_chg is not None:
+                pct_count += 1
+                pct_sum += pct_chg
+                if pct_chg > 0:
+                    positive_count += 1
+            if amount is not None:
+                amount_sum += amount
+            if turnover_rate is not None:
+                turnover_sum += turnover_rate
+            if volume_ratio is not None:
+                volume_ratio_sum += volume_ratio
+
+        if used_count == 0:
+            return None
+
+        positive_ratio = (positive_count / pct_count) if pct_count else 0.5
+        avg_pct = (pct_sum / pct_count) if pct_count else 0.0
+        avg_turnover = turnover_sum / used_count
+        avg_volume_ratio = volume_ratio_sum / used_count
+        amount_signal = 0.0
+        if amount_sum > 0:
+            amount_signal = 1.0
+
+        positive_ratio_signal = max(-1.5, min(1.5, (positive_ratio - 0.5) * 5.0))
+        avg_pct_signal = max(-1.3, min(1.3, avg_pct / 2.5))
+        turnover_signal = max(-0.3, min(0.3, (avg_turnover - 3.0) / 8.0))
+        volume_ratio_signal = max(-0.25, min(0.25, (avg_volume_ratio - 1.0) / 3.0))
+        amount_signal = amount_signal * 0.25
+
+        raw_score = (
+            positive_ratio_signal
+            + avg_pct_signal
+            + turnover_signal
+            + volume_ratio_signal
+            + amount_signal
+        )
+        industry_heat_score = max(-INDUSTRY_FLOW_SCORE_CAP, min(INDUSTRY_FLOW_SCORE_CAP, round(raw_score, 2)))
+        flow_value = round(amount_sum, 2) if amount_sum else None
+        return {
+            "industry": industry,
+            "industry_stock_count": used_count,
+            "industry_pct_count": pct_count,
+            "industry_pct_sources": pct_source_counts,
+            "industry_3d_net_inflow": None,
+            "industry_positive_ratio": round(positive_ratio, 4),
+            "industry_flow_bias": self._describe_industry_flow_bias(industry_heat_score),
+            "industry_heat_score": industry_heat_score,
+            "industry_flow_value": flow_value,
+        }
+
+    @staticmethod
+    def _safe_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _build_theme_support_map(
+        self,
+        stock_map: Dict[str, Any],
+        *,
+        news_clusters: List[Any],
+        news_hot_stocks: set[str],
+        industry_adjustments: Dict[str, Dict[str, Any]],
+        distribution_risk_map: Dict[str, Dict[str, Any]],
+        screening_results: Dict[str, ScreenResult],
+    ) -> Dict[str, Dict[str, Any]]:
+        strategy_counts: Dict[str, int] = {}
+        for result in screening_results.values():
+            if not result:
+                continue
+            for stock in result.stocks:
+                strategy_counts[stock.ts_code] = strategy_counts.get(stock.ts_code, 0) + 1
+
+        strong_cluster_hits: Dict[str, int] = {}
+        for cluster in news_clusters:
+            importance = float(getattr(cluster, "importance", 0.0) or 0.0)
+            if importance < 0.6:
+                continue
+            related_codes = set()
+            for value in getattr(cluster, "key_stocks", []) or []:
+                normalized = self._normalize_stock_code(value)
+                if normalized:
+                    related_codes.add(normalized)
+            for item in getattr(cluster, "news_items", []) or []:
+                for value in getattr(item, "related_stocks", []) or []:
+                    normalized = self._normalize_stock_code(value)
+                    if normalized:
+                        related_codes.add(normalized)
+            for code in related_codes:
+                strong_cluster_hits[code] = strong_cluster_hits.get(code, 0) + 1
+
+        support_map: Dict[str, Dict[str, Any]] = {}
+        for code in stock_map:
+            industry_adjustment = industry_adjustments.get(code, {})
+            distribution_risk = distribution_risk_map.get(code, {})
+            strategy_count = strategy_counts.get(code, 0)
+            industry_heat_score = float(industry_adjustment.get("industry_heat_score") or 0.0)
+            industry_flow_bias = str(industry_adjustment.get("industry_flow_bias") or "中性")
+            moneyflow_3d_value = float(distribution_risk.get("moneyflow_3d_value") or 0.0)
+            score = 0.0
+            sources: List[str] = []
+
+            cluster_hit_count = strong_cluster_hits.get(code, 0)
+            if cluster_hit_count > 0:
+                score += min(2.2, 1.4 + 0.4 * (cluster_hit_count - 1))
+                sources.append("高重要度新闻主题命中")
+            elif code in news_hot_stocks:
+                score += 0.9
+                sources.append("新闻提及")
+
+            if strategy_count >= 3:
+                score += 1.2
+                sources.append("多策略共振")
+            elif strategy_count >= 2:
+                score += 0.8
+                sources.append("双策略共振")
+            elif strategy_count == 1:
+                score += 0.3
+
+            if industry_heat_score >= 1.2:
+                score += 1.0
+                sources.append("行业热度偏强")
+            elif industry_heat_score >= 0.45:
+                score += 0.6
+                sources.append("行业热度回暖")
+            elif industry_heat_score <= -0.8:
+                score -= 0.5
+
+            if industry_flow_bias in {"明显偏强", "偏强"}:
+                score += 0.7
+                sources.append("行业资金偏强")
+            elif industry_flow_bias in {"明显偏弱", "偏弱"}:
+                score -= 0.5
+
+            if moneyflow_3d_value >= 12000:
+                score += 1.2
+                sources.append("3日资金承接强")
+            elif moneyflow_3d_value >= 5000:
+                score += 0.6
+                sources.append("3日资金承接尚可")
+            elif moneyflow_3d_value <= 0:
+                score -= 0.8
+            elif moneyflow_3d_value < 3000:
+                score -= 0.4
+
+            if distribution_risk.get("latest_weakening_flag"):
+                score -= 0.5
+            if distribution_risk.get("high_level_pullback_flag"):
+                score -= 0.9
+            if distribution_risk.get("theme_support_absent_flag"):
+                score -= 0.8
+
+            score = round(score, 2)
+            leader_turnover_justified_flag = (
+                score >= THEME_SUPPORT_SCORE_STRONG
+                and (
+                    cluster_hit_count > 0
+                    or strategy_count >= 2
+                    or (industry_heat_score >= 1.2 and moneyflow_3d_value >= 5000)
+                )
+            )
+            unsupported_high_position_flag = bool(
+                distribution_risk.get("theme_support_absent_flag")
+                and not leader_turnover_justified_flag
+                and score < THEME_SUPPORT_SCORE_MEDIUM
+            )
+            if score >= THEME_SUPPORT_SCORE_STRONG:
+                label = "strong"
+            elif score >= THEME_SUPPORT_SCORE_MEDIUM:
+                label = "moderate"
+            else:
+                label = "weak"
+            support_map[code] = {
+                "theme_support_score": score,
+                "theme_support_label": label,
+                "theme_support_sources": sources,
+                "unsupported_high_position_flag": unsupported_high_position_flag,
+                "leader_turnover_justified_flag": leader_turnover_justified_flag,
+            }
+        return support_map
+
+    def _build_distribution_risk_map(
+        self,
+        stock_map: Dict[str, Any],
+        *,
+        market_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        daily_history_map = {}
+        if isinstance(market_snapshot, dict):
+            raw_daily = market_snapshot.get("daily")
+            if isinstance(raw_daily, dict):
+                daily_history_map = raw_daily
+        risk_map: Dict[str, Dict[str, Any]] = {}
+        for code, stock in stock_map.items():
+            daily_rows = daily_history_map.get(code) or []
+            risk_map[code] = self._evaluate_distribution_risk(
+                stock,
+                daily_rows=daily_rows,
+            )
+            if code in {"002269.SZ", "301226.SZ", "600222.SH"}:
+                logger.info(
+                    "Risk evaluation for %s: daily_rows=%s, stock_turnover=%s, stock_volume_ratio=%s, stock_pct_change=%s, result=%s",
+                    code,
+                    len(daily_rows),
+                    (stock.get("turnover_rate") if isinstance(stock, dict) else getattr(stock, "turnover_rate", None)),
+                    (stock.get("volume_ratio") if isinstance(stock, dict) else getattr(stock, "volume_ratio", None)),
+                    (stock.get("pct_change") if isinstance(stock, dict) else getattr(stock, "pct_change", None)),
+                    risk_map[code],
+                )
+        return risk_map
+
+    def _evaluate_distribution_risk(self, stock: Any, *, daily_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if isinstance(stock, dict):
+            ts_code = str(stock.get("ts_code") or "").strip()
+            volume_ratio = self._safe_float(stock.get("volume_ratio")) or 0.0
+            pct_change = self._safe_float(stock.get("pct_change"))
+            if pct_change is None:
+                pct_change = self._safe_float(stock.get("pct_chg")) or 0.0
+            price_position = self._safe_float(stock.get("price_position_20d")) or 0.0
+            turnover_rate = self._safe_float(stock.get("turnover_rate")) or 0.0
+        else:
+            ts_code = str(getattr(stock, "ts_code", "") or "").strip()
+            volume_ratio = self._safe_float(getattr(stock, "volume_ratio", None)) or 0.0
+            pct_change = self._safe_float(getattr(stock, "pct_change", None)) or 0.0
+            price_position = self._safe_float(getattr(stock, "price_position_20d", None)) or 0.0
+            turnover_rate = self._safe_float(getattr(stock, "turnover_rate", None)) or 0.0
+        moneyflow_summary = self._build_stock_moneyflow_summary(ts_code) if ts_code else None
+        moneyflow_3d_value = float((moneyflow_summary or {}).get("recent_3d_net_inflow") or 0.0)
+        recent_runup_5d = self._build_recent_runup_5d(daily_rows)
+        turnover_spike_ratio = self._build_turnover_spike_ratio(daily_rows, turnover_rate)
+
+        latest_row = daily_rows[0] if daily_rows else {}
+        latest_open = self._safe_float(latest_row.get("open"))
+        latest_high = self._safe_float(latest_row.get("high"))
+        latest_close = self._safe_float(latest_row.get("close"))
+        latest_turnover = self._safe_float(latest_row.get("turnover_rate")) or turnover_rate
+        latest_weakening = pct_change <= -1.0
+        if latest_open is not None and latest_close is not None and latest_close < latest_open:
+            latest_weakening = True
+        high_retrace = False
+        if latest_high not in (None, 0) and latest_close is not None:
+            high_retrace = ((latest_high - latest_close) / latest_high) >= 0.03
+            if high_retrace:
+                latest_weakening = True
+        high_turnover_active = latest_turnover >= 12.0 or turnover_spike_ratio >= DISTRIBUTION_TURNOVER_SPIKE_HIGH
+        theme_support_absent_flag = (
+            price_position >= DISTRIBUTION_PRICE_POSITION_HIGH
+            and recent_runup_5d >= DISTRIBUTION_RECENT_RUNUP_HIGH
+            and moneyflow_3d_value <= 3000
+            and turnover_spike_ratio < DISTRIBUTION_TURNOVER_SPIKE_VERY_HIGH
+            and latest_turnover < 18.0
+            and not high_retrace
+        )
+
+        risk_score = 0.0
+        risk_flags: List[str] = []
+        if moneyflow_3d_value <= 0:
+            risk_score += 1.5
+            risk_flags.append("近3日资金未转正")
+        elif moneyflow_3d_value < 5000:
+            risk_score += 0.7
+            risk_flags.append("近3日资金承接偏弱")
+        if turnover_spike_ratio >= DISTRIBUTION_TURNOVER_SPIKE_VERY_HIGH:
+            risk_score += 1.2
+            risk_flags.append("换手较近期明显激增")
+        elif turnover_spike_ratio >= DISTRIBUTION_TURNOVER_SPIKE_HIGH:
+            risk_score += 0.8
+            risk_flags.append("换手较近期抬升")
+        if volume_ratio >= DISTRIBUTION_VOLUME_RATIO_HIGH:
+            risk_score += 0.9
+            risk_flags.append("当日量比偏高")
+        if recent_runup_5d >= DISTRIBUTION_RECENT_RUNUP_HIGH:
+            risk_score += 1.0
+            risk_flags.append("近5日累计涨幅偏大")
+        if price_position >= DISTRIBUTION_PRICE_POSITION_HIGH:
+            risk_score += 0.8
+            risk_flags.append("价格处于20日高位")
+        if latest_weakening:
+            risk_score += 0.9
+            risk_flags.append("最新日转弱")
+        if high_retrace:
+            risk_score += 0.8
+            risk_flags.append("高位冲高回落")
+
+        late_stage_momentum_flag = (
+            price_position >= DISTRIBUTION_PRICE_POSITION_HIGH
+            and turnover_spike_ratio >= DISTRIBUTION_TURNOVER_SPIKE_HIGH
+            and volume_ratio >= DISTRIBUTION_VOLUME_RATIO_HIGH
+            and recent_runup_5d >= DISTRIBUTION_RECENT_RUNUP_HIGH
+            and moneyflow_3d_value <= 0
+        )
+        high_level_pullback_flag = (
+            price_position >= DISTRIBUTION_PRICE_POSITION_HIGH
+            and recent_runup_5d >= DISTRIBUTION_RECENT_RUNUP_HIGH
+            and latest_weakening
+            and moneyflow_3d_value <= 5000
+            and high_turnover_active
+            and volume_ratio >= DISTRIBUTION_VOLUME_RATIO_HIGH
+        )
+        if late_stage_momentum_flag:
+            risk_score += 1.0
+            risk_flags.append("疑似末端分歧")
+        if high_level_pullback_flag:
+            risk_score += 1.1
+            risk_flags.append("高位回调且承接不足")
+        if theme_support_absent_flag:
+            risk_score += 0.8
+            risk_flags.append("高位运行但题材承接不足")
+
+        distribution_risk_score = round(risk_score, 2)
+        return {
+            "distribution_risk_score": distribution_risk_score,
+            "distribution_risk_flags": risk_flags,
+            "moneyflow_3d_value": round(moneyflow_3d_value, 2),
+            "turnover_spike_ratio": round(turnover_spike_ratio, 2),
+            "recent_runup_5d": round(recent_runup_5d, 2),
+            "late_stage_momentum_flag": late_stage_momentum_flag,
+            "latest_weakening_flag": latest_weakening,
+            "high_level_pullback_flag": high_level_pullback_flag,
+            "theme_support_absent_flag": theme_support_absent_flag,
+            "candidate_risk_blocked": distribution_risk_score >= DISTRIBUTION_RISK_BLOCK_SCORE,
+        }
 
     def _build_stock_moneyflow_summary(self, ts_code: str) -> Optional[Dict[str, float]]:
         recent_3d_net_inflow = self._fetch_recent_moneyflow_total(ts_code)
@@ -628,6 +1427,33 @@ class EnhancedScreeningScheduler:
             "recent_3d_net_inflow": recent_3d_net_inflow,
             "positive_flag": 1.0 if recent_3d_net_inflow > 0 else 0.0,
         }
+
+    def _build_turnover_spike_ratio(self, daily_rows: List[Dict[str, Any]], current_turnover_rate: float) -> float:
+        if not daily_rows or current_turnover_rate <= 0:
+            return 0.0
+        recent_rows = sorted(daily_rows, key=lambda item: str(item.get("trade_date") or ""), reverse=True)
+        history_rates: List[float] = []
+        for item in recent_rows[1:6]:
+            value = self._safe_float(item.get("turnover_rate"))
+            if value is not None and value > 0:
+                history_rates.append(value)
+        if not history_rates:
+            return 0.0
+        baseline = sum(history_rates) / len(history_rates)
+        if baseline <= 0:
+            return 0.0
+        return current_turnover_rate / baseline
+
+    def _build_recent_runup_5d(self, daily_rows: List[Dict[str, Any]]) -> float:
+        if not daily_rows:
+            return 0.0
+        recent_rows = sorted(daily_rows, key=lambda item: str(item.get("trade_date") or ""))
+        if len(recent_rows) < 5:
+            return 0.0
+        total = 0.0
+        for item in recent_rows[-5:]:
+            total += self._safe_float(item.get("pct_chg")) or 0.0
+        return total
 
     def _fetch_recent_moneyflow_total(self, ts_code: str) -> float:
         rows = self.screener.client.fetch_moneyflow(ts_code)
@@ -643,17 +1469,98 @@ class EnhancedScreeningScheduler:
                 continue
         return total
 
+    def _build_company_business_summary(self, ts_code: str, fallback_industry: str) -> str:
+        profile = self.screener.client.fetch_company_profile(ts_code)
+        main_business = str(profile.get("main_business") or "").strip()
+        business_scope = str(profile.get("business_scope") or "").strip()
+        if main_business:
+            return main_business[:180]
+        if business_scope:
+            return business_scope[:180]
+        if fallback_industry:
+            return f"公司主要处于{fallback_industry}方向，具体业务以公开资料披露为准。"
+        return ""
+
+    def _build_financial_yoy_summary(self, ts_code: str) -> Dict[str, Any]:
+        rows = self.screener.client.fetch_financial_indicators(ts_code)
+        if not rows:
+            return {"latest_revenue_yoy": None, "latest_profit_yoy": None}
+        latest = sorted(rows, key=lambda item: str(item.get("end_date") or ""), reverse=True)[0]
+        return {
+            "latest_revenue_yoy": latest.get("op_income_yoy"),
+            "latest_profit_yoy": latest.get("netprofit_yoy"),
+        }
+
+    def _build_moneyflow_windows(self, ts_code: str) -> Dict[str, Any]:
+        rows = self.screener.client.fetch_moneyflow(ts_code)
+        if not rows:
+            return {
+                "main_fund_flow_1d": None,
+                "main_fund_flow_3d": None,
+                "main_fund_flow_10d": None,
+            }
+        recent_rows = sorted(rows, key=lambda item: str(item.get("trade_date") or ""), reverse=True)
+
+        def _sum_recent(limit: int) -> Optional[float]:
+            total = 0.0
+            seen = False
+            for item in recent_rows[:limit]:
+                value = item.get("net_mf_amount")
+                try:
+                    total += float(value or 0.0)
+                    seen = True
+                except (TypeError, ValueError):
+                    continue
+            return total if seen else None
+
+        return {
+            "main_fund_flow_1d": _sum_recent(1),
+            "main_fund_flow_3d": _sum_recent(3),
+            "main_fund_flow_10d": _sum_recent(10),
+        }
+
+    def _build_catalyst_summary(self, item: Dict[str, Any], recommendation: Dict[str, Any], analysis: Dict[str, Any]) -> str:
+        texts = [
+            str(item.get("recommendation_text") or "").strip(),
+            str(recommendation.get("recommendation") or "").strip(),
+            str(analysis.get("summary") or "").strip(),
+        ]
+        for text in texts:
+            if text:
+                return text[:120]
+        return ""
+
     @staticmethod
     def _extract_industry_name(stock: Any) -> str:
         if isinstance(stock, dict):
             return str(stock.get("industry") or "").strip()
         return str(getattr(stock, "industry", "") or "").strip()
 
+    def _describe_snapshot_cache_status(self, market_snapshot: Optional[Dict[str, Any]], trade_date: str) -> str:
+        if not isinstance(market_snapshot, dict):
+            return "unknown"
+        created_at = market_snapshot.get("created_at")
+        if not isinstance(created_at, str):
+            return "unknown"
+        snapshot_path = self.screener.client._screening_snapshot_path(trade_date)
+        if not snapshot_path.exists():
+            return "unknown"
+        try:
+            snapshot_time = datetime.fromisoformat(created_at)
+            file_time = datetime.fromtimestamp(snapshot_path.stat().st_mtime)
+        except (ValueError, OSError):
+            return "unknown"
+        return "hit" if abs((snapshot_time - file_time).total_seconds()) < 2 else "rebuilt"
+
     @staticmethod
     def _describe_industry_flow_bias(industry_heat_score: float) -> str:
-        if industry_heat_score >= 1.0:
+        if industry_heat_score >= 1.4:
+            return "明显偏强"
+        if industry_heat_score >= 0.45:
             return "偏强"
-        if industry_heat_score <= -1.0:
+        if industry_heat_score <= -1.4:
+            return "明显偏弱"
+        if industry_heat_score <= -0.45:
             return "偏弱"
         return "中性"
 
@@ -677,6 +1584,63 @@ class EnhancedScreeningScheduler:
 
         return news_hot_stocks
 
+    def _build_news_score_context(self, news_clusters: List[Any]) -> Dict[str, Any]:
+        hot_stocks = self._extract_news_hot_stocks(news_clusters)
+        strong_theme_stocks: set[str] = set()
+        stock_themes: Dict[str, List[str]] = {}
+        industry_themes: Dict[str, List[str]] = {}
+
+        for cluster in news_clusters:
+            importance = float(getattr(cluster, "importance", 0.0) or 0.0)
+            if importance < 0.45:
+                continue
+            theme = str(getattr(cluster, "theme", "") or "").strip()
+            if not theme:
+                continue
+
+            normalized_stocks = set()
+            for value in getattr(cluster, "key_stocks", []) or []:
+                normalized = self._normalize_stock_code(value)
+                if normalized:
+                    normalized_stocks.add(normalized)
+            for item in getattr(cluster, "news_items", []) or []:
+                for value in getattr(item, "related_stocks", []) or []:
+                    normalized = self._normalize_stock_code(value)
+                    if normalized:
+                        normalized_stocks.add(normalized)
+
+            if importance >= 0.75:
+                strong_theme_stocks.update(normalized_stocks)
+
+            for code in normalized_stocks:
+                stock_themes.setdefault(code, [])
+                if theme not in stock_themes[code]:
+                    stock_themes[code].append(theme)
+
+            for keyword in self._extract_theme_keywords(theme):
+                industry_themes.setdefault(keyword, [])
+                if theme not in industry_themes[keyword]:
+                    industry_themes[keyword].append(theme)
+
+        return {
+            "hot_stocks": hot_stocks,
+            "strong_theme_stocks": strong_theme_stocks,
+            "stock_themes": stock_themes,
+            "industry_themes": industry_themes,
+        }
+
+    @staticmethod
+    def _extract_theme_keywords(theme: str) -> List[str]:
+        parts = re.split(r"[、/\s,，；;：:（）()]+", str(theme or ""))
+        keywords: List[str] = []
+        for part in parts:
+            normalized = part.strip()
+            if len(normalized) < 2:
+                continue
+            if normalized not in keywords:
+                keywords.append(normalized)
+        return keywords
+
     @staticmethod
     def _normalize_stock_code(value: Any) -> Optional[str]:
         if not isinstance(value, str):
@@ -693,17 +1657,27 @@ class EnhancedScreeningScheduler:
     def _generate_recommendation(
         self,
         score: float,
-        analysis: Dict[str, Any]
+        analysis: Dict[str, Any],
+        distribution_risk: Optional[Dict[str, Any]] = None,
     ) -> str:
         """生成操作建议"""
-        if score >= 80:
-            return "强烈推荐：多维度共振，建议重点关注"
-        elif score >= 70:
-            return "推荐：技术面良好，可适当关注"
-        elif score >= 60:
-            return "观察：有一定机会，建议跟踪"
-        else:
-            return "谨慎：暂不建议操作"
+        technical_signal = str(analysis.get("technical_signal") or "").strip()
+        risk_payload = distribution_risk or {}
+        risk_blocked = bool(risk_payload.get("candidate_risk_blocked", False))
+        risk_score = float(risk_payload.get("distribution_risk_score") or 0.0)
+        confidence = float(analysis.get("overall_confidence") or 0.0)
+
+        if risk_blocked:
+            return "等待确认：短线分歧偏大，暂不追高"
+        if score >= 82 and confidence >= 0.7 and risk_score < 1.2:
+            return "优先关注：多维度共振，可作为当日重点跟踪"
+        if score >= 72 and risk_score < 2.0:
+            if self._contains_any_keyword(technical_signal, ["突破", "走强", "多头", "放量", "启动"]):
+                return "建议跟踪：趋势延续性较好，可等回踩或放量确认"
+            return "建议跟踪：强度尚可，关注盘中承接与量价确认"
+        if score >= 60:
+            return "等待确认：具备一定弹性，先观察是否形成一致性"
+        return "暂不参与：当前胜率与盈亏比暂不占优"
 
     def _get_top_stocks(
         self,
@@ -719,16 +1693,53 @@ class EnhancedScreeningScheduler:
                 continue
 
             for i, stock in enumerate(result.stocks):
+                technical_score = float(stock.technical_score or 0.0)
+                recommendation_score = float(stock.recommendation_score or stock.score or 0.0)
+                pct_change = float(stock.pct_change or 0.0) if stock.pct_change is not None else 0.0
+                volume_ratio = float(stock.volume_ratio or 0.0)
+                current_record = {
+                    "stock": stock,
+                    "technical_score": technical_score,
+                    "recommendation_score": recommendation_score,
+                    "pct_change": pct_change,
+                    "volume_ratio": volume_ratio,
+                    "rsi": stock.rsi,
+                }
                 if stock.ts_code not in stock_scores:
                     stock_scores[stock.ts_code] = {
                         "count": 0,
                         "total_score": 0,
                         "best_rank": float('inf'),
-                        "technical_score": stock.technical_score or 0,
-                        "pct_change": stock.pct_change or 0,
-                        "volume_ratio": stock.volume_ratio or 0,
+                        "technical_score": technical_score,
+                        "recommendation_score": recommendation_score,
+                        "pct_change": pct_change,
+                        "volume_ratio": volume_ratio,
                         "rsi": stock.rsi,
+                        "technical_score_min": technical_score,
+                        "technical_score_max": technical_score,
+                        "divergence_score": 0.0,
+                        "strategy_consistency_label": "单策略命中",
+                        "representative_stock": stock,
                     }
+                else:
+                    aggregate = stock_scores[stock.ts_code]
+                    aggregate["technical_score_min"] = min(aggregate["technical_score_min"], technical_score)
+                    aggregate["technical_score_max"] = max(aggregate["technical_score_max"], technical_score)
+                    representative_score = float(aggregate["recommendation_score"] or 0.0)
+                    representative_technical = float(aggregate["technical_score"] or 0.0)
+                    if (
+                        recommendation_score > representative_score
+                        or (
+                            recommendation_score == representative_score
+                            and technical_score > representative_technical
+                        )
+                    ):
+                        aggregate["representative_stock"] = stock
+                        aggregate["technical_score"] = technical_score
+                        aggregate["recommendation_score"] = recommendation_score
+                        aggregate["pct_change"] = pct_change
+                        aggregate["volume_ratio"] = volume_ratio
+                        aggregate["rsi"] = stock.rsi
 
                 stock_scores[stock.ts_code]["count"] += 1
                 stock_scores[stock.ts_code]["total_score"] += (
@@ -738,29 +1749,109 @@ class EnhancedScreeningScheduler:
                     stock_scores[stock.ts_code]["best_rank"],
                     i
                 )
+                divergence_score = max(
+                    0.0,
+                    float(stock_scores[stock.ts_code]["technical_score_max"] or 0.0)
+                    - float(stock_scores[stock.ts_code]["technical_score_min"] or 0.0),
+                )
+                stock_scores[stock.ts_code]["divergence_score"] = divergence_score
+                if stock_scores[stock.ts_code]["count"] <= 1:
+                    stock_scores[stock.ts_code]["strategy_consistency_label"] = "单策略命中"
+                elif divergence_score >= 20:
+                    stock_scores[stock.ts_code]["strategy_consistency_label"] = "存在分歧"
+                else:
+                    stock_scores[stock.ts_code]["strategy_consistency_label"] = "多策略一致"
 
         # 第二层：用多维度规则再筛选
         # 优先级：出现次数 > 技术评分 > 成交量 > 涨幅
         filtered_stocks = []
+        reject_reasons = {
+            "technical_score": 0,
+            "volume_ratio": 0,
+            "rsi": 0,
+        }
+        reject_samples = {
+            "technical_score": [],
+            "volume_ratio": [],
+            "rsi": [],
+        }
         for code, scores in stock_scores.items():
             # 基础筛选：至少出现在一个策略中
             if scores["count"] < 1:
                 continue
-            
+
             # 技术评分要求
             if scores["technical_score"] < 45:
+                reject_reasons["technical_score"] += 1
+                if len(reject_samples["technical_score"]) < 5:
+                    reject_samples["technical_score"].append(
+                        {
+                            "ts_code": code,
+                            "technical_score": round(float(scores["technical_score"] or 0.0), 2),
+                            "volume_ratio": round(float(scores["volume_ratio"] or 0.0), 2),
+                            "rsi": round(float(scores["rsi"] or 0.0), 2) if scores["rsi"] is not None else None,
+                            "count": scores["count"],
+                        }
+                    )
                 continue
-            
+
             # 成交量要求（放量）
             if scores["volume_ratio"] < 1.0:
+                reject_reasons["volume_ratio"] += 1
+                if len(reject_samples["volume_ratio"]) < 5:
+                    reject_samples["volume_ratio"].append(
+                        {
+                            "ts_code": code,
+                            "technical_score": round(float(scores["technical_score"] or 0.0), 2),
+                            "volume_ratio": round(float(scores["volume_ratio"] or 0.0), 2),
+                            "rsi": round(float(scores["rsi"] or 0.0), 2) if scores["rsi"] is not None else None,
+                            "count": scores["count"],
+                        }
+                    )
                 continue
-            
+
             # RSI 过热过冷过滤（可选）
             if scores["rsi"] is not None:
                 if scores["rsi"] > 85 or scores["rsi"] < 15:
+                    reject_reasons["rsi"] += 1
+                    if len(reject_samples["rsi"]) < 5:
+                        reject_samples["rsi"].append(
+                            {
+                                "ts_code": code,
+                                "technical_score": round(float(scores["technical_score"] or 0.0), 2),
+                                "volume_ratio": round(float(scores["volume_ratio"] or 0.0), 2),
+                                "rsi": round(float(scores["rsi"] or 0.0), 2),
+                                "count": scores["count"],
+                            }
+                        )
                     continue
-            
+
             filtered_stocks.append((code, scores))
+
+        logger.info(
+            "Two-layer screening filters: technical_score=%s, volume_ratio=%s, rsi=%s, samples=%s",
+            reject_reasons["technical_score"],
+            reject_reasons["volume_ratio"],
+            reject_reasons["rsi"],
+            reject_samples,
+        )
+        divergence_samples = [
+            {
+                "ts_code": code,
+                "count": scores["count"],
+                "technical_score_min": round(float(scores["technical_score_min"] or 0.0), 2),
+                "technical_score_max": round(float(scores["technical_score_max"] or 0.0), 2),
+                "representative_technical_score": round(float(scores["technical_score"] or 0.0), 2),
+                "representative_recommendation_score": round(float(scores["recommendation_score"] or 0.0), 2),
+            }
+            for code, scores in stock_scores.items()
+            if scores["count"] > 1 and abs(float(scores["technical_score_max"] or 0.0) - float(scores["technical_score_min"] or 0.0)) >= 20
+        ]
+        if divergence_samples:
+            logger.info(
+                "Two-layer screening divergences: %s",
+                divergence_samples[:10],
+            )
 
         # 排序：多策略共振 > 技术评分 > 成交量 > 涨幅
         sorted_stocks = sorted(
@@ -912,8 +2003,8 @@ class EnhancedScreeningScheduler:
 
         state_map = {item.get("ts_code"): item for item in pool_states}
         items = []
-        sorted_states = sorted(pool_states, key=lambda item: item.get("recommendation_score", 0.0), reverse=True)
-        for rank, state in enumerate(sorted_states, start=1):
+        sorted_states = sorted(pool_states, key=self._frontlist_sort_key)
+        for state in sorted_states:
             code = state.get("ts_code")
             stock = stock_map.get(code)
             analysis = ai_analyses.get(code, {})
@@ -922,7 +2013,7 @@ class EnhancedScreeningScheduler:
             items.append({
                 "ts_code": code,
                 "name": state.get("name") or getattr(stock, "name", "") or analysis.get("name") or "",
-                "recommend_rank": rank,
+                "recommend_rank": state.get("recommend_rank"),
                 "recommend_score": state.get("recommendation_score", info.get("score")),
                 "priority_score": state.get("priority_score"),
                 "hit_streak_days": state.get("hit_streak_days", 0),
@@ -970,35 +2061,58 @@ class EnhancedScreeningScheduler:
             for stock in result.stocks:
                 stock_name_map.setdefault(stock.ts_code, stock.name)
 
-        pool_states = self.store.list_recommendation_pool(trade_date=trade_date)
-        display_states = sorted(pool_states, key=lambda item: item.get("recommendation_score", 0.0), reverse=True)[:TOP_RECOMMENDATION_LIMIT]
-        today_top_states = [item for item in display_states if item.get("source_tag") == "今日Top3"]
-        continuation_states = [item for item in display_states if item.get("source_tag") == "昨日延续"]
+        persisted_pool_states = self.store.list_recommendation_pool(trade_date=trade_date)
+        authoritative_report_context = self._build_report_context(
+            trade_date=trade_date,
+            pool_states=persisted_pool_states,
+            ai_analyses=ai_analyses,
+            final_recommendations=final_recommendations,
+        )
+        for key in ("today_top3_live_context", "yesterday_top3_live_context"):
+            if report_context.get(key) is not None:
+                authoritative_report_context[key] = report_context.get(key)
+        authoritative_today_top_states = self._select_authoritative_today_top_states(persisted_pool_states)
+        continuation_states = [item for item in persisted_pool_states if item.get("source_tag") == "昨日延续"]
+        today_candidate_states = sorted(
+            [
+                item for item in persisted_pool_states
+                if item.get("source_tag") in {"今日Top3", WINDOW_RECOMMENDATION_TAG}
+            ],
+            key=self._frontlist_sort_key,
+        )[:TOP_RECOMMENDATION_LIMIT]
+        if not today_candidate_states:
+            today_candidate_states = sorted(
+                [item for item in persisted_pool_states if item.get("in_frontlist")],
+                key=self._frontlist_sort_key,
+            )[:TOP_RECOMMENDATION_LIMIT]
+        report_today_top3 = list(authoritative_report_context.get("today_top3") or [])
+        report_blocks = dict((getattr(report, "metadata", {}) or {}).get("report_blocks", {}))
 
         snapshot = {
             "generated_at": datetime.now().isoformat(),
+            "snapshot_type": "intelligent_screening",
             "screening_results": {
                 "strategy_count": len(screening_results),
                 "total_stocks": total_stocks,
-                "final_recommendations": len(display_states),
-                "frontlist_count": len(display_states),
+                "final_recommendations": len(report_today_top3),
+                "frontlist_count": len(today_candidate_states),
                 "shadow_count": 0,
-                "candidate_count": len(pool_states),
-                "today_top_count": len(today_top_states),
+                "candidate_count": len(persisted_pool_states),
+                "today_top_count": len(authoritative_today_top_states),
                 "continuation_count": len(continuation_states),
             },
             "recommendation_pool": {
-                "frontlist": display_states,
+                "frontlist": today_candidate_states,
                 "shadow": [],
                 "shadow_symbols": [],
-                "today_top": today_top_states,
+                "today_top": report_today_top3,
                 "yesterday_continuations": continuation_states,
             },
             "ai_analyses": self._build_dashboard_ai_payload(
                 ai_analyses,
                 final_recommendations,
                 stock_name_map,
-                pool_states,
+                persisted_pool_states,
             ),
             "news_clusters": [
                 {
@@ -1033,9 +2147,9 @@ class EnhancedScreeningScheduler:
                 ],
                 "recommendations": list(getattr(report, "recommendations", []) or []),
                 "key_points": list(getattr(report, "key_points", []) or []),
-                "blocks": (getattr(report, "metadata", {}) or {}).get("report_blocks", {}),
+                "blocks": report_blocks,
             },
-            "report_context": report_context,
+            "report_context": authoritative_report_context,
         }
 
         snapshot_dir = Path(self.settings.history_dir_path) / "intelligent_screening"
@@ -1045,6 +2159,43 @@ class EnhancedScreeningScheduler:
         for path in (latest_path, dated_path):
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, ensure_ascii=False, indent=2)
+
+    def _build_analysis_target_codes(
+        self,
+        *,
+        trade_date: date,
+        candidate_codes: List[str],
+        screening_results: Dict[str, ScreenResult],
+    ) -> List[str]:
+        stock_map: Dict[str, Any] = {}
+        for result in screening_results.values():
+            if not result:
+                continue
+            for stock in result.stocks:
+                stock_map.setdefault(stock.ts_code, stock)
+
+        today_window_codes = candidate_codes[:LLM_REVIEW_CANDIDATE_LIMIT]
+        previous_top3_codes = self._get_previous_top3_codes(trade_date)
+        return list(dict.fromkeys(today_window_codes + previous_top3_codes))
+
+    def _get_previous_top3_codes(self, trade_date: date) -> List[str]:
+        previous_trade_date = self.store.get_previous_recommendation_pool_trade_date(trade_date)
+        if not previous_trade_date:
+            return []
+        previous_states = self.store.load_recommendation_pool_state(trade_date=previous_trade_date)
+        previous_top3 = [
+            item for item in previous_states
+            if item.get("source_tag") == "今日Top3" and item.get("ts_code")
+        ]
+        previous_top3 = sorted(
+            previous_top3,
+            key=lambda item: (
+                -(item.get("priority_score") or 0.0),
+                -(item.get("recommendation_score") or 0.0),
+                item.get("ts_code") or "",
+            ),
+        )[:TODAY_TOP_LIMIT]
+        return [item.get("ts_code") for item in previous_top3 if item.get("ts_code")]
 
     @staticmethod
     def _build_dashboard_ai_payload(
@@ -1068,17 +2219,22 @@ class EnhancedScreeningScheduler:
                 or recommendation_meta.get("name")
                 or ""
             )
-            overall_score = merged.get("overall_score", merged.get("score", 0))
+            overall_score = state.get("overall_score")
+            if overall_score is None:
+                overall_score = EnhancedScreeningScheduler._resolve_real_overall_score(
+                    merged,
+                    recommendation_meta,
+                )
             recommendation_score = state.get(
                 "recommendation_score",
-                recommendation_meta.get("weighted_score", recommendation_meta.get("score", overall_score)),
+                recommendation_meta.get("weighted_score", recommendation_meta.get("score", 0)),
             )
             if recommendation_meta:
                 merged["recommendation"] = recommendation_meta.get("recommendation", merged.get("recommendation", ""))
                 merged["news_mentioned"] = state.get("news_mentioned", recommendation_meta.get("news_mentioned", False))
                 merged["strategy_count"] = state.get("strategy_count", recommendation_meta.get("strategy_count", 0))
             merged["overall_score"] = overall_score
-            merged["priority_score"] = state.get("priority_score", recommendation_meta.get("priority_score", overall_score))
+            merged["priority_score"] = state.get("priority_score", overall_score)
             merged["recommendation_score"] = recommendation_score
             merged["hit_streak_days"] = state.get("hit_streak_days", 0)
             merged["miss_streak_days"] = state.get("miss_streak_days", 0)
@@ -1175,6 +2331,93 @@ class EnhancedScreeningScheduler:
             or code
         )
 
+    @staticmethod
+    def _has_real_ai_overall_score(payload: Optional[Dict[str, Any]]) -> bool:
+        if not payload:
+            return False
+        if payload.get("overall_score") is None and payload.get("base_score") is None:
+            return False
+        ai_markers = (
+            "base_score",
+            "overall_confidence",
+            "technical_score",
+            "fundamental_score",
+            "sentiment_score",
+            "news_score",
+            "score_model",
+        )
+        return any(payload.get(marker) is not None for marker in ai_markers)
+
+    @classmethod
+    def _resolve_real_overall_score(
+        cls,
+        current_payload: Optional[Dict[str, Any]],
+        *historical_payloads: Optional[Dict[str, Any]],
+    ) -> Optional[float]:
+        if cls._has_real_ai_overall_score(current_payload):
+            value = current_payload.get("overall_score")
+            if value is None:
+                value = current_payload.get("base_score")
+            if value is not None:
+                return float(value)
+        for payload in historical_payloads:
+            if cls._has_real_ai_overall_score(payload):
+                value = payload.get("overall_score")
+                if value is None:
+                    value = payload.get("base_score")
+                if value is not None:
+                    return float(value)
+        return None
+
+    @classmethod
+    def _is_authoritative_today_top_state(cls, item: Optional[Dict[str, Any]]) -> bool:
+        if not item or item.get("source_tag") != "今日Top3":
+            return False
+        if item.get("recommend_rank") is None:
+            return False
+        overall_score = item.get("overall_score")
+        return overall_score is not None and cls._has_real_ai_overall_score(item)
+
+    @staticmethod
+    def _today_top_sort_key(item: Dict[str, Any]) -> Any:
+        return (
+            item.get("recommend_rank") is None,
+            int(item.get("recommend_rank") or 9999),
+            -float(item.get("recommendation_score") or 0.0),
+            -float(item.get("overall_score") or item.get("priority_score") or 0.0),
+            item.get("ts_code") or "",
+        )
+
+    @staticmethod
+    def _frontlist_sort_key(item: Dict[str, Any]) -> Any:
+        return (
+            -float(item.get("recommendation_score") or 0.0),
+            -float(item.get("final_display_recommendation_score") or 0.0),
+            -float(item.get("overall_score") or item.get("priority_score") or 0.0),
+            item.get("ts_code") or "",
+        )
+
+    @classmethod
+    def _select_authoritative_today_top_states(
+        cls,
+        pool_states: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        ranked_states = sorted(
+            [item for item in pool_states if item.get("ts_code")],
+            key=cls._today_top_sort_key,
+        )
+        authoritative_states = [
+            item for item in ranked_states
+            if cls._is_authoritative_today_top_state(item)
+        ]
+        if authoritative_states:
+            return authoritative_states[:TODAY_TOP_LIMIT]
+        fallback_states = [
+            item for item in ranked_states
+            if item.get("source_tag") == "今日Top3" and cls._has_real_ai_overall_score(item)
+        ]
+        return fallback_states[:TODAY_TOP_LIMIT]
+
     def _build_recommendation_pool_states(
         self,
         *,
@@ -1197,20 +2440,26 @@ class EnhancedScreeningScheduler:
                 stock_map.setdefault(stock.ts_code, stock)
                 strategy_counts[stock.ts_code] = strategy_counts.get(stock.ts_code, 0) + 1
 
-        display_codes = candidate_codes[:TOP_RECOMMENDATION_LIMIT]
+        eligible_display_codes = [
+            code for code in candidate_codes[:TOP_RECOMMENDATION_LIMIT]
+            if code in final_recommendations
+        ]
         ranked_display_codes = sorted(
-            display_codes,
-            key=lambda code: float(
-                (final_recommendations.get(code, {}) or {}).get("weighted_score")
-                or (final_recommendations.get(code, {}) or {}).get("recommendation_score")
-                or (final_recommendations.get(code, {}) or {}).get("score")
-                or getattr(stock_map.get(code), "recommendation_score", None)
-                or getattr(stock_map.get(code), "score", None)
-                or 0.0
+            eligible_display_codes,
+            key=lambda code: self._build_top_ranking_score(
+                code,
+                final_recommendations.get(code, {}) or {},
+                stock_map.get(code),
+                apply_divergence_penalty=True,
             ),
             reverse=True,
         )
-        today_top_codes = ranked_display_codes[:TODAY_TOP_LIMIT]
+        display_codes = ranked_display_codes[:TOP_RECOMMENDATION_LIMIT]
+        analyzed_top_codes = [
+            code for code in ranked_display_codes
+            if self._has_real_ai_overall_score(final_recommendations.get(code, {}))
+        ]
+        today_top_codes = analyzed_top_codes[:TODAY_TOP_LIMIT]
         previous_trade_date = self.store.get_previous_recommendation_pool_trade_date(trade_date)
         previous_frontlist = self.store.list_recommendation_pool(
             trade_date=previous_trade_date,
@@ -1224,19 +2473,15 @@ class EnhancedScreeningScheduler:
             code: float(item.get("recommendation_score") or item.get("recommend_score") or item.get("score") or 0.0)
             for code, item in previous_frontlist_map.items()
         }
-        previous_top3_codes = [
-            item.get("ts_code")
-            for item in sorted(
-                [item for item in previous_states.values() if item.get("source_tag") == "今日Top3" and item.get("ts_code")],
-                key=lambda item: float(item.get("recommendation_score") or 0.0),
-                reverse=True,
-            )[:TODAY_TOP_LIMIT]
-        ]
+        previous_top3_codes = self._get_previous_top3_codes(trade_date)
         display_code_set = set(display_codes)
         continuation_codes = [code for code in previous_top3_codes if code]
-        merged_display_codes = display_codes + [code for code in continuation_codes if code not in display_code_set]
+        merged_display_codes = list(display_codes) + [
+            code for code in continuation_codes
+            if code not in display_code_set and code in final_recommendations
+        ]
         states_payload: List[Dict[str, Any]] = []
-        for rank, code in enumerate(merged_display_codes, start=1):
+        for display_rank, code in enumerate(merged_display_codes, start=1):
             stock = stock_map.get(code)
             recommendation = final_recommendations.get(code, {})
             previous_state = previous_states.get(code)
@@ -1244,40 +2489,61 @@ class EnhancedScreeningScheduler:
             is_today_top = code in today_top_codes
             is_continuation = code in continuation_codes and not is_today_top
             source_tag = "今日Top3" if is_today_top else ("昨日延续" if is_continuation else WINDOW_RECOMMENDATION_TAG)
-            overall_score = float(
-                recommendation.get("overall_score")
-                or recommendation.get("score")
-                or getattr(stock, "score", None)
-                or (previous_state or {}).get("priority_score")
-                or (previous_front_state or {}).get("priority_score")
-                or 0.0
+            overall_score = self._resolve_real_overall_score(
+                recommendation,
+                previous_state,
+                previous_front_state,
             )
-            recommendation_score = float(
+            top3_risk_penalty = float(recommendation.get("distribution_risk_score") or 0.0) * TOP3_RISK_PENALTY_MULTIPLIER
+            contradiction_penalty = self._build_short_term_contradiction_penalty(recommendation)
+            base_recommendation_score = float(
                 recommendation.get("weighted_score")
                 or recommendation.get("recommendation_score")
                 or recommendation.get("score")
                 or getattr(stock, "recommendation_score", None)
                 or (previous_state or {}).get("recommendation_score")
                 or (previous_front_state or {}).get("recommendation_score")
-                or overall_score
+                or 0.0
             )
-            analysis_confidence = recommendation.get("overall_confidence")
+            recommendation_score = base_recommendation_score
+            raw_display_confidence = recommendation.get("display_confidence")
+            raw_overall_confidence = recommendation.get("overall_confidence")
+            raw_ai_confidence = recommendation.get("ai_confidence")
+            analysis_confidence = raw_display_confidence
             if analysis_confidence is None:
-                analysis_confidence = recommendation.get("ai_confidence")
+                analysis_confidence = raw_overall_confidence
+            if analysis_confidence is None:
+                analysis_confidence = raw_ai_confidence
             if analysis_confidence is None and previous_state is not None:
-                analysis_confidence = previous_state.get("ai_confidence")
+                analysis_confidence = previous_state.get("display_confidence")
+                if analysis_confidence is None:
+                    analysis_confidence = previous_state.get("overall_confidence")
+                if analysis_confidence is None:
+                    analysis_confidence = previous_state.get("ai_confidence")
             if analysis_confidence is None and previous_front_state is not None:
-                analysis_confidence = previous_front_state.get("ai_confidence")
+                analysis_confidence = previous_front_state.get("display_confidence")
+                if analysis_confidence is None:
+                    analysis_confidence = previous_front_state.get("overall_confidence")
+                if analysis_confidence is None:
+                    analysis_confidence = previous_front_state.get("ai_confidence")
             if analysis_confidence is None and stock is not None:
                 confidence_label = getattr(stock, "confidence", None)
                 confidence_map = {"high": 0.8, "medium": 0.65, "low": 0.5}
                 analysis_confidence = confidence_map.get(str(confidence_label).lower())
-            display_confidence = round(float(analysis_confidence), 4) if analysis_confidence is not None else None
-            ai_confidence = self._apply_repeat_pick_confidence_bonus(display_confidence, is_continuation)
+            selected_confidence = round(float(analysis_confidence), 4) if analysis_confidence is not None else None
+            display_confidence = round(float(raw_display_confidence), 4) if raw_display_confidence is not None else selected_confidence
+            overall_confidence = round(float(raw_overall_confidence), 4) if raw_overall_confidence is not None else selected_confidence
+            ai_confidence_base = round(float(raw_ai_confidence), 4) if raw_ai_confidence is not None else selected_confidence
+            ai_confidence = self._apply_repeat_pick_confidence_bonus(ai_confidence_base, is_continuation)
             streaks = self._calculate_streaks(previous_state, True)
-            in_frontlist = True
-            entered_frontlist = not bool((previous_state or {}).get("in_frontlist"))
+            in_frontlist = code in display_code_set
+            entered_frontlist = in_frontlist and not bool((previous_state or {}).get("in_frontlist"))
             previous_score = previous_score_map.get(code)
+            divergence_score = float(recommendation.get("divergence_score") or 0.0)
+            strategy_consistency_label = str(
+                recommendation.get("strategy_consistency_label")
+                or ("单策略命中" if int(strategy_counts.get(code, 0) or 0) <= 1 else ("存在分歧" if divergence_score >= 20 else "多策略一致"))
+            )
             current_item = {
                 "ts_code": code,
                 "name": self._resolve_stock_name(code, stock, recommendation, previous_state, previous_front_state),
@@ -1291,7 +2557,7 @@ class EnhancedScreeningScheduler:
                 "llm_focus_level": self._classify_llm_focus_level(source_tag),
                 "tracking_status": self._classify_tracking_status(True, source_tag),
                 "source_tag": source_tag,
-                "is_repeat_pick": is_continuation,
+                "is_repeat_pick": bool(code in previous_top3_codes),
                 "setup_type": getattr(stock, "setup_type", None) or (previous_state or {}).get("setup_type"),
                 "risk_level": getattr(stock, "risk_level", None) or (previous_state or {}).get("risk_level") or "medium",
                 "recommendation": getattr(stock, "recommendation", None) or (previous_state or {}).get("recommendation") or "monitor",
@@ -1302,45 +2568,261 @@ class EnhancedScreeningScheduler:
                 "fundamental_score": recommendation.get("fundamental_score") if recommendation.get("fundamental_score") is not None else (previous_state or {}).get("fundamental_score"),
                 "sentiment_score": recommendation.get("sentiment_score") if recommendation.get("sentiment_score") is not None else (previous_state or {}).get("sentiment_score"),
                 "news_score": recommendation.get("news_score") if recommendation.get("news_score") is not None else (previous_state or {}).get("news_score"),
+                "base_score": recommendation.get("base_score") if recommendation.get("base_score") is not None else (previous_state or {}).get("base_score"),
+                "sentiment_adjustment": recommendation.get("sentiment_adjustment") if recommendation.get("sentiment_adjustment") is not None else (previous_state or {}).get("sentiment_adjustment"),
+                "news_adjustment": recommendation.get("news_adjustment") if recommendation.get("news_adjustment") is not None else (previous_state or {}).get("news_adjustment"),
+                "score_model": recommendation.get("score_model") or (previous_state or {}).get("score_model"),
                 "summary": recommendation.get("summary") or recommendation.get("ai_summary") or (previous_state or {}).get("summary"),
+                "overview_reason": self._build_overview_reason({
+                    "recommendation_score": recommendation_score,
+                    "technical_signal": recommendation.get("technical_signal") or (previous_state or {}).get("technical_signal") or (getattr(stock, "trend_status", None) if stock else None),
+                    "recommendation_text": recommendation.get("recommendation") or recommendation.get("ai_summary") or (previous_state or {}).get("recommendation_text") or "",
+                    "distribution_risk_flags": list(recommendation.get("distribution_risk_flags") or (previous_state or {}).get("distribution_risk_flags") or []),
+                }),
                 "close": getattr(stock, "close", None) or (previous_state or {}).get("close"),
                 "pct_change": getattr(stock, "pct_change", None) if stock else (previous_state or {}).get("pct_change"),
                 "volume_ratio": getattr(stock, "volume_ratio", None) if stock else (previous_state or {}).get("volume_ratio"),
                 "turnover_rate": getattr(stock, "turnover_rate", None) if stock else (previous_state or {}).get("turnover_rate"),
                 "strategy_count": strategy_counts.get(code, recommendation.get("strategy_count", (previous_state or {}).get("strategy_count", 0))),
+                "divergence_score": divergence_score,
+                "strategy_consistency_label": strategy_consistency_label,
                 "news_mentioned": bool(recommendation.get("news_mentioned", False)),
                 "industry": recommendation.get("industry") or getattr(stock, "industry", None) or (previous_state or {}).get("industry"),
                 "industry_heat_score": recommendation.get("industry_heat_score", (previous_state or {}).get("industry_heat_score")),
                 "industry_flow_bias": recommendation.get("industry_flow_bias") or (previous_state or {}).get("industry_flow_bias") or "中性",
+                "distribution_risk_score": recommendation.get("distribution_risk_score", (previous_state or {}).get("distribution_risk_score")),
+                "distribution_risk_flags": list(recommendation.get("distribution_risk_flags") or (previous_state or {}).get("distribution_risk_flags") or []),
+                "moneyflow_3d_value": recommendation.get("moneyflow_3d_value", (previous_state or {}).get("moneyflow_3d_value")),
+                "turnover_spike_ratio": recommendation.get("turnover_spike_ratio", (previous_state or {}).get("turnover_spike_ratio")),
+                "recent_runup_5d": recommendation.get("recent_runup_5d", (previous_state or {}).get("recent_runup_5d")),
+                "continuation_bias_score": recommendation.get("continuation_bias_score", (previous_state or {}).get("continuation_bias_score")),
+                "continuation_positive_flags": list(recommendation.get("continuation_positive_flags") or (previous_state or {}).get("continuation_positive_flags") or []),
+                "continuation_negative_flags": list(recommendation.get("continuation_negative_flags") or (previous_state or {}).get("continuation_negative_flags") or []),
+                "top3_risk_penalty": round(top3_risk_penalty, 2) if is_today_top else None,
+                "short_term_contradiction_penalty": contradiction_penalty if is_today_top else None,
+                "final_display_recommendation_score": recommendation_score,
+                "late_stage_momentum_flag": bool(recommendation.get("late_stage_momentum_flag", (previous_state or {}).get("late_stage_momentum_flag", False))),
+                "candidate_risk_blocked": bool(recommendation.get("candidate_risk_blocked", False)),
                 "ai_confidence": ai_confidence,
                 "display_confidence": display_confidence,
+                "overall_confidence": overall_confidence,
+                "confidence": selected_confidence,
                 "technical_signal": recommendation.get("technical_signal") or (previous_state or {}).get("technical_signal") or getattr(stock, "trend_status", None),
                 "recommendation_text": recommendation.get("recommendation") or recommendation.get("ai_summary") or (previous_state or {}).get("recommendation_text") or "",
                 "entry_price": getattr(stock, "close", None) or (previous_state or {}).get("entry_price"),
-                "recommend_rank": rank,
+                "recommend_rank": (today_top_codes.index(code) + 1) if is_today_top else None,
+                "frontlist_rank": display_rank if code in display_code_set else None,
                 "previous_recommendation_score": previous_score,
-                "previous_overall_score": (previous_state or {}).get("overall_score") or (previous_front_state or {}).get("priority_score"),
-                "previous_confidence": (previous_state or {}).get("display_confidence") or (previous_front_state or {}).get("ai_confidence"),
+                "previous_overall_score": self._resolve_real_overall_score(
+                    previous_state,
+                    previous_front_state,
+                ),
+                "previous_confidence": (previous_state or {}).get("display_confidence") if (previous_state or {}).get("display_confidence") is not None else (previous_state or {}).get("overall_confidence") if (previous_state or {}).get("overall_confidence") is not None else (previous_state or {}).get("ai_confidence") if (previous_state or {}).get("ai_confidence") is not None else (previous_front_state or {}).get("display_confidence") if (previous_front_state or {}).get("display_confidence") is not None else (previous_front_state or {}).get("overall_confidence") if (previous_front_state or {}).get("overall_confidence") is not None else (previous_front_state or {}).get("ai_confidence"),
                 "today_present": True,
                 "absence_reason": None,
                 "action_plan": self._build_action_plan(recommendation, stock, previous_state),
-                "review_status": "延续" if is_continuation else ("新入选" if is_today_top else "观察"),
-                "yesterday_conclusion": (previous_state or {}).get("recommendation_text"),
-                "today_verdict": "延续" if is_continuation else ("新入选" if is_today_top else "观察"),
+                "review_status": "延续" if is_today_top and code in previous_top3_codes else ("新入选" if is_today_top else "观察"),
+                "yesterday_conclusion": self._resolve_yesterday_conclusion(previous_state),
+                "today_verdict": "延续走强，继续列入今日Top3" if is_today_top and code in previous_top3_codes else ("新入选，进入今日重点观察" if is_today_top else "仅保留在今日候选，未进入今日Top3"),
                 "miss_reason_candidates": [],
                 "missing_factor_candidates": [],
             }
+            if code in {"603182.SH", "688618.SH", "300692.SZ"}:
+                logger.info(
+                    "Step 5 pool state debug for %s: %s",
+                    code,
+                    {
+                        "source_tag": current_item.get("source_tag"),
+                        "recommend_rank": current_item.get("recommend_rank"),
+                        "recommendation_score": current_item.get("recommendation_score"),
+                        "overall_score": current_item.get("overall_score"),
+                        "priority_score": current_item.get("priority_score"),
+                        "base_score": current_item.get("base_score"),
+                        "summary": current_item.get("summary"),
+                        "distribution_risk_score": current_item.get("distribution_risk_score"),
+                        "moneyflow_3d_value": current_item.get("moneyflow_3d_value"),
+                        "recent_runup_5d": current_item.get("recent_runup_5d"),
+                        "turnover_spike_ratio": current_item.get("turnover_spike_ratio"),
+                    },
+                )
             states_payload.append(current_item)
 
         return [TrackedRecommendationState(trade_date=trade_date, **item) for item in states_payload]
 
     @staticmethod
-    def _build_action_plan(recommendation: Dict[str, Any], stock: Any, previous_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    def _contains_any_keyword(text: Any, keywords: List[str]) -> bool:
+        normalized = str(text or "").strip()
+        return any(keyword in normalized for keyword in keywords)
+
+    @staticmethod
+    def _shorten_overview_text(text: Any, limit: int = 160) -> str:
+        cleaned = " ".join(str(text or "").split())
+        if len(cleaned) <= limit:
+            return cleaned
+        return cleaned[: limit - 1].rstrip("，；、。,. ") + "…"
+
+    @classmethod
+    def _build_overview_reason(cls, item: Dict[str, Any]) -> str:
+        recommendation = str(item.get("recommendation_text") or item.get("recommendation") or item.get("final_decision") or "").strip()
+        technical_signal = str(item.get("technical_signal") or "").strip()
+        market_context = str(item.get("market_context_view") or "").strip()
+        highlights = [str(text).strip() for text in (item.get("core_highlights") or []) if str(text or "").strip()]
+        risk_warnings = [str(text).strip() for text in (item.get("risk_warnings") or item.get("distribution_risk_flags") or []) if str(text or "").strip()]
+
+        score = cls._safe_float(item.get("recommendation_score", item.get("recommend_score", item.get("score"))))
+        if score is None:
+            score = 0.0
+        if score >= 85:
+            positioning = "优先跟踪"
+        elif score >= 75:
+            positioning = "观察为主"
+        else:
+            positioning = "谨慎观察"
+
+        support = ""
+        if technical_signal:
+            support = technical_signal
+        elif market_context:
+            support = market_context
+        elif highlights:
+            support = highlights[0]
+        elif recommendation:
+            support = recommendation
+
+        action = "等放量确认"
+        if recommendation:
+            if "不参与" in recommendation or "观望" in recommendation:
+                action = "先不参与"
+            elif "谨慎" in recommendation or "观察" in recommendation:
+                action = "先看承接"
+            elif "跟踪" in recommendation or "关注" in recommendation:
+                action = "等确认再跟"
+
+        weakness = risk_warnings[0] if risk_warnings else "强度仍待验证"
+
+        parts = [positioning]
+        if support:
+            parts.append(cls._shorten_overview_text(support, limit=48))
+        parts.append(cls._shorten_overview_text(weakness, limit=48))
+        parts.append(action)
+        return "；".join(part for part in parts if part)
+
+    @classmethod
+    def _resolve_yesterday_conclusion(cls, item: Optional[Dict[str, Any]]) -> str:
+        source = item or {}
+        return (
+            str(source.get("overview_reason") or "").strip()
+            or cls._build_overview_reason(source)
+            or str(source.get("summary") or "").strip()
+            or str(source.get("recommendation_text") or "").strip()
+            or "昨日结论缺失"
+        )
+
+    @classmethod
+    def _build_short_term_contradiction_penalty(cls, recommendation: Dict[str, Any]) -> float:
+        if bool(recommendation.get("candidate_risk_blocked", False)):
+            return 0.0
+        recommendation_text = str(
+            recommendation.get("recommendation_text")
+            or recommendation.get("recommendation")
+            or recommendation.get("ai_summary")
+            or ""
+        ).strip()
+        action_bias = str(
+            recommendation.get("action_bias")
+            or ((recommendation.get("action_plan") or {}).get("action_bias"))
+            or ""
+        ).strip()
+        technical_signal = str(recommendation.get("technical_signal") or "").strip()
+        caution_keywords = ["观察", "观望", "谨慎", "暂不建议", "不建议", "不参与", "回避", "等待"]
+        positive_keywords = ["多头", "走强", "突破", "强势", "共振", "放量", "启动"]
+        caution_hit = cls._contains_any_keyword(recommendation_text, caution_keywords)
+        action_caution_hit = cls._contains_any_keyword(action_bias, ["观察", "观望", "不参与", "回避"])
+        technical_positive_hit = cls._contains_any_keyword(technical_signal, positive_keywords)
+
+        penalty = 0.0
+        if caution_hit and (technical_positive_hit or action_caution_hit):
+            penalty += 3.0
+        if action_caution_hit:
+            penalty += 2.0
+        if bool(recommendation.get("late_stage_momentum_flag", False)):
+            penalty += 1.5
+
+        distribution_risk_score = float(recommendation.get("distribution_risk_score") or 0.0)
+        if distribution_risk_score >= 2.0:
+            penalty += 1.5
+        elif distribution_risk_score >= 1.2:
+            penalty += 0.8
+
+        recent_runup_5d = float(recommendation.get("recent_runup_5d") or 0.0)
+        moneyflow_3d_value = float(recommendation.get("moneyflow_3d_value") or 0.0)
+        turnover_spike_ratio = float(recommendation.get("turnover_spike_ratio") or 0.0)
+        if recent_runup_5d >= 10.0 and moneyflow_3d_value < 5000:
+            penalty += 1.5
+        if recent_runup_5d >= 15.0 and turnover_spike_ratio >= 1.8:
+            penalty += 1.0
+        return round(min(penalty, TOP3_CONTRADICTION_PENALTY), 2)
+
+    @classmethod
+    def _build_top_ranking_score(
+        cls,
+        code: str,
+        recommendation: Dict[str, Any],
+        stock: Any,
+        *,
+        apply_divergence_penalty: bool,
+    ) -> float:
+        base_score = float(
+            recommendation.get("weighted_score")
+            or recommendation.get("recommendation_score")
+            or recommendation.get("score")
+            or getattr(stock, "recommendation_score", None)
+            or getattr(stock, "score", None)
+            or 0.0
+        )
+        if not apply_divergence_penalty:
+            return base_score
+        divergence_score = float(recommendation.get("divergence_score") or 0.0)
+        contradiction_penalty = cls._build_short_term_contradiction_penalty(recommendation)
+        continuation_bias_score = float(recommendation.get("continuation_bias_score") or 0.0)
+        return round(
+            base_score
+            + continuation_bias_score
+            - divergence_score * TOP3_DIVERGENCE_PENALTY_MULTIPLIER
+            - contradiction_penalty,
+            4,
+        )
+
+    @classmethod
+    def _build_action_plan(cls, recommendation: Dict[str, Any], stock: Any, previous_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         close = getattr(stock, "close", None) or (previous_state or {}).get("close")
         entry_value = getattr(stock, "close", None) or (previous_state or {}).get("entry_price")
         signal = str(recommendation.get("technical_signal") or "").strip()
+        recommendation_text = str(
+            recommendation.get("recommendation_text")
+            or recommendation.get("recommendation")
+            or recommendation.get("ai_summary")
+            or ""
+        ).strip()
+        risk_blocked = bool(recommendation.get("candidate_risk_blocked", False))
+        weighted_score = float(
+            recommendation.get("weighted_score")
+            or recommendation.get("recommendation_score")
+            or recommendation.get("score")
+            or 0.0
+        )
+        if risk_blocked or cls._contains_any_keyword(recommendation_text, ["暂不参与"]):
+            action_bias = "回避"
+        elif cls._contains_any_keyword(recommendation_text, ["优先关注"]):
+            action_bias = "关注买点"
+        elif cls._contains_any_keyword(recommendation_text, ["建议跟踪"]):
+            action_bias = "跟踪"
+        elif weighted_score >= 60:
+            action_bias = "观察"
+        else:
+            action_bias = "回避"
         return {
-            "action_bias": "观察" if not recommendation.get("recommendation") else "买入" if "买" in str(recommendation.get("recommendation")) else "观察",
+            "action_bias": action_bias,
             "entry_zone": f"{entry_value:.2f} 附近观察" if isinstance(entry_value, (int, float)) else "等待回踩或放量确认",
             "take_profit": f"{close * 1.05:.2f} 附近分批止盈" if isinstance(close, (int, float)) else "结合盘中强弱分批止盈",
             "stop_loss": f"{close * 0.97:.2f}" if isinstance(close, (int, float)) else "跌破关键支撑止损",
@@ -1357,34 +2839,86 @@ class EnhancedScreeningScheduler:
         final_recommendations: Dict[str, Dict[str, Any]],
     ) -> Dict[str, Any]:
         state_map = {item.get("ts_code"): item for item in pool_states if item.get("ts_code")}
-        today_top3 = [self._build_report_stock_payload(item, ai_analyses, final_recommendations) for item in pool_states if item.get("source_tag") == "今日Top3"]
+        normalized_pool_states = sorted(
+            [item for item in pool_states if item.get("ts_code")],
+            key=self._today_top_sort_key,
+        )
+        if not normalized_pool_states:
+            normalized_pool_states = sorted(
+                [item for item in self.store.list_recommendation_pool(trade_date=trade_date) if item.get("ts_code")],
+                key=self._today_top_sort_key,
+            )
+
+        today_top_states = self._select_authoritative_today_top_states(normalized_pool_states)
+        if not today_top_states:
+            fallback_pool_states = self.store.list_recommendation_pool(trade_date=trade_date)
+            if isinstance(fallback_pool_states, list):
+                today_top_states = self._select_authoritative_today_top_states(fallback_pool_states)
+
+        today_top10_states = [
+            item
+            for item in normalized_pool_states
+            if item.get("in_frontlist")
+            and item.get("source_tag") in {"今日Top3", WINDOW_RECOMMENDATION_TAG}
+        ]
+        today_top10_states = sorted(today_top10_states, key=self._frontlist_sort_key)
+        today_top10 = [
+            self._build_report_stock_payload(item, ai_analyses, final_recommendations)
+            for item in today_top10_states[:TOP_RECOMMENDATION_LIMIT]
+            if item.get("ts_code")
+        ]
+        today_top3 = [
+            self._build_report_stock_payload(item, ai_analyses, final_recommendations)
+            for item in today_top_states
+            if item.get("ts_code")
+        ]
         previous_trade_date = self.store.get_previous_recommendation_pool_trade_date(trade_date)
         previous_states = {
             item.get("ts_code"): item
             for item in self.store.load_recommendation_pool_state(trade_date=previous_trade_date)
             if previous_trade_date and item.get("ts_code")
         }
+        previous_top3_codes = self._get_previous_top3_codes(trade_date)
         previous_top3 = [
-            item for item in previous_states.values() if item.get("source_tag") == "今日Top3"
+            previous_states[code] for code in previous_top3_codes if code in previous_states
         ]
-        previous_top3 = sorted(previous_top3, key=lambda item: int(item.get("recommend_rank") or 9999))[:TODAY_TOP_LIMIT]
 
         yesterday_top3_review: List[Dict[str, Any]] = []
         for previous_item in previous_top3:
             code = previous_item.get("ts_code")
             current_item = state_map.get(code)
+            current_review = self._build_report_stock_payload(current_item, ai_analyses, final_recommendations) if current_item else {}
+            review_status = "失效"
+            today_verdict = "失效"
             if current_item:
-                review = self._build_report_stock_payload(current_item, ai_analyses, final_recommendations)
-                review.update(
+                score_change = current_item.get("score_change")
+                if current_item.get("source_tag") == "今日Top3":
+                    review_status = "延续"
+                    today_verdict = "延续走强，继续列入今日Top3"
+                elif current_item.get("source_tag") == WINDOW_RECOMMENDATION_TAG:
+                    if isinstance(score_change, (int, float)) and score_change < 0:
+                        review_status = "转弱"
+                        today_verdict = "降级至今日候选，强度不及今日主推"
+                    else:
+                        review_status = "观察"
+                        today_verdict = "仅保留复盘跟踪，暂未回到今日主推"
+                elif isinstance(score_change, (int, float)) and score_change < 0:
+                    review_status = "转弱"
+                    today_verdict = "明显转弱，优先评估减仓或卖出"
+                else:
+                    review_status = "观察"
+                    today_verdict = "仅作中性复盘观察，暂不视为今日继续推荐"
+                current_review.update(
                     {
-                        "yesterday_conclusion": previous_item.get("recommendation_text") or previous_item.get("summary") or "昨日入选 Top3",
-                        "today_verdict": "延续" if current_item.get("source_tag") in {"今日Top3", "昨日延续", WINDOW_RECOMMENDATION_TAG} else "观察",
-                        "review_status": "延续" if current_item.get("source_tag") in {"今日Top3", "昨日延续"} else "观察",
-                        "miss_reason_candidates": [],
-                        "missing_factor_candidates": [],
+                        "yesterday_conclusion": self._resolve_yesterday_conclusion(previous_item),
+                        "today_verdict": today_verdict,
+                        "review_status": review_status,
+                        "analysis": current_review.get("analysis") or current_review.get("summary") or current_item.get("recommendation_text") or "结合昨日结论与今日表现，重点判断强势是否延续、仓位是否需要收缩，以及当前主要风险。",
+                        "miss_reason_candidates": [] if review_status == "延续" else ["评分排序下滑", "技术结构转弱", "资金承接分流"],
+                        "missing_factor_candidates": [] if review_status == "延续" else ["热点持续性", "量能变化", "相对强度"],
                     }
                 )
-                yesterday_top3_review.append(review)
+                yesterday_top3_review.append(current_review)
                 continue
             yesterday_top3_review.append(
                 {
@@ -1396,34 +2930,32 @@ class EnhancedScreeningScheduler:
                     "source_tag": "昨日复盘",
                     "today_present": False,
                     "absence_reason": "今日未进入候选池或展示池",
-                    "yesterday_conclusion": previous_item.get("recommendation_text") or previous_item.get("summary") or "昨日入选 Top3",
-                    "today_verdict": "失效",
+                    "yesterday_conclusion": self._resolve_yesterday_conclusion(previous_item),
+                    "today_verdict": "失效，今日未重新满足条件，仅保留复盘结论，不再作为今日推荐",
                     "review_status": "失效",
                     "previous_recommendation_score": previous_item.get("recommendation_score"),
-                    "previous_overall_score": previous_item.get("overall_score") or previous_item.get("priority_score"),
+                    "previous_overall_score": self._resolve_real_overall_score(previous_item),
                     "previous_confidence": previous_item.get("display_confidence") or previous_item.get("ai_confidence"),
                     "strategy_count": 0,
                     "news_mentioned": False,
                     "technical_signal": None,
                     "summary": previous_item.get("summary") or previous_item.get("recommendation_text"),
-                    "analysis": "今日未能延续到候选池，需要复盘失效原因。",
+                    "overview_reason": previous_item.get("overview_reason") or self._resolve_yesterday_conclusion(previous_item),
+                    "analysis": "今日未能延续到候选池，需要从卖出与风险角度复盘。",
                     "miss_reason_candidates": ["评分因子缺口", "技术趋势破坏", "资金承接不足"],
                     "missing_factor_candidates": ["盘中承接强度", "热点持续性", "量能变化"],
                     "action_plan": {},
                 }
             )
 
-        comparison_candidates_map: Dict[str, Dict[str, Any]] = {}
-        for item in today_top3 + yesterday_top3_review:
-            code = item.get("ts_code")
-            if code and code not in comparison_candidates_map:
-                comparison_candidates_map[code] = item
-
         return {
             "trade_date": trade_date.isoformat(),
             "today_top3": today_top3,
+            "today_top10": today_top10,
             "yesterday_top3_review": yesterday_top3_review,
-            "comparison_candidates": list(comparison_candidates_map.values()),
+            "today_top3_live_context": [],
+            "yesterday_top3_live_context": [],
+            "comparison_candidates": list(today_top3),
         }
 
     def _build_report_stock_payload(
@@ -1435,20 +2967,88 @@ class EnhancedScreeningScheduler:
         code = item.get("ts_code")
         analysis = ai_analyses.get(code, {})
         recommendation = final_recommendations.get(code, {})
+        industry_name = item.get("industry") or recommendation.get("industry") or ""
+        financial_summary = self._build_financial_yoy_summary(code)
+        moneyflow_windows = self._build_moneyflow_windows(code)
+        recommendation_score = self._first_defined_value(
+            item.get("final_display_recommendation_score"),
+            item.get("recommendation_score"),
+            recommendation.get("final_display_recommendation_score"),
+            recommendation.get("weighted_score"),
+            recommendation.get("recommendation_score"),
+            recommendation.get("score"),
+        )
+        display_confidence = self._first_defined_value(
+            item.get("display_confidence"),
+            analysis.get("confidence"),
+            analysis.get("overall_confidence"),
+            item.get("overall_confidence"),
+            item.get("ai_confidence"),
+        )
+        overall_confidence = self._first_defined_value(
+            item.get("overall_confidence"),
+            analysis.get("overall_confidence"),
+            item.get("ai_confidence"),
+            display_confidence,
+        )
+        final_display_recommendation_score = self._first_defined_value(
+            item.get("final_display_recommendation_score"),
+            recommendation.get("final_display_recommendation_score"),
+            item.get("recommendation_score"),
+            recommendation.get("weighted_score"),
+            recommendation.get("recommendation_score"),
+            recommendation.get("score"),
+        )
         return {
             "ts_code": code,
             "name": item.get("name") or analysis.get("name") or code,
             "source_tag": item.get("source_tag"),
-            "recommendation_score": item.get("recommendation_score", recommendation.get("weighted_score")),
-            "overall_score": item.get("overall_score", analysis.get("overall_score", recommendation.get("overall_score"))),
+            "recommendation_score": recommendation_score,
+            "overall_score": item.get("overall_score") if item.get("overall_score") is not None else self._resolve_real_overall_score(analysis, recommendation),
             "priority_score": item.get("priority_score"),
-            "overall_confidence": analysis.get("overall_confidence", item.get("ai_confidence")),
-            "display_confidence": item.get("display_confidence", analysis.get("confidence")),
+            "overall_confidence": overall_confidence,
+            "display_confidence": display_confidence,
+            "open": item.get("open"),
+            "high": item.get("high"),
+            "low": item.get("low"),
+            "close": item.get("close"),
+            "pct_change": item.get("pct_change", item.get("change_pct")),
+            "amplitude": item.get("amplitude"),
+            "turnover_rate": item.get("turnover_rate"),
+            "amount": item.get("amount"),
             "strategy_count": item.get("strategy_count", recommendation.get("strategy_count", 0)),
+            "divergence_score": item.get("divergence_score", recommendation.get("divergence_score")),
+            "strategy_consistency_label": item.get("strategy_consistency_label", recommendation.get("strategy_consistency_label")),
             "news_mentioned": item.get("news_mentioned", recommendation.get("news_mentioned", False)),
             "industry": item.get("industry", recommendation.get("industry")),
+            "business_summary": item.get("business_summary") or analysis.get("business_summary") or recommendation.get("business_summary") or self._build_company_business_summary(code, industry_name),
+            "latest_revenue_yoy": item.get("latest_revenue_yoy") or analysis.get("latest_revenue_yoy") or recommendation.get("latest_revenue_yoy") or financial_summary.get("latest_revenue_yoy"),
+            "latest_profit_yoy": item.get("latest_profit_yoy") or analysis.get("latest_profit_yoy") or recommendation.get("latest_profit_yoy") or financial_summary.get("latest_profit_yoy"),
+            "pe_ttm": item.get("pe_ttm") or analysis.get("pe_ttm") or recommendation.get("pe_ttm"),
+            "industry_pe_median": item.get("industry_pe_median") or analysis.get("industry_pe_median") or recommendation.get("industry_pe_median"),
+            "catalyst_summary": item.get("catalyst_summary") or analysis.get("catalyst_summary") or recommendation.get("catalyst_summary") or self._build_catalyst_summary(item, recommendation, analysis),
+            "main_fund_flow_1d": item.get("main_fund_flow_1d") or analysis.get("main_fund_flow_1d") or recommendation.get("main_fund_flow_1d") or moneyflow_windows.get("main_fund_flow_1d"),
+            "main_fund_flow_3d": item.get("main_fund_flow_3d") or analysis.get("main_fund_flow_3d") or recommendation.get("main_fund_flow_3d") or moneyflow_windows.get("main_fund_flow_3d"),
+            "main_fund_flow_10d": item.get("main_fund_flow_10d") or analysis.get("main_fund_flow_10d") or recommendation.get("main_fund_flow_10d") or moneyflow_windows.get("main_fund_flow_10d"),
+            "margin_balance_change_10d": item.get("margin_balance_change_10d") or analysis.get("margin_balance_change_10d") or recommendation.get("margin_balance_change_10d"),
             "industry_heat_score": item.get("industry_heat_score", recommendation.get("industry_heat_score")),
             "industry_flow_bias": item.get("industry_flow_bias", recommendation.get("industry_flow_bias", "中性")),
+            "distribution_risk_score": item.get("distribution_risk_score", recommendation.get("distribution_risk_score")),
+            "distribution_risk_flags": list(item.get("distribution_risk_flags") or recommendation.get("distribution_risk_flags") or []),
+            "moneyflow_3d_value": item.get("moneyflow_3d_value", recommendation.get("moneyflow_3d_value")),
+            "turnover_spike_ratio": item.get("turnover_spike_ratio", recommendation.get("turnover_spike_ratio")),
+            "recent_runup_5d": item.get("recent_runup_5d", recommendation.get("recent_runup_5d")),
+            "continuation_bias_score": item.get("continuation_bias_score", recommendation.get("continuation_bias_score")),
+            "continuation_positive_flags": list(item.get("continuation_positive_flags") or recommendation.get("continuation_positive_flags") or []),
+            "continuation_negative_flags": list(item.get("continuation_negative_flags") or recommendation.get("continuation_negative_flags") or []),
+            "top3_risk_penalty": item.get("top3_risk_penalty", recommendation.get("top3_risk_penalty")),
+            "short_term_contradiction_penalty": item.get("short_term_contradiction_penalty", recommendation.get("short_term_contradiction_penalty", self._build_short_term_contradiction_penalty(recommendation))),
+            "final_display_recommendation_score": final_display_recommendation_score,
+            "late_stage_momentum_flag": bool(item.get("late_stage_momentum_flag", recommendation.get("late_stage_momentum_flag", False))),
+            "short_term_contradiction_penalty": item.get("short_term_contradiction_penalty", recommendation.get("short_term_contradiction_penalty", self._build_short_term_contradiction_penalty(recommendation))),
+            "latest_weakening_flag": bool(item.get("latest_weakening_flag", recommendation.get("latest_weakening_flag", False))),
+            "high_level_pullback_flag": bool(item.get("high_level_pullback_flag", recommendation.get("high_level_pullback_flag", False))),
+            "theme_support_absent_flag": bool(item.get("theme_support_absent_flag", recommendation.get("theme_support_absent_flag", False))),
             "score_change": item.get("score_change"),
             "previous_recommendation_score": item.get("previous_recommendation_score"),
             "technical_signal": item.get("technical_signal") or analysis.get("technical_signal"),
@@ -1456,8 +3056,19 @@ class EnhancedScreeningScheduler:
             "fundamental_score": item.get("fundamental_score") if item.get("fundamental_score") is not None else analysis.get("fundamental_score"),
             "sentiment_score": item.get("sentiment_score") if item.get("sentiment_score") is not None else analysis.get("sentiment_score"),
             "news_score": item.get("news_score") if item.get("news_score") is not None else analysis.get("news_score"),
+            "base_score": item.get("base_score") if item.get("base_score") is not None else analysis.get("base_score"),
+            "sentiment_adjustment": item.get("sentiment_adjustment") if item.get("sentiment_adjustment") is not None else analysis.get("sentiment_adjustment"),
+            "news_adjustment": item.get("news_adjustment") if item.get("news_adjustment") is not None else analysis.get("news_adjustment"),
+            "score_model": item.get("score_model") or analysis.get("score_model"),
             "summary": item.get("summary") or analysis.get("summary"),
+            "overview_reason": item.get("overview_reason") or self._build_overview_reason({
+                **recommendation,
+                **analysis,
+                **item,
+                "distribution_risk_flags": list(item.get("continuation_negative_flags") or item.get("distribution_risk_flags") or recommendation.get("distribution_risk_flags") or []),
+            }),
             "recommendation_text": item.get("recommendation_text") or recommendation.get("recommendation") or analysis.get("recommendation"),
+            "analysis": item.get("analysis") or analysis.get("summary") or recommendation.get("ai_summary") or item.get("summary"),
             "close": item.get("close"),
             "entry_price": item.get("entry_price"),
             "action_plan": item.get("action_plan") or self._build_action_plan(recommendation, None, item),
@@ -1471,6 +3082,13 @@ class EnhancedScreeningScheduler:
             "previous_overall_score": item.get("previous_overall_score"),
             "previous_confidence": item.get("previous_confidence"),
         }
+
+    @staticmethod
+    def _first_defined_value(*values: Any) -> Any:
+        for value in values:
+            if value not in (None, ""):
+                return value
+        return None
 
     def _get_active_strategies(self) -> List[ScreenPreset]:
         """获取活跃策略"""

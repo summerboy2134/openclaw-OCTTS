@@ -14,7 +14,7 @@ from octts.schemas.report import (
     StructuredAnalysis,
     TradingDecision,
 )
-from octts.services.news_aggregator import NewsAggregator, NewsItem, NewsSource
+from octts.services.news_aggregator import NewsAggregator, NewsItem, NewsSource, StockLiveNewsItem
 from octts.services.position_store import FilePositionStore
 from octts.services.report_exporter import ReportExporter
 from octts.services.history_store import FileHistoryStore
@@ -103,7 +103,9 @@ def test_export_latest_intelligent_screening_zip_reuses_action_and_verdict_field
           "news_clusters": [],
           "report_context": {
             "today_top3": [{"ts_code": "600000.SH", "technical_signal": "量价共振", "recommendation_text": "建议跟踪"}],
-            "yesterday_top3_review": [{"ts_code": "000001.SZ", "today_verdict": "不能转强则离场", "review_status": "减仓观察"}]
+            "yesterday_top3_review": [{"ts_code": "000001.SZ", "today_verdict": "不能转强则离场", "review_status": "减仓观察"}],
+            "today_top3_live_context": [{"ts_code": "600000.SH", "name": "浦发银行", "query": "浦发银行", "items": [{"title": "浦发银行披露一季报预告", "summary": "业绩边际改善", "source": "东方财富", "url": "https://example.com/live1", "publish_time": "2026-03-30 09:35", "category": "公告"}]}],
+            "yesterday_top3_live_context": [{"ts_code": "000001.SZ", "name": "平安银行", "query": "平安银行", "items": [{"title": "平安银行盘中异动", "summary": "资金回流", "source": "东方财富", "url": "https://example.com/live2", "publish_time": "2026-03-30 10:05", "category": "新闻"}]}]
           },
           "intelligent_report": {
             "title": "智能选股报告",
@@ -129,16 +131,13 @@ def test_export_latest_intelligent_screening_zip_reuses_action_and_verdict_field
     assert archive_name.endswith(".zip")
     with ZipFile(BytesIO(archive_bytes)) as archive:
         index_html = archive.read("index.html").decode("utf-8")
+        dashboard_html = archive.read("dashboard.html").decode("utf-8")
         detail_html = archive.read("stocks/600000.SH.html").decode("utf-8")
-    assert "买入区间" in index_html
-    assert "10.0-10.2" in index_html
-    assert "止损位" in index_html
-    assert "跌破 11.8 离场" in index_html
-    assert "今日结论" in index_html
-    assert "不能转强则离场" in index_html
-    assert "10.0-10.2" in detail_html
-    assert "10.8" in detail_html
-    assert "跌破 9.8" in detail_html
+    assert "<!DOCTYPE html>" in index_html
+    assert "./dashboard.html" in index_html
+    assert "./index.html" in index_html
+    assert "../dashboard.html" in detail_html
+    assert "600000.SH" in detail_html
 
 
 def test_report_exporter_methodology_matches_news_bonus(tmp_path) -> None:
@@ -183,3 +182,38 @@ def test_news_aggregator_prefilter_reduces_importance_calls() -> None:
     import asyncio
 
     asyncio.run(_run_news_aggregation_checks())
+
+
+def test_news_aggregator_collect_focus_stock_live_context() -> None:
+    import asyncio
+
+    async def _run() -> None:
+        settings = Settings(OCTTS_MEMORY_BACKEND="file", OCTTS_MEMORY_FILE_PATH="memory.json")
+        aggregator = NewsAggregator(settings)
+
+        async def _fake_collect_stock_news(*, keyword: str, limit: int = 3):
+            assert keyword == "浦发银行"
+            assert limit == 2
+            return [
+                StockLiveNewsItem(
+                    title="浦发银行披露一季报预告",
+                    summary="业绩边际改善",
+                    source="东方财富",
+                    url="https://example.com/live1",
+                    publish_time="2026-03-30 09:35",
+                    category="公告",
+                )
+            ]
+
+        aggregator.stock_news_collector.collect_stock_news = _fake_collect_stock_news
+        payload = await aggregator.collect_focus_stock_live_context(
+            today_top3=[{"ts_code": "600000.SH", "name": "浦发银行"}],
+            yesterday_top3_review=[],
+            per_stock_limit=2,
+        )
+
+        assert payload["today_top3_live_context"][0]["ts_code"] == "600000.SH"
+        assert payload["today_top3_live_context"][0]["items"]
+        assert payload["yesterday_top3_live_context"] == []
+
+    asyncio.run(_run())

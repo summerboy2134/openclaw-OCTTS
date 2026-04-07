@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import json
 import logging
 import re
@@ -93,6 +95,101 @@ def _configure_logging() -> None:
 
 
 _configure_logging()
+
+
+def _pick_confidence_value(*sources: Dict[str, Any]) -> Any:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in ("display_confidence", "overall_confidence", "ai_confidence", "confidence"):
+            value = source.get(key)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def _normalize_legacy_recommendation_text(text: Any, *, candidate_risk_blocked: bool = False) -> str:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return "等待确认：具备一定弹性，先观察是否形成一致性"
+    if candidate_risk_blocked:
+        return "等待确认：短线分歧偏大，暂不追高"
+    if any(keyword in normalized for keyword in ["强烈推荐", "重点关注", "优先关注"]):
+        return "优先关注：多维度共振，可作为当日重点跟踪"
+    if any(keyword in normalized for keyword in ["推荐", "建议跟踪", "可适当关注"]):
+        return "建议跟踪：强度尚可，关注盘中承接与量价确认"
+    if any(keyword in normalized for keyword in ["观察", "观望", "等待", "谨慎"]):
+        return "等待确认：具备一定弹性，先观察是否形成一致性"
+    if any(keyword in normalized for keyword in ["暂不建议", "不建议", "不参与", "回避"]):
+        return "暂不参与：当前胜率与盈亏比暂不占优"
+    return normalized
+
+
+def _normalize_legacy_action_bias(text: Any, *, candidate_risk_blocked: bool = False) -> str:
+    normalized = str(text or "").strip()
+    if candidate_risk_blocked:
+        return "回避"
+    if normalized in {"关注买点", "跟踪", "观察", "回避"}:
+        return normalized
+    if any(keyword in normalized for keyword in ["买", "介入", "低吸", "关注"]):
+        return "关注买点"
+    if any(keyword in normalized for keyword in ["跟踪"]):
+        return "跟踪"
+    if any(keyword in normalized for keyword in ["观察", "观望", "等待"]):
+        return "观察"
+    if any(keyword in normalized for keyword in ["不参与", "回避", "暂不"]):
+        return "回避"
+    return "观察"
+
+
+def _normalize_intelligent_item(item: Any) -> Any:
+    if not isinstance(item, dict):
+        return item
+    normalized = dict(item)
+    candidate_risk_blocked = bool(normalized.get("candidate_risk_blocked", False))
+    normalized["recommendation_text"] = _normalize_legacy_recommendation_text(
+        normalized.get("recommendation_text") or normalized.get("recommendation") or normalized.get("summary"),
+        candidate_risk_blocked=candidate_risk_blocked,
+    )
+    action_plan = normalized.get("action_plan")
+    if isinstance(action_plan, dict):
+        merged_action_plan = dict(action_plan)
+    else:
+        merged_action_plan = {}
+    merged_action_plan["action_bias"] = _normalize_legacy_action_bias(
+        merged_action_plan.get("action_bias") or normalized.get("action_bias") or normalized.get("recommendation_text"),
+        candidate_risk_blocked=candidate_risk_blocked,
+    )
+    normalized["action_plan"] = merged_action_plan
+    normalized["action_bias"] = merged_action_plan["action_bias"]
+    return normalized
+
+
+def _normalize_intelligent_item_list(items: Any) -> List[Dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    return [item for item in (_normalize_intelligent_item(entry) for entry in items) if isinstance(item, dict)]
+
+
+def _normalize_intelligent_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized_payload = dict(payload)
+    recommendation_pool = dict(normalized_payload.get("recommendation_pool") or {})
+    for key in ("frontlist", "today_top", "yesterday_continuations", "shadow"):
+        recommendation_pool[key] = _normalize_intelligent_item_list(recommendation_pool.get(key))
+    normalized_payload["recommendation_pool"] = recommendation_pool
+
+    report_context = dict(normalized_payload.get("report_context") or {})
+    for key in ("today_top3", "today_top10", "yesterday_top3_review"):
+        report_context[key] = _normalize_intelligent_item_list(report_context.get(key))
+    normalized_payload["report_context"] = report_context
+
+    report = dict(normalized_payload.get("intelligent_report") or {})
+    blocks = dict(report.get("blocks") or {})
+    for key in ("focus_stocks", "yesterday_reviews"):
+        blocks[key] = _normalize_intelligent_item_list(blocks.get(key))
+    report["blocks"] = blocks
+    normalized_payload["intelligent_report"] = report
+    return normalized_payload
 
 
 app = FastAPI(title="OCTTS", version="0.1.0", lifespan=lifespan)
@@ -621,6 +718,7 @@ def intelligent_screening_dashboard(tab: str = "overview") -> HTMLResponse:
         intelligent_report=dashboard_payload["intelligent_report"],
         recommendation_summary=dashboard_payload.get("recommendation_summary") or {},
         recommendation_methodology=dashboard_payload.get("recommendation_methodology") or {},
+        report_context=dashboard_payload.get("report_context") or {},
         generated_at=dashboard_payload.get("generated_at"),
         active_tab=tab,
     )
@@ -649,10 +747,21 @@ async def create_intelligent_screening_job(request: Request) -> Dict[str, Any]:
     """
     manager = _get_intelligent_screening_job_manager(request)
     settings = get_settings()
+    main_loop = asyncio.get_running_loop()
 
     async def runner(progress_callback):
-        scheduler = EnhancedScreeningScheduler(settings, progress_callback=progress_callback)
-        return await scheduler.run_intelligent_screening()
+        def thread_safe_progress_callback(payload: Dict[str, Any]) -> None:
+            future = asyncio.run_coroutine_threadsafe(progress_callback(payload), main_loop)
+            try:
+                future.result()
+            except concurrent.futures.CancelledError:
+                return
+
+        def run_scheduler() -> Dict[str, Any]:
+            scheduler = EnhancedScreeningScheduler(settings, progress_callback=thread_safe_progress_callback)
+            return asyncio.run(scheduler.run_intelligent_screening())
+
+        return await asyncio.to_thread(run_scheduler)
 
     try:
         payload = await manager.start_job(runner)
@@ -733,25 +842,20 @@ def _build_recommendation_methodology_payload(settings: Settings) -> Dict[str, A
         "strategy_count": len(strategy_items),
         "strategies": strategy_items,
         "candidate_selection": [
-            "先汇总所有启用策略的候选股票，优先保留多策略同时命中的标的。",
-            "默认先过滤 ST 名称标的与近年连续亏损风险较高的标的。",
-            "候选股需满足技术评分不低于 45。",
-            "候选股需满足成交量比不低于 1.0，优先考虑放量标的。",
-            "若 RSI 高于 85 或低于 15，则视为过热/过冷，先过滤。",
-            "候选池按优先级收敛为持续跟踪池 Top10，其中前台 Top5 作为默认展示名单。",
+            "先汇总所有启用策略命中的股票，优先保留多策略共振、结构更完整的标的。",
+            "候选阶段会先剔除明显高风险或基础条件不达标的股票。",
+            "候选池最终收敛为今日 Top10，其中今日 Top3 采用更严格的筛选口径。",
         ],
         "ai_analysis": [
-            "默认只对前台 Top3 与高关注股票补充执行 AI 分析，shadow 仅保留规则跟踪，不调用 LLM。",
-            "分析页面会同步展示技术面、基本面、市场情绪、新闻舆情四个维度的结果。",
-            "AI 还会给出 overall_confidence 作为最终推荐分数的置信度权重。",
+            "默认只对今日 Top3 与高关注股票补充 AI 分析，其他标的以规则跟踪为主。",
+            "AI分析会补充技术面、基本面、市场情绪与新闻舆情的综合判断。",
+            "AI 置信度会参与最终排序，用于区分高把握度与一般信号。",
         ],
         "score_formula": [
-            "基础分 = AI 综合分数 overall_score。",
-            "若股票出现在高重要性新闻热点中，额外加 3 分。",
-            "每多命中 1 个策略，额外加 5 分。",
-            "再叠加小幅行业近 3 日资金氛围修正，基于所属行业近 3 日净流入与净流入占比做温和加减分。",
-            "最终分数 = (AI 综合分数 + 新闻加分 + 多策略加分 + 行业近 3 日资金氛围修正) × AI 置信度。",
-            "最终分数达到 55 分才会进入最终推荐池。",
+            "排序会综合 AI 评分、多策略共振、新闻催化与整体强弱表现。",
+            "行业资金氛围会做温和修正，但不会替代个股自身的强弱判断。",
+            "系统会统一评估末端风险，对高位分歧、放量异动、追涨风险等情况进行惩罚。",
+            "Top3 使用比 Top10 更严格的风控标准，尽量减少末端追涨标的进入前排。",
         ],
         "recommendation_levels": [
             {"label": "强烈推荐", "rule": "最终分数 ≥ 80", "description": "多维度共振，建议重点关注"},
@@ -760,11 +864,10 @@ def _build_recommendation_methodology_payload(settings: Settings) -> Dict[str, A
             {"label": "谨慎", "rule": "最终分数 < 60", "description": "暂不建议操作"},
         ],
         "tracking_metrics": [
-            "入场价格统一使用推荐日收盘价。",
-            "自动回填 T+1 / T+3 / T+5 / T+10 收益。",
-            "10 日最大回撤按推荐日收盘价为基准计算。",
-            "5 日胜率定义为 return_5d > 0。",
-            "默认基准为沪深300（000300.SH），用于计算 5 日超额收益。",
+            "推荐后会持续回填短中期收益，用来复盘策略有效性。",
+            "昨日 Top3 会在今日继续复盘，即使不再属于强势推荐，也保留对比与归因。",
+            "跟踪不仅看涨跌结果，也会同步观察回撤、分数变化与风险变化。",
+            "默认会结合基准表现观察策略是否具备稳定的相对优势。",
         ],
     }
 
@@ -773,24 +876,31 @@ def _load_intelligent_dashboard_payload(settings: Settings, trade_date: Optional
     """Load the intelligent screening payload for the dashboard."""
     file_name = f"{trade_date}.json" if trade_date else "latest.json"
     snapshot_path = Path(settings.history_dir_path) / "intelligent_screening" / file_name
+    snapshot_payload = None
     if snapshot_path.exists():
         try:
             with open(snapshot_path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-            return {
-                "generated_at": payload.get("generated_at"),
-                "screening_results": payload.get("screening_results", {}),
-                "recommendation_pool": payload.get("recommendation_pool", {}),
-                "ai_analyses": payload.get("ai_analyses", {}),
-                "news_clusters": payload.get("news_clusters", []),
-                "intelligent_report": payload.get("intelligent_report"),
-                "recommendation_summary": payload.get("recommendation_summary", {}),
-                "recommendation_methodology": payload.get("recommendation_methodology", {}),
-                "report_context": payload.get("report_context", {}),
-                "data_source": "snapshot",
-            }
+                candidate_payload = json.load(f)
+            if candidate_payload.get("snapshot_type") == "intelligent_screening":
+                snapshot_payload = candidate_payload
         except Exception:
             pass
+
+    if snapshot_payload is not None:
+        return _normalize_intelligent_payload(
+            {
+                "generated_at": snapshot_payload.get("generated_at"),
+                "screening_results": snapshot_payload.get("screening_results", {}),
+                "recommendation_pool": snapshot_payload.get("recommendation_pool", {}),
+                "ai_analyses": snapshot_payload.get("ai_analyses", {}),
+                "news_clusters": snapshot_payload.get("news_clusters", []),
+                "intelligent_report": snapshot_payload.get("intelligent_report"),
+                "recommendation_summary": snapshot_payload.get("recommendation_summary", {}),
+                "recommendation_methodology": snapshot_payload.get("recommendation_methodology", {}),
+                "report_context": snapshot_payload.get("report_context", {}),
+                "data_source": "snapshot",
+            }
+        )
 
     from octts.services.screening_store import ScreeningStore
 
@@ -821,9 +931,9 @@ def _load_intelligent_dashboard_payload(settings: Settings, trade_date: Optional
                 "overall_confidence": 0.6,
                 "recommendation": "基于最新选股结果，建议结合实时行情进一步确认。",
                 "technical_score": float(stock.get("technical_score") or stock.get("score") or 0.0),
-                "fundamental_score": float(stock.get("market_cap") or 0.0),
-                "sentiment_score": 0.0,
-                "news_score": 0.0,
+                "fundamental_score": stock.get("fundamental_score"),
+                "sentiment_score": stock.get("sentiment_score"),
+                "news_score": stock.get("news_score"),
                 "summary": "当前页面展示的是最近一次筛选结果生成的候选股概览。",
                 "technical_summary": "匹配原因：" + "；".join(stock.get("match_reasons", [])[:4]),
                 "technical_signal": stock.get("trend_status") or "待进一步确认",
@@ -862,46 +972,54 @@ def _load_intelligent_dashboard_payload(settings: Settings, trade_date: Optional
         "today_top": [item for item in frontlist if item.get("source_tag") == "今日Top3"],
         "yesterday_continuations": [item for item in frontlist if item.get("source_tag") == "昨日延续"],
     }
-    return {
-        "screening_results": {
-            "strategy_count": len(latest_results) if latest_results else None,
-            "total_stocks": total_stocks if latest_results else None,
-            "final_recommendations": len(frontlist),
-            "frontlist_count": len(frontlist),
-            "shadow_count": 0,
-            "candidate_count": len(ai_analyses),
-            "today_top_count": len(recommendation_pool["today_top"]),
-            "continuation_count": len(recommendation_pool["yesterday_continuations"]),
-        },
-        "recommendation_pool": recommendation_pool,
-        "ai_analyses": ai_analyses,
-        "news_clusters": [],
-        "intelligent_report": {
-            "title": "智能选股页面",
-            "summary": "当前展示最近一次选股结果汇总。运行一次智能选股后，页面会展示完整的新闻热点、AI多维分析和智能报告。",
-            "sections": [
-                {
-                    "title": "当前状态",
-                    "content": "页面已切换为真实数据源，不再使用固定 mock 数据。",
-                }
-            ],
-            "blocks": {},
-        },
-        "report_context": {},
-        "data_source": "fallback",
-    }
+    return _normalize_intelligent_payload(
+        {
+            "screening_results": {
+                "strategy_count": len(latest_results) if latest_results else None,
+                "total_stocks": total_stocks if latest_results else None,
+                "final_recommendations": len(frontlist),
+                "frontlist_count": len(frontlist),
+                "shadow_count": 0,
+                "candidate_count": len(ai_analyses),
+                "today_top_count": len(recommendation_pool["today_top"]),
+                "continuation_count": len(recommendation_pool["yesterday_continuations"]),
+            },
+            "recommendation_pool": recommendation_pool,
+            "ai_analyses": ai_analyses,
+            "news_clusters": [],
+            "intelligent_report": {
+                "title": "智能选股页面",
+                "summary": "当前展示最近一次选股结果汇总。运行一次智能选股后，页面会展示完整的新闻热点、AI多维分析和智能报告。",
+                "sections": [
+                    {
+                        "title": "当前状态",
+                        "content": "页面已切换为真实数据源，不再使用固定 mock 数据。",
+                    }
+                ],
+                "blocks": {},
+            },
+            "report_context": {},
+            "data_source": "fallback",
+        }
+    )
 
 
 def _build_stock_intelligent_insight(ts_code: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     report_context = payload.get("report_context", {}) or {}
     report_blocks = ((payload.get("intelligent_report") or {}).get("blocks") or {})
+    authoritative_today_top3 = [
+        item for item in (report_context.get("today_top3") or [])
+        if isinstance(item, dict) and item.get("ts_code")
+    ]
     focus_items = {item.get("ts_code"): item for item in report_blocks.get("focus_stocks") or [] if isinstance(item, dict) and item.get("ts_code")}
     review_items = {item.get("ts_code"): item for item in report_blocks.get("yesterday_reviews") or [] if isinstance(item, dict) and item.get("ts_code")}
     context_items = {}
-    for key in ("today_top3", "yesterday_top3_review", "comparison_candidates"):
+    for key in ("today_top3", "yesterday_top3_review"):
         for item in report_context.get(key) or []:
             if isinstance(item, dict) and item.get("ts_code"):
                 context_items[item["ts_code"]] = item
+    for item in authoritative_today_top3:
+        context_items[item["ts_code"]] = item
     recommendation_pool = payload.get("recommendation_pool") or {}
     frontlist = recommendation_pool.get("frontlist") or []
     today_top = recommendation_pool.get("today_top") or []
@@ -923,19 +1041,253 @@ def _build_stock_intelligent_insight(ts_code: str, payload: Dict[str, Any]) -> D
     ):
         if isinstance(source, dict):
             action.update({key: value for key, value in source.items() if value not in (None, "")})
+    score_explanations = []
+    technical_score = next(
+        (
+            source.get("technical_score")
+            for source in (context_item, pool_item, continuation_item, today_top_item)
+            if isinstance(source, dict) and source.get("technical_score") is not None
+        ),
+        None,
+    )
+    fundamental_score = next(
+        (
+            source.get("fundamental_score")
+            for source in (context_item, pool_item, continuation_item, today_top_item)
+            if isinstance(source, dict) and source.get("fundamental_score") is not None
+        ),
+        None,
+    )
+    sentiment_score = next(
+        (
+            source.get("sentiment_score")
+            for source in (context_item, pool_item, continuation_item, today_top_item)
+            if isinstance(source, dict) and source.get("sentiment_score") is not None
+        ),
+        None,
+    )
+    news_score = next(
+        (
+            source.get("news_score")
+            for source in (context_item, pool_item, continuation_item, today_top_item)
+            if isinstance(source, dict) and source.get("news_score") is not None
+        ),
+        None,
+    )
+    base_score = next(
+        (
+            source.get("base_score")
+            for source in (context_item, pool_item, continuation_item, today_top_item)
+            if isinstance(source, dict) and source.get("base_score") is not None
+        ),
+        None,
+    )
+    sentiment_adjustment = next(
+        (
+            source.get("sentiment_adjustment")
+            for source in (context_item, pool_item, continuation_item, today_top_item)
+            if isinstance(source, dict) and source.get("sentiment_adjustment") is not None
+        ),
+        None,
+    )
+    news_adjustment = next(
+        (
+            source.get("news_adjustment")
+            for source in (context_item, pool_item, continuation_item, today_top_item)
+            if isinstance(source, dict) and source.get("news_adjustment") is not None
+        ),
+        None,
+    )
+    score_model = next(
+        (
+            source.get("score_model")
+            for source in (context_item, pool_item, continuation_item, today_top_item)
+            if isinstance(source, dict) and source.get("score_model")
+        ),
+        None,
+    )
+    strategy_count = next(
+        (
+            source.get("strategy_count")
+            for source in (context_item, pool_item, continuation_item, today_top_item)
+            if isinstance(source, dict) and source.get("strategy_count") is not None
+        ),
+        None,
+    )
+    continuation_bias_score = next(
+        (
+            source.get("continuation_bias_score")
+            for source in (context_item, pool_item, continuation_item, today_top_item)
+            if isinstance(source, dict) and source.get("continuation_bias_score") is not None
+        ),
+        None,
+    )
+    continuation_positive_flags = list(context_item.get("continuation_positive_flags") or pool_item.get("continuation_positive_flags") or continuation_item.get("continuation_positive_flags") or today_top_item.get("continuation_positive_flags") or [])
+    continuation_negative_flags = list(context_item.get("continuation_negative_flags") or pool_item.get("continuation_negative_flags") or continuation_item.get("continuation_negative_flags") or today_top_item.get("continuation_negative_flags") or [])
+    distribution_risk_score = next(
+        (
+            source.get("distribution_risk_score")
+            for source in (context_item, pool_item, continuation_item, today_top_item)
+            if isinstance(source, dict) and source.get("distribution_risk_score") is not None
+        ),
+        None,
+    )
+    moneyflow_3d_value = next(
+        (
+            source.get("moneyflow_3d_value")
+            for source in (context_item, pool_item, continuation_item, today_top_item)
+            if isinstance(source, dict) and source.get("moneyflow_3d_value") is not None
+        ),
+        None,
+    )
+    turnover_spike_ratio = next(
+        (
+            source.get("turnover_spike_ratio")
+            for source in (context_item, pool_item, continuation_item, today_top_item)
+            if isinstance(source, dict) and source.get("turnover_spike_ratio") is not None
+        ),
+        None,
+    )
+    recent_runup_5d = next(
+        (
+            source.get("recent_runup_5d")
+            for source in (context_item, pool_item, continuation_item, today_top_item)
+            if isinstance(source, dict) and source.get("recent_runup_5d") is not None
+        ),
+        None,
+    )
+    late_stage_momentum_flag = bool(
+        next(
+            (
+                source.get("late_stage_momentum_flag")
+                for source in (context_item, pool_item, continuation_item, today_top_item)
+                if isinstance(source, dict) and source.get("late_stage_momentum_flag") is not None
+            ),
+            False,
+        )
+    )
+    industry_flow_bias = next(
+        (
+            source.get("industry_flow_bias")
+            for source in (context_item, pool_item, continuation_item, today_top_item)
+            if isinstance(source, dict) and source.get("industry_flow_bias") not in (None, "")
+        ),
+        None,
+    )
+
+    dimension_explanations = []
+    if technical_score is not None:
+        dimension_explanations.append("技术面 %.1f" % float(technical_score))
+    if fundamental_score is not None:
+        dimension_explanations.append("基本面 %.1f" % float(fundamental_score))
+    if sentiment_score is not None:
+        dimension_explanations.append("情绪面 %.1f" % float(sentiment_score))
+    if news_score is not None:
+        dimension_explanations.append("新闻面 %.1f" % float(news_score))
+    if dimension_explanations:
+        score_explanations.append("维度分数：%s" % "、".join(dimension_explanations))
+    if base_score is not None:
+        score_explanations.append("主评分：技术+基本面合成 %.1f" % float(base_score))
+    if sentiment_adjustment is not None or news_adjustment is not None:
+        adjustment_parts = []
+        if sentiment_adjustment is not None:
+            adjustment_parts.append("情绪修正 %+.1f" % float(sentiment_adjustment))
+        if news_adjustment is not None:
+            adjustment_parts.append("新闻修正 %+.1f" % float(news_adjustment))
+        if adjustment_parts:
+            score_explanations.append("辅助修正：%s" % "、".join(adjustment_parts))
+    if score_model:
+        score_explanations.append("评分模型：%s" % str(score_model))
+
+    if strategy_count not in (None, ""):
+        score_explanations.append("排序加成：命中策略 %s 个" % int(strategy_count))
+    if continuation_bias_score not in (None, ""):
+        score_explanations.append("续涨偏置：%.1f" % float(continuation_bias_score))
+    if industry_flow_bias:
+        score_explanations.append("板块环境：资金偏向%s" % str(industry_flow_bias))
+    if moneyflow_3d_value not in (None, ""):
+        score_explanations.append("资金承接：近3日资金流 %.1f 万" % float(moneyflow_3d_value))
+    if distribution_risk_score not in (None, ""):
+        score_explanations.append("风险约束：分歧/派发风险 %.1f" % float(distribution_risk_score))
+    if turnover_spike_ratio not in (None, ""):
+        score_explanations.append("交易节奏：换手放大 %.2f 倍" % float(turnover_spike_ratio))
+    if recent_runup_5d not in (None, ""):
+        score_explanations.append("位置状态：近5日累计涨幅 %.1f%%" % float(recent_runup_5d))
+    if late_stage_momentum_flag:
+        score_explanations.append("风险提示：存在后排追高风险")
+    if not score_explanations:
+        score_explanations.append("当前以最新候选结果为主，排序拆解信息有限，需结合主分析与盘中承接进一步确认。")
+
     return {
         "ts_code": ts_code,
-        "in_today_top3": pool_item.get("source_tag") == "今日Top3" or context_item.get("source_tag") == "今日Top3" or bool(today_top_item),
+        "in_today_top3": any(item.get("ts_code") == ts_code for item in authoritative_today_top3),
         "in_yesterday_review": bool(review_item or context_item.get("review_status") or continuation_item),
-        "source_tag": pool_item.get("source_tag") or continuation_item.get("source_tag") or today_top_item.get("source_tag") or context_item.get("source_tag"),
-        "recommendation_score": context_item.get("recommendation_score") or pool_item.get("recommendation_score") or continuation_item.get("recommendation_score") or today_top_item.get("recommendation_score"),
-        "overall_score": context_item.get("overall_score") or context_item.get("priority_score") or pool_item.get("priority_score") or continuation_item.get("priority_score") or today_top_item.get("priority_score"),
-        "confidence": context_item.get("display_confidence") or context_item.get("overall_confidence") or pool_item.get("ai_confidence") or continuation_item.get("ai_confidence") or today_top_item.get("ai_confidence"),
+        "source_tag": next(
+            (
+                source.get("source_tag")
+                for source in (pool_item, continuation_item, today_top_item, context_item)
+                if isinstance(source, dict) and source.get("source_tag") not in (None, "")
+            ),
+            None,
+        ),
+        "recommendation_score": next(
+            (
+                source.get("recommendation_score")
+                for source in (context_item, pool_item, continuation_item, today_top_item)
+                if isinstance(source, dict) and source.get("recommendation_score") is not None
+            ),
+            None,
+        ),
+        "overall_score": next(
+            (
+                value
+                for value in (
+                    context_item.get("overall_score"),
+                    context_item.get("priority_score"),
+                    pool_item.get("priority_score"),
+                    continuation_item.get("priority_score"),
+                    today_top_item.get("priority_score"),
+                )
+                if value is not None
+            ),
+            None,
+        ),
+        "display_confidence": _pick_confidence_value(context_item),
+        "overall_confidence": _pick_confidence_value(context_item, pool_item, continuation_item, today_top_item),
+        "ai_confidence": _pick_confidence_value(pool_item, continuation_item, today_top_item, context_item),
+        "confidence": _pick_confidence_value(context_item, pool_item, continuation_item, today_top_item),
         "core_highlights": focus_item.get("core_highlights") or [],
-        "risk_warnings": focus_item.get("risk_warnings") or review_item.get("risk_warnings") or [],
+        "risk_warnings": focus_item.get("risk_warnings") or review_item.get("risk_warnings") or list(context_item.get("distribution_risk_flags") or []) or list(pool_item.get("distribution_risk_flags") or []),
         "overall_assessment": focus_item.get("overall_assessment") or review_item.get("overall_assessment") or context_item.get("summary") or context_item.get("recommendation_text") or continuation_item.get("summary") or continuation_item.get("recommendation_text") or today_top_item.get("summary") or today_top_item.get("recommendation_text"),
         "technical_signal": focus_item.get("technical_signal") or review_item.get("technical_signal") or context_item.get("technical_signal") or pool_item.get("technical_signal") or continuation_item.get("technical_signal") or today_top_item.get("technical_signal"),
         "recommendation_text": context_item.get("recommendation_text") or pool_item.get("recommendation_text") or continuation_item.get("recommendation_text") or today_top_item.get("recommendation_text"),
+        "score_rationale": focus_item.get("score_rationale") or review_item.get("score_rationale"),
+        "fundamental_view": focus_item.get("fundamental_view") or review_item.get("fundamental_view"),
+        "market_context_view": focus_item.get("market_context_view") or review_item.get("market_context_view"),
+        "trading_context_view": focus_item.get("trading_context_view") or review_item.get("trading_context_view"),
+        "market_performance_view": focus_item.get("market_performance_view") or review_item.get("market_performance_view"),
+        "catalyst_and_capital_view": focus_item.get("catalyst_and_capital_view") or review_item.get("catalyst_and_capital_view"),
+        "focus_analysis": focus_item.get("focus_analysis") or review_item.get("review_analysis") or focus_item.get("analysis") or review_item.get("analysis"),
+        "technical_score": technical_score,
+        "fundamental_score": fundamental_score,
+        "sentiment_score": sentiment_score,
+        "news_score": news_score,
+        "base_score": base_score,
+        "sentiment_adjustment": sentiment_adjustment,
+        "news_adjustment": news_adjustment,
+        "score_model": score_model,
+        "strategy_count": strategy_count,
+        "continuation_bias_score": continuation_bias_score,
+        "continuation_positive_flags": continuation_positive_flags,
+        "continuation_negative_flags": continuation_negative_flags,
+        "distribution_risk_score": distribution_risk_score,
+        "distribution_risk_flags": list(context_item.get("distribution_risk_flags") or pool_item.get("distribution_risk_flags") or continuation_item.get("distribution_risk_flags") or today_top_item.get("distribution_risk_flags") or []),
+        "moneyflow_3d_value": moneyflow_3d_value,
+        "turnover_spike_ratio": turnover_spike_ratio,
+        "recent_runup_5d": recent_runup_5d,
+        "late_stage_momentum_flag": late_stage_momentum_flag,
+        "industry_flow_bias": industry_flow_bias,
+        "score_explanations": score_explanations,
         "action_plan": {
             "action_bias": action.get("action_bias"),
             "entry_zone": action.get("entry_zone"),
@@ -955,63 +1307,108 @@ def _build_stock_intelligent_insight(ts_code: str, payload: Dict[str, Any]) -> D
 
 
 def _build_intelligent_overview_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _score_value(item: Dict[str, Any], *keys: str) -> float:
+        for key in keys:
+            value = item.get(key)
+            if value not in (None, ""):
+                return float(value)
+        return 0.0
+
+    def _normalize_recommendation_item(item: Dict[str, Any], default_source_tag: str) -> Dict[str, Any]:
+        selected_confidence = _pick_confidence_value(item)
+        return {
+            "ts_code": item.get("ts_code"),
+            "name": item.get("name", ""),
+            "score": _score_value(item, "overall_score", "priority_score", "score"),
+            "overall_score": _score_value(item, "overall_score", "priority_score", "score"),
+            "priority_score": _score_value(item, "priority_score", "overall_score", "score"),
+            "recommendation_score": _score_value(item, "recommendation_score", "overall_score", "priority_score", "score"),
+            "display_confidence": item.get("display_confidence"),
+            "overall_confidence": item.get("overall_confidence"),
+            "ai_confidence": item.get("ai_confidence"),
+            "confidence": selected_confidence,
+            "technical_signal": item.get("technical_signal") or "信号待确认",
+            "recommendation": item.get("recommendation_text") or item.get("final_decision") or item.get("recommendation") or item.get("summary") or "建议继续观察",
+            "summary": item.get("summary") or item.get("technical_summary") or "",
+            "hit_streak_days": int(item.get("hit_streak_days") or 0),
+            "miss_streak_days": int(item.get("miss_streak_days") or 0),
+            "tracking_status": item.get("tracking_status") or "active",
+            "llm_focus_level": item.get("llm_focus_level") or "medium",
+            "source_tag": item.get("source_tag") or default_source_tag,
+            "is_repeat_pick": bool(item.get("is_repeat_pick", False)),
+            "continuation_bias_score": item.get("continuation_bias_score"),
+            "continuation_positive_flags": list(item.get("continuation_positive_flags") or []),
+            "continuation_negative_flags": list(item.get("continuation_negative_flags") or []),
+        }
+
+    def _merge_authoritative_cards(primary_items: List[Dict[str, Any]], fallback_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        merged_cards: List[Dict[str, Any]] = []
+        seen_codes = set()
+        for item in primary_items + fallback_items:
+            if not isinstance(item, dict):
+                continue
+            code = item.get("ts_code")
+            if not code or code in seen_codes:
+                continue
+            seen_codes.add(code)
+            merged_cards.append(item)
+        return merged_cards[:10]
+
+    def _frontlist_sort_key(item: Dict[str, Any]) -> tuple:
+        return (
+            -_score_value(item, "recommendation_score"),
+            -_score_value(item, "final_display_recommendation_score"),
+            -_score_value(item, "overall_score", "priority_score", "score"),
+            str(item.get("ts_code") or ""),
+        )
+
     ai_analyses = payload.get("ai_analyses", {}) or {}
     recommendation_pool = payload.get("recommendation_pool", {}) or {}
+    report_context = payload.get("report_context") or recommendation_pool.get("report_context") or {}
+    authoritative_today_top3 = [item for item in (report_context.get("today_top3") or []) if isinstance(item, dict)]
+    authoritative_today_top10 = [
+        item
+        for item in (report_context.get("today_top10") or [])
+        if isinstance(item, dict) and (item.get("source_tag") or "今日候选") != "昨日延续"
+    ]
+    normalized_today_top3 = [
+        _normalize_recommendation_item(item, item.get("source_tag") or "今日Top3")
+        for item in authoritative_today_top3
+    ]
     frontlist = recommendation_pool.get("frontlist") or []
-    if frontlist:
-        sorted_recommendations = sorted(
-            (
-                {
-                    "ts_code": item.get("ts_code"),
-                    "name": item.get("name", ""),
-                    "score": float(((ai_analyses.get(item.get("ts_code"), {}) or {}).get("overall_score") or item.get("priority_score") or 0.0)),
-                    "overall_score": float(((ai_analyses.get(item.get("ts_code"), {}) or {}).get("overall_score") or item.get("priority_score") or 0.0)),
-                    "priority_score": float(item.get("priority_score") or (ai_analyses.get(item.get("ts_code"), {}) or {}).get("priority_score") or 0.0),
-                    "recommendation_score": float(((ai_analyses.get(item.get("ts_code"), {}) or {}).get("recommendation_score") or item.get("recommendation_score") or item.get("score") or 0.0)),
-                    "confidence": float((ai_analyses.get(item.get("ts_code"), {}) or {}).get("confidence") or (ai_analyses.get(item.get("ts_code"), {}) or {}).get("overall_confidence") or item.get("ai_confidence") or 0.0),
-                    "technical_signal": item.get("technical_signal") or (ai_analyses.get(item.get("ts_code"), {}) or {}).get("technical_signal") or "信号待确认",
-                    "recommendation": item.get("recommendation_text") or (ai_analyses.get(item.get("ts_code"), {}) or {}).get("final_decision") or (ai_analyses.get(item.get("ts_code"), {}) or {}).get("recommendation") or "建议继续观察",
-                    "summary": (ai_analyses.get(item.get("ts_code"), {}) or {}).get("summary") or (ai_analyses.get(item.get("ts_code"), {}) or {}).get("technical_summary") or "",
-                    "hit_streak_days": int(item.get("hit_streak_days") or 0),
-                    "miss_streak_days": int(item.get("miss_streak_days") or 0),
-                    "tracking_status": item.get("tracking_status") or "active",
-                    "llm_focus_level": item.get("llm_focus_level") or "medium",
-                    "source_tag": item.get("source_tag") or "今日Top3",
-                    "is_repeat_pick": bool(item.get("is_repeat_pick", False)),
-                }
-                for item in frontlist
-                if isinstance(item, dict)
-            ),
-            key=lambda item: item["recommendation_score"],
-            reverse=True,
-        )[:10]
+    frontlist_cards = sorted([
+        _normalize_recommendation_item(
+            dict(item, **((ai_analyses.get(item.get("ts_code"), {}) or {}) if item.get("ts_code") else {})),
+            item.get("source_tag") or "今日候选",
+        )
+        for item in frontlist
+        if isinstance(item, dict)
+    ], key=_frontlist_sort_key)
+    if authoritative_today_top10:
+        sorted_recommendations = [
+            _normalize_recommendation_item(item, item.get("source_tag") or "今日候选")
+            for item in authoritative_today_top10
+            if isinstance(item, dict)
+        ][:10]
+    elif normalized_today_top3:
+        sorted_recommendations = _merge_authoritative_cards(normalized_today_top3, frontlist_cards)
+    elif frontlist_cards:
+        sorted_recommendations = frontlist_cards[:10]
     else:
         sorted_recommendations = sorted(
             (
-                {
-                    "ts_code": code,
-                    "name": analysis.get("name", ""),
-                    "score": float(analysis.get("overall_score") or analysis.get("priority_score") or 0.0),
-                    "overall_score": float(analysis.get("overall_score") or analysis.get("priority_score") or 0.0),
-                    "priority_score": float(analysis.get("priority_score") or analysis.get("overall_score") or 0.0),
-                    "recommendation_score": float(analysis.get("recommendation_score") or analysis.get("score") or analysis.get("overall_score") or 0.0),
-                    "confidence": float(analysis.get("confidence") or analysis.get("overall_confidence") or 0.0),
-                    "technical_signal": analysis.get("technical_signal") or "信号待确认",
-                    "recommendation": analysis.get("final_decision") or analysis.get("recommendation") or "建议继续观察",
-                    "summary": analysis.get("summary") or analysis.get("technical_summary") or "",
-                    "hit_streak_days": int(analysis.get("hit_streak_days") or 0),
-                    "miss_streak_days": int(analysis.get("miss_streak_days") or 0),
-                    "tracking_status": analysis.get("tracking_status") or "active",
-                    "llm_focus_level": analysis.get("llm_focus_level") or "medium",
-                    "source_tag": analysis.get("source_tag") or "今日Top3",
-                    "is_repeat_pick": bool(analysis.get("is_repeat_pick", False)),
-                }
-                for code, analysis in ai_analyses.items()
+                _normalize_recommendation_item(analysis, analysis.get("source_tag") or "今日候选")
+                for analysis in ai_analyses.values()
                 if isinstance(analysis, dict)
             ),
-            key=lambda item: item["recommendation_score"],
+            key=lambda item: (
+                item["recommendation_score"],
+                item["overall_score"],
+                item["priority_score"],
+            ),
             reverse=True,
         )[:10]
+    overview_today_top3 = normalized_today_top3[:3] if normalized_today_top3 else sorted_recommendations[:3]
     report = payload.get("intelligent_report") or {}
     screening_results = payload.get("screening_results") or {}
     recommendation_summary = payload.get("recommendation_summary") or {}
@@ -1027,6 +1424,8 @@ def _build_intelligent_overview_payload(payload: Dict[str, Any]) -> Dict[str, An
         "today_top_count": screening_results.get("today_top_count", len([item for item in sorted_recommendations if item.get("source_tag") == "今日Top3"])),
         "continuation_count": screening_results.get("continuation_count", len([item for item in sorted_recommendations if item.get("source_tag") == "昨日延续"])),
         "news_cluster_count": len(payload.get("news_clusters", []) or []),
+        "today_top3": overview_today_top3,
+        "today_top10": sorted_recommendations[:10],
         "top_recommendations": sorted_recommendations[:10],
         "report_title": report.get("title") or "智能选股报告",
         "report_summary": report.get("summary") or "运行一次智能选股后，这里会显示最新摘要。",

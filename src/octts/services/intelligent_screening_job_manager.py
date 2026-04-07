@@ -218,6 +218,7 @@ class IntelligentScreeningJobManager:
             task = self._tasks.pop(job_id, None)
             if task and not task.done():
                 task.cancel()
+            self._remove_job_snapshot(job_id)
 
     def _persist_job_snapshot_locked(self, job: IntelligentScreeningJob) -> None:
         payload = job.to_dict()
@@ -277,6 +278,15 @@ class IntelligentScreeningJobManager:
                 pass
             except OSError:
                 logger.warning("Failed to remove stale intelligent screening active snapshot: %s", self._active_snapshot_path)
+
+    def _remove_job_snapshot(self, job_id: str) -> None:
+        snapshot_path = self._snapshot_dir / f"{job_id}.json"
+        try:
+            snapshot_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("Failed to remove intelligent screening job snapshot: %s", snapshot_path)
 
     @staticmethod
     def _read_snapshot(path: Path) -> Optional[Dict[str, Any]]:

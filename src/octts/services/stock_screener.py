@@ -205,6 +205,8 @@ class StockScreener:
                     technical_score_min=55,
                     exclude_st=True,
                     max_recent_loss_years=1,
+                    require_positive_3d_moneyflow=True,
+                    max_late_stage_price_position=0.98,
                     sort_by="recommendation_score",
                     sort_desc=True
                 ),
@@ -402,6 +404,38 @@ class StockScreener:
             total_flow += self._to_float(item.get("net_mf_amount")) or 0.0
         return total_flow > 0
 
+    @staticmethod
+    def _hits_late_stage_risk_gate(
+        *,
+        pct_change: Optional[float],
+        turnover_rate: Optional[float],
+        volume_ratio: Optional[float],
+        price_position: Optional[float],
+        criteria: ScreenCriteria,
+    ) -> bool:
+        max_position = criteria.max_late_stage_price_position
+        if max_position is None:
+            return False
+        if price_position is None or price_position > max_position:
+            return True
+
+        pct_change_value = pct_change or 0.0
+        turnover_value = turnover_rate or 0.0
+        volume_ratio_value = volume_ratio or 0.0
+        high_position = price_position >= max(0.9, max_position - 0.03)
+        overheated_move = pct_change_value >= 7.0
+        weak_close = pct_change_value <= -1.0
+        high_turnover = turnover_value >= 12.0
+        abnormal_volume = volume_ratio_value >= 2.8
+
+        if high_position and weak_close and high_turnover and abnormal_volume:
+            return True
+        if high_position and high_turnover and abnormal_volume and pct_change_value <= -2.0:
+            return True
+        if high_position and abnormal_volume and overheated_move and weak_close:
+            return True
+        return False
+
     def _fetch_stock_data(
         self,
         ts_codes: List[str],
@@ -484,12 +518,24 @@ class StockScreener:
             start_date=start_date,
             end_date=end_date
         )
+        fetched_count = sum(1 for items in fetched_daily.values() if items)
+        missing_after_fetch = [
+            ts_code for ts_code in missing_ts_codes
+            if not fetched_daily.get(ts_code)
+        ]
         logger.info(
             "Stock screener daily history fetched after prefilter: %s/%s symbols in %.2fs",
-            sum(1 for items in fetched_daily.values() if items),
+            fetched_count,
             len(missing_ts_codes),
             time.time() - daily_start,
         )
+        if missing_after_fetch:
+            logger.warning(
+                "Stock screener missing daily history after fetch: count=%s, trade_date=%s, symbols=%s",
+                len(missing_after_fetch),
+                trade_date,
+                ",".join(missing_after_fetch[:20]),
+            )
 
         if market_snapshot is not None:
             daily_source = market_snapshot.setdefault("daily", {})
@@ -537,11 +583,15 @@ class StockScreener:
         snapshot = build_technical_snapshot(closes, highs, lows, volumes)
         volume_ratio = float(basic.get("volume_ratio", 0)) if basic.get("volume_ratio") else snapshot.volume_ratio
 
+        pct_change = self._to_float(latest.get("pct_chg"))
+        if pct_change is None:
+            pct_change = self._to_float(latest.get("pct_change"))
+
         item = StockScreenItem(
             ts_code=ts_code,
             name=stock_info.get("name", ""),
             close=float(basic.get("close", snapshot.close)),
-            pct_change=float(latest.get("pct_chg", 0)),
+            pct_change=pct_change,
             volume_ratio=volume_ratio,
             turnover_rate=float(basic.get("turnover_rate", 0)),
             rsi=snapshot.rsi,
@@ -592,7 +642,7 @@ class StockScreener:
             match_reasons.append(f"RSI={item.rsi:.1f}低于{criteria.rsi_max}")
         if criteria.volume_ratio_min is not None and item.volume_ratio >= criteria.volume_ratio_min:
             match_reasons.append(f"量比={item.volume_ratio:.1f}")
-        if criteria.pct_change_min is not None and item.pct_change >= criteria.pct_change_min:
+        if criteria.pct_change_min is not None and item.pct_change is not None and item.pct_change >= criteria.pct_change_min:
             match_reasons.append(f"涨幅={item.pct_change:.1f}%")
         if criteria.technical_score_min is not None and item.technical_score is not None and item.technical_score >= criteria.technical_score_min:
             match_reasons.append(f"技术评分={item.technical_score:.1f}")
@@ -626,9 +676,9 @@ class StockScreener:
             return False
 
         # 涨跌幅
-        if criteria.pct_change_min is not None and item.pct_change < criteria.pct_change_min:
+        if criteria.pct_change_min is not None and (item.pct_change is None or item.pct_change < criteria.pct_change_min):
             return False
-        if criteria.pct_change_max is not None and item.pct_change > criteria.pct_change_max:
+        if criteria.pct_change_max is not None and (item.pct_change is None or item.pct_change > criteria.pct_change_max):
             return False
 
         # 成交量
@@ -697,6 +747,14 @@ class StockScreener:
         if criteria.price_position_max is not None:
             if item.price_position_20d is None or item.price_position_20d > criteria.price_position_max:
                 return False
+        if self._hits_late_stage_risk_gate(
+            pct_change=item.pct_change,
+            turnover_rate=item.turnover_rate,
+            volume_ratio=item.volume_ratio,
+            price_position=item.price_position_20d,
+            criteria=criteria,
+        ):
+            return False
 
         # 市值
         if criteria.market_cap_min is not None:
