@@ -79,15 +79,31 @@ if [[ ! -f .env ]]; then
   echo "Created .env from .env.example"
 fi
 
-if [[ ! -d .venv ]]; then
-  python3 -m venv .venv
-fi
+detect_conda_env() {
+  if [[ -n "${OCTTS_CONDA_ENV:-}" ]]; then
+    echo "${OCTTS_CONDA_ENV}"
+    return 0
+  fi
+  if [[ "${CONDA_DEFAULT_ENV:-}" == "ai-test" ]]; then
+    echo "ai-test"
+    return 0
+  fi
+  if [[ -n "${CONDA_PREFIX:-}" && "${CONDA_PREFIX:-}" == *"/envs/ai-test" ]]; then
+    echo "ai-test"
+    return 0
+  fi
+  echo ""
+}
 
 deps_fingerprint() {
   shasum pyproject.toml | awk '{print $1}'
 }
 
-ensure_dependencies() {
+ensure_dependencies_venv() {
+  if [[ ! -d .venv ]]; then
+    python3 -m venv .venv
+  fi
+
   local marker_file=".venv/.octts_bootstrapped"
   local fingerprint_file=".venv/.octts_deps_fingerprint"
   local current_fingerprint=""
@@ -116,7 +132,47 @@ ensure_dependencies() {
   fi
 }
 
-ensure_dependencies
+ensure_dependencies_conda() {
+  local conda_env="$1"
+  local marker_file=".conda/.octts_bootstrapped_${conda_env}"
+  local fingerprint_file=".conda/.octts_deps_fingerprint_${conda_env}"
+  local current_fingerprint=""
+  local installed_fingerprint=""
+  local needs_install=0
+
+  mkdir -p .conda
+
+  current_fingerprint="$(deps_fingerprint)"
+  if [[ -f "$fingerprint_file" ]]; then
+    installed_fingerprint="$(<"$fingerprint_file")"
+  fi
+
+  if [[ ! -f "$marker_file" ]]; then
+    needs_install=1
+  elif [[ "$current_fingerprint" != "$installed_fingerprint" ]]; then
+    needs_install=1
+  elif ! conda run -n "$conda_env" python -c "import fastapi, sqlalchemy" >/dev/null 2>&1; then
+    needs_install=1
+  fi
+
+  if [[ "$needs_install" -eq 1 ]]; then
+    echo "Installing or refreshing Python dependencies in conda env: $conda_env"
+    conda run -n "$conda_env" python -m pip install --upgrade pip >/dev/null
+    conda run -n "$conda_env" python -m pip install -e '.[dev]'
+    printf '%s\n' "$current_fingerprint" > "$fingerprint_file"
+    touch "$marker_file"
+  fi
+}
+
+CONDA_ENV_NAME="$(detect_conda_env)"
+if [[ -n "$CONDA_ENV_NAME" ]]; then
+  echo "Using conda env: $CONDA_ENV_NAME"
+  conda run -n "$CONDA_ENV_NAME" python -c "import sys; print('Python:', sys.executable); print(sys.version)"
+  ensure_dependencies_conda "$CONDA_ENV_NAME"
+else
+  echo "Using venv: .venv"
+  ensure_dependencies_venv
+fi
 
 echo
 echo "OCTTS starting on http://127.0.0.1:$PORT"
@@ -127,4 +183,27 @@ echo
 ensure_port_available
 cleanup_port_state
 
-exec .venv/bin/uvicorn octts.api:app --host 0.0.0.0 --port "$PORT"
+echo "Press Ctrl+C to stop."
+
+SERVER_PID=""
+cleanup_server() {
+  if [[ -n "${SERVER_PID:-}" ]]; then
+    kill -TERM "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup_server INT TERM EXIT
+
+if [[ -n "$CONDA_ENV_NAME" ]]; then
+  # If the env is already active, prefer direct python for correct signal handling.
+  if [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
+    "${CONDA_PREFIX}/bin/python" -m uvicorn octts.api:app --host 0.0.0.0 --port "$PORT" &
+  else
+    conda run -n "$CONDA_ENV_NAME" python -m uvicorn octts.api:app --host 0.0.0.0 --port "$PORT" &
+  fi
+else
+  .venv/bin/uvicorn octts.api:app --host 0.0.0.0 --port "$PORT" &
+fi
+
+SERVER_PID="$!"
+wait "$SERVER_PID"

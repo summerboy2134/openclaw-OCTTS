@@ -7,8 +7,11 @@ import logging
 import math
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
+
+_executor = ThreadPoolExecutor(max_workers=4)
 
 from json_repair import repair_json
 
@@ -86,11 +89,12 @@ class LLMClient:
         *,
         system_prompt: str = "You are a helpful financial analysis assistant.",
         max_tokens: Optional[int] = None,
+        model: Optional[str] = None,
     ) -> str:
         """Return free-form model output for prompt-driven workflows."""
         
         # 生成缓存 key
-        cache_key = self._make_cache_key(system_prompt, prompt)
+        cache_key = self._make_cache_key(system_prompt, prompt, model=model)
         if cache_key in self._completion_cache:
             return self._completion_cache[cache_key]
 
@@ -102,10 +106,12 @@ class LLMClient:
                 ],
                 use_json_mode=False,
                 max_tokens=max_tokens or self._settings.llm_max_tokens,
+                model=model,
             )
             return content
 
-        result = await asyncio.to_thread(_run_request)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(_executor, _run_request)
         self._completion_cache[cache_key] = result
         return result
 
@@ -115,9 +121,11 @@ class LLMClient:
         messages: list[dict[str, str]],
         use_json_mode: bool,
         max_tokens: int,
+        model: Optional[str] = None,
     ) -> tuple[str, Optional[str]]:
+        request_model = model or self._settings.llm_model
         request_kwargs: dict[str, Any] = {
-            "model": self._settings.llm_model,
+            "model": request_model,
             "temperature": self._settings.llm_temperature,
             "max_tokens": max_tokens,
             "messages": messages,
@@ -129,7 +137,7 @@ class LLMClient:
         started_at = time.time()
         logger.info(
             "LLM request start: model=%s, base_url=%s, json_mode=%s, max_tokens=%s, message_count=%s, timeout=%ss",
-            self._settings.llm_model,
+            request_model,
             self._settings.llm_base_url,
             use_json_mode,
             max_tokens,
@@ -149,7 +157,7 @@ class LLMClient:
                 logger.error(
                     "LLM request failed after %.2fs: model=%s, error=%s",
                     time.time() - started_at,
-                    self._settings.llm_model,
+                    request_model,
                     exc,
                 )
                 raise
@@ -159,7 +167,7 @@ class LLMClient:
         finish_reason = getattr(choice, "finish_reason", None)
         logger.info(
             "LLM response received: model=%s, finish_reason=%s, content_length=%s, duration=%.2fs",
-            self._settings.llm_model,
+            request_model,
             finish_reason,
             len(content),
             time.time() - started_at,
@@ -167,9 +175,9 @@ class LLMClient:
         return content, finish_reason
 
     @staticmethod
-    def _make_cache_key(system_prompt: str, user_prompt: str) -> str:
+    def _make_cache_key(system_prompt: str, user_prompt: str, *, model: Optional[str] = None) -> str:
         """生成缓存 key"""
-        combined = f"{system_prompt}||{user_prompt}"
+        combined = f"{model or ''}||{system_prompt}||{user_prompt}"
         return hashlib.md5(combined.encode()).hexdigest()
 
 

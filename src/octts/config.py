@@ -21,6 +21,10 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("TINYSHARE_TOKEN", "TUSHARE_TOKEN"),
     )
+    tushare_base_url: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("TINYSHARE_BASE_URL", "TUSHARE_BASE_URL"),
+    )
     llm_api_key: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices("LLM_API_KEY", "DEEPSEEK_API_KEY"),
@@ -28,6 +32,14 @@ class Settings(BaseSettings):
     llm_model: str = Field(
         default="deepseek-ai/DeepSeek-V3",
         validation_alias=AliasChoices("LLM_MODEL", "DEEPSEEK_MODEL"),
+    )
+    llm_report_analysis_model: str = Field(
+        default="deepseek-ai/DeepSeek-R1-0528",
+        alias="LLM_REPORT_ANALYSIS_MODEL",
+    )
+    llm_report_formatter_model: str = Field(
+        default="deepseek-ai/DeepSeek-V3-0324",
+        alias="LLM_REPORT_FORMATTER_MODEL",
     )
     llm_base_url: str = Field(
         default="https://api.modelverse.cn/v1",
@@ -46,7 +58,7 @@ class Settings(BaseSettings):
         default="memory/history",
         validation_alias=AliasChoices("OCTTS_HISTORY_DIR_PATH", "OCTTS_HISTORY_FILE_PATH"),
     )
-    history_limit_per_symbol: int = Field(default=30, alias="OCTTS_HISTORY_LIMIT_PER_SYMBOL")
+    history_limit_per_symbol: int = Field(default=10, alias="OCTTS_HISTORY_LIMIT_PER_SYMBOL")
 
     stock_pool_raw: str = Field(default="", alias="OCTTS_STOCK_POOL")
     default_lookback_days: int = Field(default=20, alias="OCTTS_DEFAULT_LOOKBACK_DAYS")
@@ -80,6 +92,9 @@ class Settings(BaseSettings):
     screening_strategies_raw: str = Field(default="", alias="OCTTS_SCREENING_STRATEGIES")
     screening_notify: bool = Field(default=True, alias="OCTTS_SCREENING_NOTIFY")
     screening_top_n: int = Field(default=20, alias="OCTTS_SCREENING_TOP_N")
+    screening_llm_enabled: bool = Field(default=True, alias="OCTTS_SCREENING_LLM_ENABLED")
+    screening_history_throttle_every: int = Field(default=4, alias="OCTTS_SCREENING_HISTORY_THROTTLE_EVERY")
+    screening_history_throttle_sleep_seconds: float = Field(default=1.5, alias="OCTTS_SCREENING_HISTORY_THROTTLE_SLEEP_SECONDS")
 
     # 数据库配置
     database_url: str = Field(

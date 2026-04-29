@@ -114,12 +114,50 @@ class RecommendationTracker:
         return target_dates
 
     def _fetch_bar_map(self, ts_code: str, start_date: str, end_date: str) -> Dict[str, DailyBar]:
+        snapshot_bar_map = self._fetch_bar_map_from_screening_snapshot(ts_code, start_date)
+        if snapshot_bar_map:
+            return snapshot_bar_map
         bars = self.tushare_client.fetch_daily_bars(
             ts_code=ts_code,
             start_date=start_date.replace("-", ""),
             end_date=end_date.replace("-", ""),
         )
         return {self._normalize_trade_date(bar.trade_date): bar for bar in bars if self._normalize_trade_date(bar.trade_date)}
+
+    def _fetch_bar_map_from_screening_snapshot(self, ts_code: str, start_date: str) -> Dict[str, DailyBar]:
+        normalized_trade_date = start_date.replace("-", "")
+        try:
+            snapshot = self.tushare_client.get_or_build_screening_snapshot(normalized_trade_date)
+        except Exception:
+            return {}
+        if not isinstance(snapshot, dict):
+            return {}
+        raw_daily = snapshot.get("daily")
+        if not isinstance(raw_daily, dict):
+            return {}
+        rows = raw_daily.get(ts_code) or []
+        bar_map: Dict[str, DailyBar] = {}
+        for row in rows:
+            trade_date = self._normalize_trade_date(row.get("trade_date"))
+            if not trade_date:
+                continue
+            close = row.get("close")
+            if close is None:
+                continue
+            bar_map[trade_date] = DailyBar.model_validate(
+                {
+                    "ts_code": ts_code,
+                    "trade_date": row.get("trade_date"),
+                    "open": row.get("open"),
+                    "high": row.get("high"),
+                    "low": row.get("low"),
+                    "close": row.get("close"),
+                    "pct_chg": row.get("pct_chg"),
+                    "vol": row.get("vol"),
+                    "amount": row.get("amount"),
+                }
+            )
+        return bar_map
 
     @staticmethod
     def _compute_return(entry_price: Optional[float], target_price: Optional[float]) -> Optional[float]:

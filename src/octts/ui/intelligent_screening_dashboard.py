@@ -57,12 +57,30 @@ def _format_datetime_minute(value: Any) -> str:
     return escape(text[:16].replace("T", " "))
 
 
+def _format_trade_date_label(value: Any) -> str:
+    text = _safe_text(value)
+    if not text:
+        return "暂无交易日"
+    compact = text.replace("-", "").strip()
+    if len(compact) == 8 and compact.isdigit():
+        return escape(f"{compact[:4]}-{compact[4:6]}-{compact[6:8]}")
+    return escape(text)
+
+
 def _format_metric_value(value: Any, *, percent: bool = False) -> str:
     if value is None or value == "":
         return "--"
     if percent:
         return f"{_safe_float(value, 0.0) * 100:.1f}%"
     return escape(_safe_text(value, "--"))
+
+
+def _format_focus_badge(item: Dict[str, Any]) -> str:
+    score = _safe_float(
+        item.get("final_display_recommendation_score", item.get("recommendation_score", item.get("score"))),
+        0.0,
+    )
+    return f"执行分 {score:.1f}"
 
 
 def _pick_confidence_value(item: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> Optional[float]:
@@ -268,17 +286,19 @@ def _render_stock_cards(
     for item in items:
         code = escape(_safe_text(item.get("ts_code")))
         name = escape(_safe_text(item.get("name"), _safe_text(item.get("ts_code"))))
-        score = _safe_float(item.get("recommendation_score", item.get("recommend_score", item.get("score"))), 0.0)
+        execution_score = _safe_float(item.get("recommendation_score", item.get("recommend_score", item.get("score"))), 0.0)
         source_tag = escape(_safe_text(item.get("source_tag"), "候选池"))
         overall_score = _safe_float(item.get("overall_score", item.get("priority_score", item.get("score"))), 0.0)
         confidence_text = _format_confidence_text(item)
+        badge = escape(_format_focus_badge(item))
         html.append(
             f'''
             <div class="stock-item">
-                <div class="stock-header"><div><span class="stock-code">{code}</span><span class="stock-name">{name}</span></div><span class="score-badge">推荐分数 {score:.1f}</span></div>
+                <div class="stock-header"><div><span class="stock-code">{code}</span><span class="stock-name">{name}</span></div><span class="score-badge">{badge}</span></div>
                 <div class="detail-grid" style="margin-top:12px;">
                     <div class="detail-panel"><div class="detail-label">来源</div><div class="detail-value">{source_tag}</div></div>
                     <div class="detail-panel"><div class="detail-label">综合分</div><div class="detail-value">{overall_score:.1f}</div></div>
+                    <div class="detail-panel"><div class="detail-label">执行分（风险后）</div><div class="detail-value">{execution_score:.1f}</div></div>
                     <div class="detail-panel"><div class="detail-label">置信度</div><div class="detail-value">{confidence_text}</div></div>
                 </div>
             </div>
@@ -732,11 +752,14 @@ def _render_focus_stock_block(items: List[Dict[str, Any]]) -> str:
         market_performance = escape(_safe_text(item.get("market_performance_view"), "暂无"))
         catalyst_capital = escape(_safe_text(item.get("catalyst_and_capital_view"), "暂无"))
         focus_analysis = escape(_safe_text(item.get("focus_analysis"), _safe_text(item.get("analysis"), _safe_text(item.get("overall_assessment"), "暂无分析"))))
+        execution_score = _safe_float(item.get('recommendation_score'), 0.0)
+        badge = escape(_format_focus_badge(item))
         html += f"""
         <div class="stock-item">
-            <div class="stock-header"><div><span class="stock-code">{escape(_safe_text(item.get('ts_code')))}</span><span class="stock-name">{escape(_safe_text(item.get('name'), _safe_text(item.get('ts_code'))))}</span></div><span class="score-badge">{_safe_float(item.get('recommendation_score'), 0.0):.1f}分</span></div>
+            <div class="stock-header"><div><span class="stock-code">{escape(_safe_text(item.get('ts_code')))}</span><span class="stock-name">{escape(_safe_text(item.get('name'), _safe_text(item.get('ts_code'))))}</span></div><span class="score-badge">{badge}</span></div>
             <div class="detail-grid" style="margin-top:12px;">
                 <div class="detail-panel"><div class="detail-label">综合分</div><div class="detail-value">{_safe_float(item.get('overall_score'), 0.0):.1f}</div></div>
+                <div class="detail-panel"><div class="detail-label">执行分（风险后）</div><div class="detail-value">{execution_score:.1f}</div></div>
                 <div class="detail-panel"><div class="detail-label">置信度</div><div class="detail-value">{_format_confidence_text(item)}</div></div>
                 <div class="detail-panel"><div class="detail-label">来源</div><div class="detail-value">{escape(_safe_text(item.get('source_tag'), '--'))}</div></div>
             </div>
@@ -902,6 +925,11 @@ def render_intelligent_screening_dashboard(
         report_context = intelligent_report.get("report_context") or {}
     if not report_context:
         report_context = _lookup(intelligent_report, "report_context", {}) or {}
+    trade_date_label = _format_trade_date_label(
+        _lookup(report_context, "trade_date")
+        or screening_results.get("trade_date")
+        or _lookup(intelligent_report, "trade_date")
+    )
 
     frontlist = recommendation_pool.get("frontlist") or []
     frontlist = sorted(
@@ -1158,6 +1186,7 @@ def render_intelligent_screening_dashboard(
     <section class="hero">
       <div>
         <h1>智能选股系统</h1>
+        <p>交易日：{trade_date_label}</p>
         <p>最近生成时间：{generated_label}</p>
       </div>
       <div class="hero-actions">

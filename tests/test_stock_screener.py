@@ -376,6 +376,44 @@ def test_save_recommendation_run_overwrites_same_trade_date(tmp_path) -> None:
     assert [item["ts_code"] for item in active] == ["600000.SH"]
 
 
+def test_save_recommendation_run_normalizes_active_status_to_new(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'screening.db'}"
+    settings = Settings(
+        OCTTS_DATABASE_URL=database_url,
+        OCTTS_USE_DATABASE=True,
+        OCTTS_MEMORY_BACKEND="file",
+        OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+    )
+    store = ScreeningStore(settings)
+    trade_date = date(2026, 4, 3)
+
+    store.save_recommendation_run(
+        run_id="rec-20260403",
+        trade_date=trade_date,
+        candidate_count=8,
+        final_count=3,
+        report_id="report-20260403",
+        items=[
+            {
+                "ts_code": "688010.SH",
+                "name": "福光股份",
+                "recommend_rank": 1,
+                "recommend_score": 59.56,
+                "status": "active",
+                "tracking_status": "active",
+                "trade_date": trade_date,
+                "entry_price": 30.9,
+            }
+        ],
+    )
+
+    active = store.list_active_recommendations(limit=10)
+    pending = store.list_pending_performance_updates(lookback_days=30, limit=10)
+
+    assert active[0]["status"] in {"new", "active"}
+    assert pending[0]["ts_code"] == "688010.SH"
+
+
 def test_screen_criteria_validation():
     """ScreenCriteria should keep current defaults and accept explicit bounds."""
     criteria = ScreenCriteria(
@@ -587,6 +625,98 @@ def test_build_recommendation_pool_states_only_promotes_analyzed_stocks_to_today
     assert today_top_codes == ["000003.SZ", "000004.SZ"]
     assert [state.recommend_rank for state in states if state.source_tag == "今日Top3"] == [1, 2]
     assert all(state.ts_code not in {"000001.SZ", "000002.SZ"} for state in states)
+
+
+def test_model_top3_selection_only_vetoes_extreme_risk(tmp_path) -> None:
+    settings = Settings(
+        OCTTS_HISTORY_DIR_PATH=str(tmp_path / "history"),
+        OCTTS_MEMORY_BACKEND="file",
+        OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+    )
+    scheduler = EnhancedScreeningScheduler(
+        settings=settings,
+        screener=Mock(),
+        store=Mock(),
+        analyzer=Mock(),
+        news_aggregator=Mock(),
+        report_generator=Mock(),
+    )
+    recommendations = {
+        "000001.SZ": {"weighted_score": 50, "candidate_risk_blocked": True},
+        "000002.SZ": {"weighted_score": 10, "distribution_risk_score": 2.9},
+        "000003.SZ": {"weighted_score": 5, "relay_candidate_veto": True},
+        "000004.SZ": {"weighted_score": 1, "distribution_risk_score": 0.0},
+        "000005.SZ": {"weighted_score": 99, "distribution_risk_score": 3.49},
+    }
+
+    selected = scheduler._select_model_top3_with_extreme_risk_veto(
+        model_candidate_codes=["000001.SZ", "000002.SZ", "000003.SZ", "000004.SZ", "000005.SZ"],
+        recommendations=recommendations,
+    )
+
+    assert selected == ["000002.SZ", "000004.SZ", "000005.SZ"]
+    assert recommendations["000001.SZ"]["selection_stage"] == "model_top100_extreme_risk_veto"
+    assert recommendations["000001.SZ"]["top3_extreme_risk_reason"] == "candidate_risk_blocked"
+    assert recommendations["000002.SZ"]["selection_stage"] == "stage3_final_top3"
+    assert recommendations["000005.SZ"]["selection_stage"] == "stage3_final_top3"
+
+
+def test_model_top3_selection_keeps_st_stock_when_not_extreme_risk(tmp_path) -> None:
+    settings = Settings(
+        OCTTS_HISTORY_DIR_PATH=str(tmp_path / "history"),
+        OCTTS_MEMORY_BACKEND="file",
+        OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+    )
+    scheduler = EnhancedScreeningScheduler(
+        settings=settings,
+        screener=Mock(),
+        store=Mock(),
+        analyzer=Mock(),
+        news_aggregator=Mock(),
+        report_generator=Mock(),
+    )
+    recommendations = {
+        "000001.SZ": {"name": "*ST测试", "weighted_score": 80, "distribution_risk_score": 0.0},
+        "000002.SZ": {"name": "正常股A", "weighted_score": 70, "distribution_risk_score": 0.0},
+        "000003.SZ": {"name": "正常股B", "weighted_score": 60, "distribution_risk_score": 0.0},
+    }
+
+    selected = scheduler._select_model_top3_with_extreme_risk_veto(
+        model_candidate_codes=["000001.SZ", "000002.SZ", "000003.SZ"],
+        recommendations=recommendations,
+    )
+
+    assert selected == ["000001.SZ", "000002.SZ", "000003.SZ"]
+    assert recommendations["000001.SZ"]["selection_stage"] == "stage3_final_top3"
+    assert recommendations["000001.SZ"]["top3_st_excluded"] is False
+
+
+def test_rank_stage1_candidates_by_fusion_uses_model_and_overall_scores() -> None:
+    recommendations = {
+        "000001.SZ": {"overall_score": 80.0},
+        "000002.SZ": {"overall_score": 90.0},
+        "000003.SZ": {"overall_score": 100.0},
+        "000004.SZ": {"overall_score": 70.0},
+        "000005.SZ": {"overall_score": 99.0, "candidate_risk_blocked": True},
+    }
+    rerank_metadata = {
+        "000001.SZ": {"blend_score": 1.00, "rerank_pool_rank": 1},
+        "000002.SZ": {"blend_score": 0.99, "rerank_pool_rank": 2},
+        "000003.SZ": {"blend_score": 0.95, "rerank_pool_rank": 3},
+        "000004.SZ": {"blend_score": 0.90, "rerank_pool_rank": 4},
+        "000005.SZ": {"blend_score": 0.999, "rerank_pool_rank": 5},
+    }
+
+    ranked_codes = EnhancedScreeningScheduler._rank_stage1_candidates_by_fusion(
+        candidate_codes=["000001.SZ", "000002.SZ", "000003.SZ", "000004.SZ", "000005.SZ"],
+        recommendations=recommendations,
+        rerank_metadata=rerank_metadata,
+    )
+
+    assert ranked_codes == ["000002.SZ", "000001.SZ", "000003.SZ", "000004.SZ"]
+    assert recommendations["000002.SZ"]["fusion_70_30"] > recommendations["000001.SZ"]["fusion_70_30"]
+    assert recommendations["000002.SZ"]["top3_ranking_strategy"] == "stage1_fusion_70_30"
+    assert recommendations["000005.SZ"].get("fusion_70_30") is None
 
 
 def test_build_dashboard_ai_payload_separates_scores_and_keeps_names() -> None:
@@ -2202,3 +2332,58 @@ def test_logic_consistency_distinguishes_missing_scores(mock_tushare_client) -> 
     assert "000001.SZ: 技术面(0.0)和基本面(45.0)差异大" in result["issues"]
     assert "000002.SZ: 缺少评分字段(technical_score)" in result["issues"]
     assert all("技术面(0.0)和基本面(45.0)差异大" not in issue or issue.startswith("000001.SZ") for issue in result["issues"])
+
+
+def test_recommendation_tracker_prefers_screening_snapshot_history_for_returns(tmp_path) -> None:
+    settings = Settings(
+        OCTTS_DATABASE_URL=f"sqlite:///{tmp_path / 'screening.db'}",
+        OCTTS_USE_DATABASE=True,
+        OCTTS_HISTORY_DIR_PATH=str(tmp_path / "history"),
+        OCTTS_MEMORY_BACKEND="file",
+        OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+    )
+    store = ScreeningStore(settings)
+    trade_date = date(2026, 4, 3)
+
+    saved = store.save_recommendation_run(
+        run_id="rec-20260403",
+        trade_date=trade_date,
+        candidate_count=3,
+        final_count=1,
+        report_id="report-20260403",
+        items=[
+            {
+                "ts_code": "688010.SH",
+                "name": "福光股份",
+                "recommend_rank": 1,
+                "recommend_score": 49.24,
+                "status": "new",
+                "trade_date": trade_date,
+                "entry_price": 30.9,
+            }
+        ],
+    )
+
+    tushare_client = Mock()
+    tushare_client.fetch_trading_dates.return_value = ["20260403", "20260407"]
+    tushare_client.fetch_daily_bars.return_value = []
+    tushare_client.get_or_build_screening_snapshot.return_value = {
+        "daily": {
+            "688010.SH": [
+                {"ts_code": "688010.SH", "trade_date": "20260407", "close": 30.05, "open": 30.2, "high": 30.4, "low": 29.9, "pct_chg": -2.75, "vol": 1000, "amount": 10000},
+                {"ts_code": "688010.SH", "trade_date": "20260403", "close": 30.9, "open": 29.8, "high": 31.2, "low": 29.7, "pct_chg": 6.92, "vol": 1200, "amount": 12000},
+            ],
+            "000300.SH": [
+                {"ts_code": "000300.SH", "trade_date": "20260407", "close": 3990.0, "open": 3980.0, "high": 4010.0, "low": 3970.0, "pct_chg": 0.2, "vol": 1000, "amount": 10000},
+                {"ts_code": "000300.SH", "trade_date": "20260403", "close": 3982.0, "open": 3970.0, "high": 3995.0, "low": 3960.0, "pct_chg": 0.1, "vol": 1000, "amount": 10000},
+            ],
+        }
+    }
+
+    tracker = RecommendationTracker(settings, store=store, tushare_client=tushare_client)
+    summary = tracker.update_recommendation_performance(lookback_days=15)
+
+    assert summary["updated_count"] == 1
+    updated = summary["items"][0]
+    assert updated["ts_code"] == "688010.SH"
+    assert updated["return_1d"] == pytest.approx((30.05 - 30.9) / 30.9)

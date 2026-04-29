@@ -1,17 +1,19 @@
 """Database models for screening system using SQLAlchemy."""
 
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Iterable
 
 from sqlalchemy import (
     create_engine, Column, Integer, String, Float, DateTime,
-    Boolean, Text, JSON, Index, ForeignKey, Table, Date, func, inspect, text
+    Boolean, Text, JSON, Index, ForeignKey, Table, Date, func, inspect, text, select
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
 from sqlalchemy.pool import StaticPool
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from octts.schemas.screener import ScreenCriteria, ScreenResult, StockScreenItem, TrackedRecommendationState
+from octts.schemas.training import ShortTermTrainingSample
 
 Base = declarative_base()
 
@@ -135,78 +137,6 @@ class StockAIAnalysis(Base):
     )
 
 
-class NewsCluster(Base):
-    """新闻聚类"""
-    __tablename__ = 'news_clusters'
-
-    id = Column(Integer, primary_key=True)
-    cluster_id = Column(String(50), unique=True, nullable=False)
-    cluster_date = Column(DateTime, nullable=False)
-    theme = Column(String(200), nullable=False)
-    importance = Column(Float)
-    summary = Column(Text)
-    key_stocks = Column(JSON)
-    news_count = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.now)
-
-    news_items = relationship("NewsItem", back_populates="cluster")
-
-    __table_args__ = (
-        Index('idx_cluster_date', 'cluster_date'),
-        Index('idx_importance', 'importance'),
-    )
-
-
-class NewsItem(Base):
-    """新闻条目"""
-    __tablename__ = 'news_items'
-
-    id = Column(Integer, primary_key=True)
-    cluster_id = Column(Integer, ForeignKey('news_clusters.id'))
-    source = Column(String(50), nullable=False)
-    title = Column(String(500), nullable=False)
-    content = Column(Text)
-    url = Column(String(500))
-    publish_time = Column(DateTime, nullable=False)
-    importance = Column(Float, default=0.5)
-    sentiment = Column(Float, default=0.0)
-    related_stocks = Column(JSON)
-    tags = Column(JSON)
-    content_hash = Column(String(64), unique=True)
-    created_at = Column(DateTime, default=datetime.now)
-
-    cluster = relationship("NewsCluster", back_populates="news_items")
-
-    __table_args__ = (
-        Index('idx_publish_time', 'publish_time'),
-        Index('idx_source', 'source'),
-    )
-
-
-class IntelligentReport(Base):
-    """智能报告"""
-    __tablename__ = 'intelligent_reports'
-
-    id = Column(Integer, primary_key=True)
-    report_id = Column(String(50), unique=True, nullable=False)
-    report_type = Column(String(20), nullable=False)
-    title = Column(String(200), nullable=False)
-    generate_time = Column(DateTime, nullable=False)
-    summary = Column(Text)
-    key_points = Column(JSON)
-    recommendations = Column(JSON)
-    sections = Column(JSON)
-    report_metadata = Column("metadata", JSON)
-    pushed_wechat = Column(Boolean, default=False)
-    pushed_email = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.now)
-
-    __table_args__ = (
-        Index('idx_report_type', 'report_type'),
-        Index('idx_generate_time', 'generate_time'),
-    )
-
-
 class RecommendationRun(Base):
     """智能选股推荐批次"""
     __tablename__ = 'recommendation_runs'
@@ -248,6 +178,18 @@ class RecommendationItem(Base):
     tracking_days = Column(Integer, default=0)
     trade_date = Column(Date, nullable=False)
     entry_price = Column(Float)
+    score_mode = Column(String(50))
+    rerank_pool_rank = Column(Integer)
+    rerank_blend_score = Column(Float)
+    rerank_model_score = Column(Float)
+    rerank_rule_score = Column(Float)
+    rerank_rule_weight = Column(Float)
+    rerank_model_target = Column(String(50))
+    selection_stage = Column(String(50))
+    selection_reason = Column(Text)
+    selection_reason_components = Column(JSON)
+    structured_rank_score = Column(Float)
+    structured_rank_position = Column(Integer)
     created_at = Column(DateTime, default=datetime.now, nullable=False)
 
     recommendation_run = relationship("RecommendationRun", back_populates="items")
@@ -297,6 +239,7 @@ class RecommendationPoolState(Base):
     pct_change = Column(Float)
     volume_ratio = Column(Float)
     turnover_rate = Column(Float)
+    ma20 = Column(Float)
     strategy_count = Column(Integer, default=0)
     divergence_score = Column(Float)
     strategy_consistency_label = Column(String(50))
@@ -307,6 +250,8 @@ class RecommendationPoolState(Base):
     distribution_risk_score = Column(Float)
     distribution_risk_flags = Column(JSON)
     moneyflow_3d_value = Column(Float)
+    recent_large_order_net_inflow = Column(Float)
+    recent_super_large_order_net_inflow = Column(Float)
     turnover_spike_ratio = Column(Float)
     recent_runup_5d = Column(Float)
     continuation_bias_score = Column(Float)
@@ -319,13 +264,30 @@ class RecommendationPoolState(Base):
     top3_reason = Column(Text)
     late_stage_momentum_flag = Column(Boolean, default=False)
     candidate_risk_blocked = Column(Boolean, default=False)
+    top3_extreme_risk_blocked = Column(Boolean, default=False)
+    top3_extreme_risk_reason = Column(Text)
     ai_confidence = Column(Float)
     display_confidence = Column(Float)
     technical_signal = Column(String(200))
     summary = Column(Text)
     recommendation_text = Column(Text)
     entry_price = Column(Float)
+    fundamental_bonus = Column(Float)
+    fundamental_bonus_breakdown = Column(JSON)
     recommend_rank = Column(Integer)
+    frontlist_rank = Column(Integer)
+    rerank_pool_rank = Column(Integer)
+    rerank_model_score = Column(Float)
+    rerank_rule_score = Column(Float)
+    rerank_blend_score = Column(Float)
+    rerank_rule_weight = Column(Float)
+    rerank_model_target = Column(String(50))
+    rerank_selected_for_llm = Column(Boolean, default=False)
+    selection_stage = Column(String(50))
+    selection_reason = Column(Text)
+    selection_reason_components = Column(JSON)
+    structured_rank_score = Column(Float)
+    structured_rank_position = Column(Integer)
     previous_recommendation_score = Column(Float)
     previous_overall_score = Column(Float)
     previous_confidence = Column(Float)
@@ -372,6 +334,339 @@ class RecommendationPerformance(Base):
 
     __table_args__ = (
         Index('idx_recommendation_performance_updated_at', 'updated_at'),
+    )
+
+
+class ShortTermTrainingSampleRecord(Base):
+    """短线训练样本"""
+    __tablename__ = 'short_term_training_samples'
+
+    id = Column(Integer, primary_key=True)
+    feature_schema_version = Column(String(20), nullable=False, default='v1')
+    trade_date = Column(Date, nullable=False)
+    ts_code = Column(String(20), nullable=False)
+    name = Column(String(50))
+    source_tag = Column(String(50))
+    in_frontlist = Column(Boolean, default=False)
+    recommend_rank = Column(Integer)
+    strategy_count = Column(Integer, default=0)
+    is_repeat_pick = Column(Boolean, default=False)
+    news_mentioned = Column(Boolean, default=False)
+    technical_signal = Column(String(200))
+
+    entry_price = Column(Float)
+    close = Column(Float)
+    pct_change = Column(Float)
+    volume_ratio = Column(Float)
+    turnover_rate = Column(Float)
+    recommendation_score = Column(Float)
+    overall_score = Column(Float)
+    technical_score = Column(Float)
+    fundamental_score = Column(Float)
+    sentiment_score = Column(Float)
+    news_score = Column(Float)
+    base_score = Column(Float)
+    sentiment_adjustment = Column(Float)
+    news_adjustment = Column(Float)
+
+    industry = Column(String(50))
+    industry_heat_score = Column(Float)
+    industry_flow_bias = Column(String(20))
+
+    distribution_risk_score = Column(Float)
+    distribution_risk_flags = Column(JSON)
+    moneyflow_3d_value = Column(Float)
+    recent_large_order_net_inflow = Column(Float)
+    recent_super_large_order_net_inflow = Column(Float)
+    turnover_spike_ratio = Column(Float)
+    recent_runup_5d = Column(Float)
+    continuation_bias_score = Column(Float)
+    continuation_positive_flags = Column(JSON)
+    continuation_negative_flags = Column(JSON)
+    top3_risk_penalty = Column(Float)
+    short_term_contradiction_penalty = Column(Float)
+    late_stage_momentum_flag = Column(Boolean, default=False)
+    candidate_risk_blocked = Column(Boolean, default=False)
+
+    previous_recommendation_score = Column(Float)
+    previous_overall_score = Column(Float)
+    score_change = Column(Float)
+
+    action_plan = Column(JSON)
+
+    return_1d = Column(Float)
+    return_3d = Column(Float)
+    return_5d = Column(Float)
+    return_10d = Column(Float)
+    max_drawdown_10d = Column(Float)
+    benchmark_return_5d = Column(Float)
+    vs_benchmark_5d = Column(Float)
+    label_up_1d = Column(Boolean)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+    __table_args__ = (
+        Index('idx_short_term_training_trade_date', 'trade_date'),
+        Index('idx_short_term_training_code_date', 'ts_code', 'trade_date', unique=True),
+        Index('idx_short_term_training_schema_date', 'feature_schema_version', 'trade_date'),
+    )
+
+
+class MarketTradeCalendar(Base):
+    """原始交易日历"""
+    __tablename__ = 'market_trade_calendar'
+
+    trade_date = Column(Date, primary_key=True)
+    exchange = Column(String(20), nullable=False, default='SSE')
+    is_open = Column(Boolean, nullable=False, default=True)
+    pretrade_date = Column(Date)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+    __table_args__ = (
+        Index('idx_market_trade_calendar_exchange_date', 'exchange', 'trade_date'),
+    )
+
+
+class MarketDaily(Base):
+    """原始日线行情"""
+    __tablename__ = 'market_daily'
+
+    id = Column(Integer, primary_key=True)
+    trade_date = Column(Date, nullable=False)
+    ts_code = Column(String(20), nullable=False)
+    open = Column(Float)
+    high = Column(Float)
+    low = Column(Float)
+    close = Column(Float)
+    pre_close = Column(Float)
+    change = Column(Float)
+    pct_chg = Column(Float)
+    vol = Column(Float)
+    amount = Column(Float)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+    __table_args__ = (
+        Index('idx_market_daily_trade_date_ts_code', 'trade_date', 'ts_code', unique=True),
+        Index('idx_market_daily_ts_code_trade_date', 'ts_code', 'trade_date'),
+        Index('idx_market_daily_trade_date', 'trade_date'),
+    )
+
+
+class MarketDailyBasic(Base):
+    """原始日线基础指标"""
+    __tablename__ = 'market_daily_basic'
+
+    id = Column(Integer, primary_key=True)
+    trade_date = Column(Date, nullable=False)
+    ts_code = Column(String(20), nullable=False)
+    turnover_rate = Column(Float)
+    turnover_rate_f = Column(Float)
+    volume_ratio = Column(Float)
+    pe = Column(Float)
+    pe_ttm = Column(Float)
+    pb = Column(Float)
+    ps = Column(Float)
+    ps_ttm = Column(Float)
+    dv_ratio = Column(Float)
+    dv_ttm = Column(Float)
+    total_share = Column(Float)
+    float_share = Column(Float)
+    free_share = Column(Float)
+    total_mv = Column(Float)
+    circ_mv = Column(Float)
+    close = Column(Float)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+    __table_args__ = (
+        Index('idx_market_daily_basic_trade_date_ts_code', 'trade_date', 'ts_code', unique=True),
+        Index('idx_market_daily_basic_ts_code_trade_date', 'ts_code', 'trade_date'),
+        Index('idx_market_daily_basic_trade_date', 'trade_date'),
+    )
+
+
+class MarketAdjFactor(Base):
+    """原始复权因子"""
+    __tablename__ = 'market_adj_factor'
+
+    id = Column(Integer, primary_key=True)
+    trade_date = Column(Date, nullable=False)
+    ts_code = Column(String(20), nullable=False)
+    adj_factor = Column(Float)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+    __table_args__ = (
+        Index('idx_market_adj_factor_trade_date_ts_code', 'trade_date', 'ts_code', unique=True),
+        Index('idx_market_adj_factor_ts_code_trade_date', 'ts_code', 'trade_date'),
+        Index('idx_market_adj_factor_trade_date', 'trade_date'),
+    )
+
+
+class MarketStockBasic(Base):
+    """股票静态基础信息"""
+    __tablename__ = 'market_stock_basic'
+
+    ts_code = Column(String(20), primary_key=True)
+    symbol = Column(String(20))
+    name = Column(String(50))
+    area = Column(String(50))
+    industry = Column(String(50))
+    market = Column(String(50))
+    list_date = Column(Date)
+    delist_date = Column(Date)
+    is_hs = Column(String(20))
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+    __table_args__ = (
+        Index('idx_market_stock_basic_name', 'name'),
+        Index('idx_market_stock_basic_industry', 'industry'),
+    )
+
+
+class MarketMoneyflowDaily(Base):
+    __tablename__ = 'market_moneyflow_daily'
+
+    id = Column(Integer, primary_key=True)
+    trade_date = Column(Date, nullable=False)
+    ts_code = Column(String(20), nullable=False)
+    buy_sm_vol = Column(Float)
+    buy_sm_amount = Column(Float)
+    sell_sm_vol = Column(Float)
+    sell_sm_amount = Column(Float)
+    buy_md_vol = Column(Float)
+    buy_md_amount = Column(Float)
+    sell_md_vol = Column(Float)
+    sell_md_amount = Column(Float)
+    buy_lg_vol = Column(Float)
+    buy_lg_amount = Column(Float)
+    sell_lg_vol = Column(Float)
+    sell_lg_amount = Column(Float)
+    buy_elg_vol = Column(Float)
+    buy_elg_amount = Column(Float)
+    sell_elg_vol = Column(Float)
+    sell_elg_amount = Column(Float)
+    net_mf_vol = Column(Float)
+    net_mf_amount = Column(Float)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+    __table_args__ = (
+        Index('idx_market_moneyflow_trade_date_ts_code', 'trade_date', 'ts_code', unique=True),
+        Index('idx_market_moneyflow_ts_code_trade_date', 'ts_code', 'trade_date'),
+    )
+
+
+class MarketTopListDaily(Base):
+    __tablename__ = 'market_top_list_daily'
+
+    id = Column(Integer, primary_key=True)
+    trade_date = Column(Date, nullable=False)
+    ts_code = Column(String(20), nullable=False)
+    reason = Column(String(255), nullable=False, default='')
+    name = Column(String(50))
+    close = Column(Float)
+    pct_change = Column(Float)
+    turnover_rate = Column(Float)
+    amount = Column(Float)
+    l_sell = Column(Float)
+    l_buy = Column(Float)
+    l_amount = Column(Float)
+    net_amount = Column(Float)
+    net_rate = Column(Float)
+    amount_rate = Column(Float)
+    float_values = Column(Float)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+    __table_args__ = (
+        Index('idx_market_top_list_trade_date_ts_code_reason', 'trade_date', 'ts_code', 'reason', unique=True),
+        Index('idx_market_top_list_trade_date', 'trade_date'),
+    )
+
+
+class MarketLimitListDaily(Base):
+    __tablename__ = 'market_limit_list_daily'
+
+    id = Column(Integer, primary_key=True)
+    trade_date = Column(Date, nullable=False)
+    ts_code = Column(String(20), nullable=False)
+    industry = Column(String(100))
+    name = Column(String(50))
+    close = Column(Float)
+    pct_chg = Column(Float)
+    amount = Column(Float)
+    limit_amount = Column(Float)
+    float_mv = Column(Float)
+    total_mv = Column(Float)
+    turnover_ratio = Column(Float)
+    fd_amount = Column(Float)
+    first_time = Column(String(20))
+    last_time = Column(String(20))
+    open_times = Column(Integer)
+    up_stat = Column(String(20))
+    limit_times = Column(Float)
+    limit = Column(String(10))
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+    __table_args__ = (
+        Index('idx_market_limit_list_trade_date_ts_code', 'trade_date', 'ts_code', unique=True),
+        Index('idx_market_limit_list_trade_date', 'trade_date'),
+    )
+
+
+class MarketIndustryMoneyflowDaily(Base):
+    __tablename__ = 'market_industry_moneyflow_daily'
+
+    id = Column(Integer, primary_key=True)
+    trade_date = Column(Date, nullable=False)
+    ts_code = Column(String(20), nullable=False)
+    industry = Column(String(100))
+    lead_stock = Column(String(50))
+    close = Column(Float)
+    pct_change = Column(Float)
+    company_num = Column(Integer)
+    pct_change_stock = Column(Float)
+    close_price = Column(Float)
+    net_buy_amount = Column(Float)
+    net_sell_amount = Column(Float)
+    net_amount = Column(Float)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+    __table_args__ = (
+        Index('idx_market_industry_moneyflow_trade_date_ts_code', 'trade_date', 'ts_code', unique=True),
+        Index('idx_market_industry_moneyflow_trade_date', 'trade_date'),
+    )
+
+
+class MarketMoneyflowMarketDaily(Base):
+    __tablename__ = 'market_moneyflow_market_daily'
+
+    trade_date = Column(Date, primary_key=True)
+    close_sh = Column(Float)
+    pct_change_sh = Column(Float)
+    close_sz = Column(Float)
+    pct_change_sz = Column(Float)
+    net_amount = Column(Float)
+    net_amount_rate = Column(Float)
+    buy_elg_amount = Column(Float)
+    buy_elg_amount_rate = Column(Float)
+    buy_lg_amount = Column(Float)
+    buy_lg_amount_rate = Column(Float)
+    buy_md_amount = Column(Float)
+    buy_md_amount_rate = Column(Float)
+    buy_sm_amount = Column(Float)
+    buy_sm_amount_rate = Column(Float)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+    __table_args__ = (
+        Index('idx_market_moneyflow_market_trade_date', 'trade_date'),
     )
 
 
@@ -435,6 +730,7 @@ class DatabaseManager:
                 'pct_change': "ALTER TABLE recommendation_pool_states ADD COLUMN pct_change FLOAT",
                 'volume_ratio': "ALTER TABLE recommendation_pool_states ADD COLUMN volume_ratio FLOAT",
                 'turnover_rate': "ALTER TABLE recommendation_pool_states ADD COLUMN turnover_rate FLOAT",
+                'ma20': "ALTER TABLE recommendation_pool_states ADD COLUMN ma20 FLOAT",
                 'strategy_count': "ALTER TABLE recommendation_pool_states ADD COLUMN strategy_count INTEGER DEFAULT 0",
                 'divergence_score': "ALTER TABLE recommendation_pool_states ADD COLUMN divergence_score FLOAT",
                 'strategy_consistency_label': "ALTER TABLE recommendation_pool_states ADD COLUMN strategy_consistency_label VARCHAR(50)",
@@ -445,6 +741,8 @@ class DatabaseManager:
                 'distribution_risk_score': "ALTER TABLE recommendation_pool_states ADD COLUMN distribution_risk_score FLOAT",
                 'distribution_risk_flags': "ALTER TABLE recommendation_pool_states ADD COLUMN distribution_risk_flags JSON",
                 'moneyflow_3d_value': "ALTER TABLE recommendation_pool_states ADD COLUMN moneyflow_3d_value FLOAT",
+                'recent_large_order_net_inflow': "ALTER TABLE recommendation_pool_states ADD COLUMN recent_large_order_net_inflow FLOAT",
+                'recent_super_large_order_net_inflow': "ALTER TABLE recommendation_pool_states ADD COLUMN recent_super_large_order_net_inflow FLOAT",
                 'turnover_spike_ratio': "ALTER TABLE recommendation_pool_states ADD COLUMN turnover_spike_ratio FLOAT",
                 'recent_runup_5d': "ALTER TABLE recommendation_pool_states ADD COLUMN recent_runup_5d FLOAT",
                 'continuation_bias_score': "ALTER TABLE recommendation_pool_states ADD COLUMN continuation_bias_score FLOAT",
@@ -457,13 +755,30 @@ class DatabaseManager:
                 'top3_reason': "ALTER TABLE recommendation_pool_states ADD COLUMN top3_reason TEXT",
                 'late_stage_momentum_flag': "ALTER TABLE recommendation_pool_states ADD COLUMN late_stage_momentum_flag BOOLEAN DEFAULT 0",
                 'candidate_risk_blocked': "ALTER TABLE recommendation_pool_states ADD COLUMN candidate_risk_blocked BOOLEAN DEFAULT 0",
+                'top3_extreme_risk_blocked': "ALTER TABLE recommendation_pool_states ADD COLUMN top3_extreme_risk_blocked BOOLEAN DEFAULT 0",
+                'top3_extreme_risk_reason': "ALTER TABLE recommendation_pool_states ADD COLUMN top3_extreme_risk_reason TEXT",
                 'ai_confidence': "ALTER TABLE recommendation_pool_states ADD COLUMN ai_confidence FLOAT",
                 'display_confidence': "ALTER TABLE recommendation_pool_states ADD COLUMN display_confidence FLOAT",
                 'technical_signal': "ALTER TABLE recommendation_pool_states ADD COLUMN technical_signal VARCHAR(200)",
                 'summary': "ALTER TABLE recommendation_pool_states ADD COLUMN summary TEXT",
                 'recommendation_text': "ALTER TABLE recommendation_pool_states ADD COLUMN recommendation_text TEXT",
                 'entry_price': "ALTER TABLE recommendation_pool_states ADD COLUMN entry_price FLOAT",
+                'fundamental_bonus': "ALTER TABLE recommendation_pool_states ADD COLUMN fundamental_bonus FLOAT",
+                'fundamental_bonus_breakdown': "ALTER TABLE recommendation_pool_states ADD COLUMN fundamental_bonus_breakdown JSON",
                 'recommend_rank': "ALTER TABLE recommendation_pool_states ADD COLUMN recommend_rank INTEGER",
+                'frontlist_rank': "ALTER TABLE recommendation_pool_states ADD COLUMN frontlist_rank INTEGER",
+                'rerank_pool_rank': "ALTER TABLE recommendation_pool_states ADD COLUMN rerank_pool_rank INTEGER",
+                'rerank_model_score': "ALTER TABLE recommendation_pool_states ADD COLUMN rerank_model_score FLOAT",
+                'rerank_rule_score': "ALTER TABLE recommendation_pool_states ADD COLUMN rerank_rule_score FLOAT",
+                'rerank_blend_score': "ALTER TABLE recommendation_pool_states ADD COLUMN rerank_blend_score FLOAT",
+                'rerank_rule_weight': "ALTER TABLE recommendation_pool_states ADD COLUMN rerank_rule_weight FLOAT",
+                'rerank_model_target': "ALTER TABLE recommendation_pool_states ADD COLUMN rerank_model_target VARCHAR(50)",
+                'rerank_selected_for_llm': "ALTER TABLE recommendation_pool_states ADD COLUMN rerank_selected_for_llm BOOLEAN DEFAULT 0",
+                'selection_stage': "ALTER TABLE recommendation_pool_states ADD COLUMN selection_stage VARCHAR(50)",
+                'selection_reason': "ALTER TABLE recommendation_pool_states ADD COLUMN selection_reason TEXT",
+                'selection_reason_components': "ALTER TABLE recommendation_pool_states ADD COLUMN selection_reason_components JSON",
+                'structured_rank_score': "ALTER TABLE recommendation_pool_states ADD COLUMN structured_rank_score FLOAT",
+                'structured_rank_position': "ALTER TABLE recommendation_pool_states ADD COLUMN structured_rank_position INTEGER",
                 'previous_recommendation_score': "ALTER TABLE recommendation_pool_states ADD COLUMN previous_recommendation_score FLOAT",
                 'previous_overall_score': "ALTER TABLE recommendation_pool_states ADD COLUMN previous_overall_score FLOAT",
                 'previous_confidence': "ALTER TABLE recommendation_pool_states ADD COLUMN previous_confidence FLOAT",
@@ -481,6 +796,22 @@ class DatabaseManager:
             'recommendation_items': {
                 'source_tag': "ALTER TABLE recommendation_items ADD COLUMN source_tag VARCHAR(50) DEFAULT '今日Top3'",
                 'is_repeat_pick': "ALTER TABLE recommendation_items ADD COLUMN is_repeat_pick BOOLEAN DEFAULT 0",
+                'score_mode': "ALTER TABLE recommendation_items ADD COLUMN score_mode VARCHAR(50)",
+                'rerank_pool_rank': "ALTER TABLE recommendation_items ADD COLUMN rerank_pool_rank INTEGER",
+                'rerank_blend_score': "ALTER TABLE recommendation_items ADD COLUMN rerank_blend_score FLOAT",
+                'rerank_model_score': "ALTER TABLE recommendation_items ADD COLUMN rerank_model_score FLOAT",
+                'rerank_rule_score': "ALTER TABLE recommendation_items ADD COLUMN rerank_rule_score FLOAT",
+                'rerank_rule_weight': "ALTER TABLE recommendation_items ADD COLUMN rerank_rule_weight FLOAT",
+                'rerank_model_target': "ALTER TABLE recommendation_items ADD COLUMN rerank_model_target VARCHAR(50)",
+                'selection_stage': "ALTER TABLE recommendation_items ADD COLUMN selection_stage VARCHAR(50)",
+                'selection_reason': "ALTER TABLE recommendation_items ADD COLUMN selection_reason TEXT",
+                'selection_reason_components': "ALTER TABLE recommendation_items ADD COLUMN selection_reason_components JSON",
+                'structured_rank_score': "ALTER TABLE recommendation_items ADD COLUMN structured_rank_score FLOAT",
+                'structured_rank_position': "ALTER TABLE recommendation_items ADD COLUMN structured_rank_position INTEGER",
+            },
+            'short_term_training_samples': {
+                'recent_large_order_net_inflow': "ALTER TABLE short_term_training_samples ADD COLUMN recent_large_order_net_inflow FLOAT",
+                'recent_super_large_order_net_inflow': "ALTER TABLE short_term_training_samples ADD COLUMN recent_super_large_order_net_inflow FLOAT",
             },
         }
 
@@ -497,6 +828,427 @@ class DatabaseManager:
                         continue
                     connection.execute(text(ddl))
                     existing_columns.add(column_name)
+
+    def upsert_market_trade_calendar(
+        self,
+        rows: Iterable[Dict[str, Any]],
+        *,
+        exchange: str = 'SSE',
+        force_refresh: bool = False,
+    ) -> int:
+        payload = [self._build_market_trade_calendar_payload(row, exchange=exchange) for row in rows]
+        payload = [row for row in payload if row is not None]
+        return self._execute_market_upsert(
+            MarketTradeCalendar,
+            payload,
+            conflict_columns=['trade_date'],
+            update_columns=['exchange', 'is_open', 'pretrade_date', 'updated_at'],
+            force_refresh=force_refresh,
+        )
+
+    def upsert_market_daily(self, rows: Iterable[Dict[str, Any]], *, force_refresh: bool = False) -> int:
+        payload = [self._build_market_daily_payload(row) for row in rows]
+        payload = [row for row in payload if row is not None]
+        return self._execute_market_upsert(
+            MarketDaily,
+            payload,
+            conflict_columns=['trade_date', 'ts_code'],
+            update_columns=['open', 'high', 'low', 'close', 'pre_close', 'change', 'pct_chg', 'vol', 'amount', 'updated_at'],
+            force_refresh=force_refresh,
+        )
+
+    def upsert_market_daily_basic(self, rows: Iterable[Dict[str, Any]], *, force_refresh: bool = False) -> int:
+        payload = [self._build_market_daily_basic_payload(row) for row in rows]
+        payload = [row for row in payload if row is not None]
+        return self._execute_market_upsert(
+            MarketDailyBasic,
+            payload,
+            conflict_columns=['trade_date', 'ts_code'],
+            update_columns=[
+                'turnover_rate', 'turnover_rate_f', 'volume_ratio', 'pe', 'pe_ttm', 'pb', 'ps', 'ps_ttm',
+                'dv_ratio', 'dv_ttm', 'total_share', 'float_share', 'free_share', 'total_mv', 'circ_mv', 'close', 'updated_at'
+            ],
+            force_refresh=force_refresh,
+        )
+
+    def upsert_market_adj_factor(self, rows: Iterable[Dict[str, Any]], *, force_refresh: bool = False) -> int:
+        payload = [self._build_market_adj_factor_payload(row) for row in rows]
+        payload = [row for row in payload if row is not None]
+        return self._execute_market_upsert(
+            MarketAdjFactor,
+            payload,
+            conflict_columns=['trade_date', 'ts_code'],
+            update_columns=['adj_factor', 'updated_at'],
+            force_refresh=force_refresh,
+        )
+
+    def upsert_market_moneyflow_daily(self, rows: Iterable[Dict[str, Any]], *, force_refresh: bool = False) -> int:
+        payload = [self._build_market_moneyflow_daily_payload(row) for row in rows]
+        payload = [row for row in payload if row is not None]
+        return self._execute_market_upsert(
+            MarketMoneyflowDaily,
+            payload,
+            conflict_columns=['trade_date', 'ts_code'],
+            update_columns=[
+                'buy_sm_vol', 'buy_sm_amount', 'sell_sm_vol', 'sell_sm_amount', 'buy_md_vol', 'buy_md_amount',
+                'sell_md_vol', 'sell_md_amount', 'buy_lg_vol', 'buy_lg_amount', 'sell_lg_vol', 'sell_lg_amount',
+                'buy_elg_vol', 'buy_elg_amount', 'sell_elg_vol', 'sell_elg_amount', 'net_mf_vol', 'net_mf_amount', 'updated_at'
+            ],
+            force_refresh=force_refresh,
+        )
+
+    def upsert_market_top_list_daily(self, rows: Iterable[Dict[str, Any]], *, force_refresh: bool = False) -> int:
+        payload = [self._build_market_top_list_daily_payload(row) for row in rows]
+        payload = [row for row in payload if row is not None]
+        return self._execute_market_upsert(
+            MarketTopListDaily,
+            payload,
+            conflict_columns=['trade_date', 'ts_code', 'reason'],
+            update_columns=['name', 'close', 'pct_change', 'turnover_rate', 'amount', 'l_sell', 'l_buy', 'l_amount', 'net_amount', 'net_rate', 'amount_rate', 'float_values', 'updated_at'],
+            force_refresh=force_refresh,
+        )
+
+    def upsert_market_limit_list_daily(self, rows: Iterable[Dict[str, Any]], *, force_refresh: bool = False) -> int:
+        payload = [self._build_market_limit_list_daily_payload(row) for row in rows]
+        payload = [row for row in payload if row is not None]
+        return self._execute_market_upsert(
+            MarketLimitListDaily,
+            payload,
+            conflict_columns=['trade_date', 'ts_code'],
+            update_columns=['industry', 'name', 'close', 'pct_chg', 'amount', 'limit_amount', 'float_mv', 'total_mv', 'turnover_ratio', 'fd_amount', 'first_time', 'last_time', 'open_times', 'up_stat', 'limit_times', 'limit', 'updated_at'],
+            force_refresh=force_refresh,
+        )
+
+    def upsert_market_industry_moneyflow_daily(self, rows: Iterable[Dict[str, Any]], *, force_refresh: bool = False) -> int:
+        payload = [self._build_market_industry_moneyflow_daily_payload(row) for row in rows]
+        payload = [row for row in payload if row is not None]
+        return self._execute_market_upsert(
+            MarketIndustryMoneyflowDaily,
+            payload,
+            conflict_columns=['trade_date', 'ts_code'],
+            update_columns=['industry', 'lead_stock', 'close', 'pct_change', 'company_num', 'pct_change_stock', 'close_price', 'net_buy_amount', 'net_sell_amount', 'net_amount', 'updated_at'],
+            force_refresh=force_refresh,
+        )
+
+    def upsert_market_moneyflow_market_daily(self, rows: Iterable[Dict[str, Any]], *, force_refresh: bool = False) -> int:
+        payload = [self._build_market_moneyflow_market_daily_payload(row) for row in rows]
+        payload = [row for row in payload if row is not None]
+        return self._execute_market_upsert(
+            MarketMoneyflowMarketDaily,
+            payload,
+            conflict_columns=['trade_date'],
+            update_columns=['close_sh', 'pct_change_sh', 'close_sz', 'pct_change_sz', 'net_amount', 'net_amount_rate', 'buy_elg_amount', 'buy_elg_amount_rate', 'buy_lg_amount', 'buy_lg_amount_rate', 'buy_md_amount', 'buy_md_amount_rate', 'buy_sm_amount', 'buy_sm_amount_rate', 'updated_at'],
+            force_refresh=force_refresh,
+        )
+
+    def has_market_trade_calendar(self, *, start_date: date, end_date: date, exchange: str = 'SSE') -> bool:
+        session = self.get_session()
+        try:
+            row_count = session.query(func.count(MarketTradeCalendar.trade_date)).filter(
+                MarketTradeCalendar.exchange == exchange,
+                MarketTradeCalendar.trade_date >= start_date,
+                MarketTradeCalendar.trade_date <= end_date,
+                MarketTradeCalendar.is_open.is_(True),
+            ).scalar() or 0
+            return row_count > 0
+        finally:
+            session.close()
+
+    def has_market_data_for_trade_date(self, *, model, trade_date: date) -> bool:
+        session = self.get_session()
+        try:
+            record = session.execute(select(model).where(model.trade_date == trade_date).limit(1)).scalar_one_or_none()
+            return record is not None
+        finally:
+            session.close()
+
+    def _execute_market_upsert(
+        self,
+        model,
+        payload: List[Dict[str, Any]],
+        *,
+        conflict_columns: List[str],
+        update_columns: List[str],
+        force_refresh: bool,
+    ) -> int:
+        if not payload:
+            return 0
+
+        insert_stmt = sqlite_insert(model).values(payload)
+        if force_refresh:
+            update_mapping = {column: getattr(insert_stmt.excluded, column) for column in update_columns}
+            statement = insert_stmt.on_conflict_do_update(index_elements=conflict_columns, set_=update_mapping)
+        else:
+            statement = insert_stmt.on_conflict_do_nothing(index_elements=conflict_columns)
+
+        with self.engine.begin() as connection:
+            result = connection.execute(statement)
+        return int(result.rowcount or 0)
+
+    @staticmethod
+    def _build_market_trade_calendar_payload(row: Dict[str, Any], *, exchange: str) -> Optional[Dict[str, Any]]:
+        trade_date_value = DatabaseManager._parse_date_value(row.get('cal_date') or row.get('trade_date'))
+        if trade_date_value is None:
+            return None
+        is_open_raw = row.get('is_open')
+        is_open = bool(int(is_open_raw)) if isinstance(is_open_raw, str) and is_open_raw.isdigit() else bool(is_open_raw)
+        now = datetime.now()
+        return {
+            'trade_date': trade_date_value,
+            'exchange': str(row.get('exchange') or exchange or 'SSE'),
+            'is_open': is_open,
+            'pretrade_date': DatabaseManager._parse_date_value(row.get('pretrade_date')),
+            'created_at': now,
+            'updated_at': now,
+        }
+
+    @staticmethod
+    def _build_market_daily_payload(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        trade_date_value = DatabaseManager._parse_date_value(row.get('trade_date'))
+        ts_code = str(row.get('ts_code') or '').strip()
+        if trade_date_value is None or not ts_code:
+            return None
+        now = datetime.now()
+        return {
+            'trade_date': trade_date_value,
+            'ts_code': ts_code,
+            'open': DatabaseManager._safe_float_value(row.get('open')),
+            'high': DatabaseManager._safe_float_value(row.get('high')),
+            'low': DatabaseManager._safe_float_value(row.get('low')),
+            'close': DatabaseManager._safe_float_value(row.get('close')),
+            'pre_close': DatabaseManager._safe_float_value(row.get('pre_close')),
+            'change': DatabaseManager._safe_float_value(row.get('change')),
+            'pct_chg': DatabaseManager._safe_float_value(row.get('pct_chg')),
+            'vol': DatabaseManager._safe_float_value(row.get('vol')),
+            'amount': DatabaseManager._safe_float_value(row.get('amount')),
+            'created_at': now,
+            'updated_at': now,
+        }
+
+    @staticmethod
+    def _build_market_daily_basic_payload(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        trade_date_value = DatabaseManager._parse_date_value(row.get('trade_date'))
+        ts_code = str(row.get('ts_code') or '').strip()
+        if trade_date_value is None or not ts_code:
+            return None
+        now = datetime.now()
+        return {
+            'trade_date': trade_date_value,
+            'ts_code': ts_code,
+            'turnover_rate': DatabaseManager._safe_float_value(row.get('turnover_rate')),
+            'turnover_rate_f': DatabaseManager._safe_float_value(row.get('turnover_rate_f')),
+            'volume_ratio': DatabaseManager._safe_float_value(row.get('volume_ratio')),
+            'pe': DatabaseManager._safe_float_value(row.get('pe')),
+            'pe_ttm': DatabaseManager._safe_float_value(row.get('pe_ttm')),
+            'pb': DatabaseManager._safe_float_value(row.get('pb')),
+            'ps': DatabaseManager._safe_float_value(row.get('ps')),
+            'ps_ttm': DatabaseManager._safe_float_value(row.get('ps_ttm')),
+            'dv_ratio': DatabaseManager._safe_float_value(row.get('dv_ratio')),
+            'dv_ttm': DatabaseManager._safe_float_value(row.get('dv_ttm')),
+            'total_share': DatabaseManager._safe_float_value(row.get('total_share')),
+            'float_share': DatabaseManager._safe_float_value(row.get('float_share')),
+            'free_share': DatabaseManager._safe_float_value(row.get('free_share')),
+            'total_mv': DatabaseManager._safe_float_value(row.get('total_mv')),
+            'circ_mv': DatabaseManager._safe_float_value(row.get('circ_mv')),
+            'close': DatabaseManager._safe_float_value(row.get('close')),
+            'created_at': now,
+            'updated_at': now,
+        }
+
+    @staticmethod
+    def _build_market_adj_factor_payload(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        trade_date_value = DatabaseManager._parse_date_value(row.get('trade_date'))
+        ts_code = str(row.get('ts_code') or '').strip()
+        if trade_date_value is None or not ts_code:
+            return None
+        now = datetime.now()
+        return {
+            'trade_date': trade_date_value,
+            'ts_code': ts_code,
+            'adj_factor': DatabaseManager._safe_float_value(row.get('adj_factor')),
+            'created_at': now,
+            'updated_at': now,
+        }
+
+    @staticmethod
+    def _build_market_moneyflow_daily_payload(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        trade_date_value = DatabaseManager._parse_date_value(row.get('trade_date'))
+        ts_code = str(row.get('ts_code') or '').strip()
+        if trade_date_value is None or not ts_code:
+            return None
+        now = datetime.now()
+        return {
+            'trade_date': trade_date_value,
+            'ts_code': ts_code,
+            'buy_sm_vol': DatabaseManager._safe_float_value(row.get('buy_sm_vol')),
+            'buy_sm_amount': DatabaseManager._safe_float_value(row.get('buy_sm_amount')),
+            'sell_sm_vol': DatabaseManager._safe_float_value(row.get('sell_sm_vol')),
+            'sell_sm_amount': DatabaseManager._safe_float_value(row.get('sell_sm_amount')),
+            'buy_md_vol': DatabaseManager._safe_float_value(row.get('buy_md_vol')),
+            'buy_md_amount': DatabaseManager._safe_float_value(row.get('buy_md_amount')),
+            'sell_md_vol': DatabaseManager._safe_float_value(row.get('sell_md_vol')),
+            'sell_md_amount': DatabaseManager._safe_float_value(row.get('sell_md_amount')),
+            'buy_lg_vol': DatabaseManager._safe_float_value(row.get('buy_lg_vol')),
+            'buy_lg_amount': DatabaseManager._safe_float_value(row.get('buy_lg_amount')),
+            'sell_lg_vol': DatabaseManager._safe_float_value(row.get('sell_lg_vol')),
+            'sell_lg_amount': DatabaseManager._safe_float_value(row.get('sell_lg_amount')),
+            'buy_elg_vol': DatabaseManager._safe_float_value(row.get('buy_elg_vol')),
+            'buy_elg_amount': DatabaseManager._safe_float_value(row.get('buy_elg_amount')),
+            'sell_elg_vol': DatabaseManager._safe_float_value(row.get('sell_elg_vol')),
+            'sell_elg_amount': DatabaseManager._safe_float_value(row.get('sell_elg_amount')),
+            'net_mf_vol': DatabaseManager._safe_float_value(row.get('net_mf_vol')),
+            'net_mf_amount': DatabaseManager._safe_float_value(row.get('net_mf_amount')),
+            'created_at': now,
+            'updated_at': now,
+        }
+
+    @staticmethod
+    def _build_market_top_list_daily_payload(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        trade_date_value = DatabaseManager._parse_date_value(row.get('trade_date'))
+        ts_code = str(row.get('ts_code') or '').strip()
+        reason = str(row.get('reason') or '').strip()
+        if trade_date_value is None or not ts_code:
+            return None
+        now = datetime.now()
+        return {
+            'trade_date': trade_date_value,
+            'ts_code': ts_code,
+            'reason': reason,
+            'name': str(row.get('name') or '').strip() or None,
+            'close': DatabaseManager._safe_float_value(row.get('close')),
+            'pct_change': DatabaseManager._safe_float_value(row.get('pct_change')),
+            'turnover_rate': DatabaseManager._safe_float_value(row.get('turnover_rate')),
+            'amount': DatabaseManager._safe_float_value(row.get('amount')),
+            'l_sell': DatabaseManager._safe_float_value(row.get('l_sell')),
+            'l_buy': DatabaseManager._safe_float_value(row.get('l_buy')),
+            'l_amount': DatabaseManager._safe_float_value(row.get('l_amount')),
+            'net_amount': DatabaseManager._safe_float_value(row.get('net_amount')),
+            'net_rate': DatabaseManager._safe_float_value(row.get('net_rate')),
+            'amount_rate': DatabaseManager._safe_float_value(row.get('amount_rate')),
+            'float_values': DatabaseManager._safe_float_value(row.get('float_values')),
+            'created_at': now,
+            'updated_at': now,
+        }
+
+    @staticmethod
+    def _build_market_limit_list_daily_payload(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        trade_date_value = DatabaseManager._parse_date_value(row.get('trade_date'))
+        ts_code = str(row.get('ts_code') or '').strip()
+        if trade_date_value is None or not ts_code:
+            return None
+        now = datetime.now()
+        open_times_value = row.get('open_times')
+        try:
+            open_times = int(float(open_times_value)) if open_times_value not in (None, '') else None
+        except (TypeError, ValueError):
+            open_times = None
+        return {
+            'trade_date': trade_date_value,
+            'ts_code': ts_code,
+            'industry': str(row.get('industry') or '').strip() or None,
+            'name': str(row.get('name') or '').strip() or None,
+            'close': DatabaseManager._safe_float_value(row.get('close')),
+            'pct_chg': DatabaseManager._safe_float_value(row.get('pct_chg')),
+            'amount': DatabaseManager._safe_float_value(row.get('amount')),
+            'limit_amount': DatabaseManager._safe_float_value(row.get('limit_amount')),
+            'float_mv': DatabaseManager._safe_float_value(row.get('float_mv')),
+            'total_mv': DatabaseManager._safe_float_value(row.get('total_mv')),
+            'turnover_ratio': DatabaseManager._safe_float_value(row.get('turnover_ratio')),
+            'fd_amount': DatabaseManager._safe_float_value(row.get('fd_amount')),
+            'first_time': str(row.get('first_time') or '').strip() or None,
+            'last_time': str(row.get('last_time') or '').strip() or None,
+            'open_times': open_times,
+            'up_stat': str(row.get('up_stat') or '').strip() or None,
+            'limit_times': DatabaseManager._safe_float_value(row.get('limit_times')),
+            'limit': str(row.get('limit') or '').strip() or None,
+            'created_at': now,
+            'updated_at': now,
+        }
+
+    @staticmethod
+    def _build_market_industry_moneyflow_daily_payload(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        trade_date_value = DatabaseManager._parse_date_value(row.get('trade_date'))
+        ts_code = str(row.get('ts_code') or '').strip()
+        if trade_date_value is None or not ts_code:
+            return None
+        now = datetime.now()
+        company_num_value = row.get('company_num')
+        try:
+            company_num = int(float(company_num_value)) if company_num_value not in (None, '') else None
+        except (TypeError, ValueError):
+            company_num = None
+        return {
+            'trade_date': trade_date_value,
+            'ts_code': ts_code,
+            'industry': str(row.get('industry') or '').strip() or None,
+            'lead_stock': str(row.get('lead_stock') or '').strip() or None,
+            'close': DatabaseManager._safe_float_value(row.get('close')),
+            'pct_change': DatabaseManager._safe_float_value(row.get('pct_change')),
+            'company_num': company_num,
+            'pct_change_stock': DatabaseManager._safe_float_value(row.get('pct_change_stock')),
+            'close_price': DatabaseManager._safe_float_value(row.get('close_price')),
+            'net_buy_amount': DatabaseManager._safe_float_value(row.get('net_buy_amount')),
+            'net_sell_amount': DatabaseManager._safe_float_value(row.get('net_sell_amount')),
+            'net_amount': DatabaseManager._safe_float_value(row.get('net_amount')),
+            'created_at': now,
+            'updated_at': now,
+        }
+
+    @staticmethod
+    def _build_market_moneyflow_market_daily_payload(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        trade_date_value = DatabaseManager._parse_date_value(row.get('trade_date'))
+        if trade_date_value is None:
+            return None
+        now = datetime.now()
+        return {
+            'trade_date': trade_date_value,
+            'close_sh': DatabaseManager._safe_float_value(row.get('close_sh')),
+            'pct_change_sh': DatabaseManager._safe_float_value(row.get('pct_change_sh')),
+            'close_sz': DatabaseManager._safe_float_value(row.get('close_sz')),
+            'pct_change_sz': DatabaseManager._safe_float_value(row.get('pct_change_sz')),
+            'net_amount': DatabaseManager._safe_float_value(row.get('net_amount')),
+            'net_amount_rate': DatabaseManager._safe_float_value(row.get('net_amount_rate')),
+            'buy_elg_amount': DatabaseManager._safe_float_value(row.get('buy_elg_amount')),
+            'buy_elg_amount_rate': DatabaseManager._safe_float_value(row.get('buy_elg_amount_rate')),
+            'buy_lg_amount': DatabaseManager._safe_float_value(row.get('buy_lg_amount')),
+            'buy_lg_amount_rate': DatabaseManager._safe_float_value(row.get('buy_lg_amount_rate')),
+            'buy_md_amount': DatabaseManager._safe_float_value(row.get('buy_md_amount')),
+            'buy_md_amount_rate': DatabaseManager._safe_float_value(row.get('buy_md_amount_rate')),
+            'buy_sm_amount': DatabaseManager._safe_float_value(row.get('buy_sm_amount')),
+            'buy_sm_amount_rate': DatabaseManager._safe_float_value(row.get('buy_sm_amount_rate')),
+            'created_at': now,
+            'updated_at': now,
+        }
+
+    @staticmethod
+    def _parse_date_value(value: Any) -> Optional[date]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        text_value = str(value).strip()
+        if not text_value:
+            return None
+        for fmt in ('%Y%m%d', '%Y-%m-%d'):
+            try:
+                return datetime.strptime(text_value, fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    @staticmethod
+    def _safe_float_value(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if numeric != numeric:
+            return None
+        return numeric
 
     def save_screening_result(
         self,
@@ -763,6 +1515,7 @@ class DatabaseManager:
             created_items = []
             for item in items or []:
                 tracking_status = item.get('tracking_status')
+                raw_status = item.get('status')
                 recommendation_item = RecommendationItem(
                     run_id=recommendation_run.id,
                     ts_code=item.get('ts_code'),
@@ -776,10 +1529,22 @@ class DatabaseManager:
                     news_mentioned=bool(item.get('news_mentioned', False)),
                     technical_signal=item.get('technical_signal'),
                     recommendation_text=item.get('recommendation_text'),
-                    status=item.get('status') or ('tracking' if tracking_status == 'active' else 'new'),
+                    status=self._normalize_recommendation_status(raw_status, tracking_status),
                     tracking_days=item.get('tracking_days', 0),
                     trade_date=item.get('trade_date', trade_date),
                     entry_price=item.get('entry_price'),
+                    score_mode=item.get('score_mode'),
+                    rerank_pool_rank=item.get('rerank_pool_rank'),
+                    rerank_blend_score=item.get('rerank_blend_score'),
+                    rerank_model_score=item.get('rerank_model_score'),
+                    rerank_rule_score=item.get('rerank_rule_score'),
+                    rerank_rule_weight=item.get('rerank_rule_weight'),
+                    rerank_model_target=item.get('rerank_model_target'),
+                    selection_stage=item.get('selection_stage'),
+                    selection_reason=item.get('selection_reason'),
+                    selection_reason_components=item.get('selection_reason_components') or {},
+                    structured_rank_score=item.get('structured_rank_score'),
+                    structured_rank_position=item.get('structured_rank_position'),
                     created_at=item.get('created_at') or recommendation_run.generated_at,
                 )
                 session.add(recommendation_item)
@@ -850,6 +1615,7 @@ class DatabaseManager:
                 record.pct_change = state.pct_change
                 record.volume_ratio = state.volume_ratio
                 record.turnover_rate = state.turnover_rate
+                record.ma20 = getattr(state, 'ma20', None)
                 record.strategy_count = state.strategy_count
                 record.divergence_score = getattr(state, 'divergence_score', None)
                 record.strategy_consistency_label = getattr(state, 'strategy_consistency_label', None)
@@ -860,6 +1626,8 @@ class DatabaseManager:
                 record.distribution_risk_score = state.distribution_risk_score
                 record.distribution_risk_flags = list(state.distribution_risk_flags or [])
                 record.moneyflow_3d_value = state.moneyflow_3d_value
+                record.recent_large_order_net_inflow = getattr(state, 'recent_large_order_net_inflow', None)
+                record.recent_super_large_order_net_inflow = getattr(state, 'recent_super_large_order_net_inflow', None)
                 record.turnover_spike_ratio = state.turnover_spike_ratio
                 record.recent_runup_5d = state.recent_runup_5d
                 record.continuation_bias_score = state.continuation_bias_score
@@ -872,13 +1640,30 @@ class DatabaseManager:
                 record.top3_reason = getattr(state, 'top3_reason', None)
                 record.late_stage_momentum_flag = bool(state.late_stage_momentum_flag)
                 record.candidate_risk_blocked = bool(state.candidate_risk_blocked)
+                record.top3_extreme_risk_blocked = bool(getattr(state, 'top3_extreme_risk_blocked', False))
+                record.top3_extreme_risk_reason = getattr(state, 'top3_extreme_risk_reason', None)
                 record.ai_confidence = state.ai_confidence
                 record.display_confidence = state.display_confidence
                 record.technical_signal = state.technical_signal
                 record.summary = state.summary
                 record.recommendation_text = state.recommendation_text
                 record.entry_price = state.entry_price
+                record.fundamental_bonus = getattr(state, 'fundamental_bonus', None)
+                record.fundamental_bonus_breakdown = dict(getattr(state, 'fundamental_bonus_breakdown', {}) or {})
                 record.recommend_rank = state.recommend_rank
+                record.frontlist_rank = getattr(state, 'frontlist_rank', None)
+                record.rerank_pool_rank = getattr(state, 'rerank_pool_rank', None)
+                record.rerank_model_score = getattr(state, 'rerank_model_score', None)
+                record.rerank_rule_score = getattr(state, 'rerank_rule_score', None)
+                record.rerank_blend_score = getattr(state, 'rerank_blend_score', None)
+                record.rerank_rule_weight = getattr(state, 'rerank_rule_weight', None)
+                record.rerank_model_target = getattr(state, 'rerank_model_target', None)
+                record.rerank_selected_for_llm = bool(getattr(state, 'rerank_selected_for_llm', False))
+                record.selection_stage = getattr(state, 'selection_stage', None)
+                record.selection_reason = getattr(state, 'selection_reason', None)
+                record.selection_reason_components = dict(getattr(state, 'selection_reason_components', {}) or {})
+                record.structured_rank_score = getattr(state, 'structured_rank_score', None)
+                record.structured_rank_position = getattr(state, 'structured_rank_position', None)
                 record.previous_recommendation_score = state.previous_recommendation_score
                 record.previous_overall_score = state.previous_overall_score
                 record.previous_confidence = state.previous_confidence
@@ -915,6 +1700,7 @@ class DatabaseManager:
                 RecommendationPoolState.trade_date == target_date
             ).order_by(
                 RecommendationPoolState.recommend_rank.asc().nullslast(),
+                RecommendationPoolState.rerank_pool_rank.asc().nullslast(),
                 RecommendationPoolState.recommendation_score.desc(),
                 RecommendationPoolState.overall_score.desc().nullslast(),
                 RecommendationPoolState.priority_score.desc(),
@@ -954,6 +1740,7 @@ class DatabaseManager:
                 query = query.filter(RecommendationPoolState.in_frontlist == front_only)
             query = query.order_by(
                 RecommendationPoolState.recommend_rank.asc().nullslast(),
+                RecommendationPoolState.rerank_pool_rank.asc().nullslast(),
                 RecommendationPoolState.recommendation_score.desc(),
                 RecommendationPoolState.overall_score.desc().nullslast(),
                 RecommendationPoolState.priority_score.desc(),
@@ -969,7 +1756,7 @@ class DatabaseManager:
         session = self.get_session()
         try:
             query = session.query(RecommendationItem).outerjoin(RecommendationPerformance).filter(
-                RecommendationItem.status.in_(['new', 'tracking'])
+                RecommendationItem.status.in_(['new', 'tracking', 'active'])
             ).order_by(RecommendationItem.trade_date.desc(), RecommendationItem.recommend_rank.asc())
             return [self._serialize_recommendation_item(item) for item in query.limit(limit).all()]
         finally:
@@ -1006,13 +1793,26 @@ class DatabaseManager:
         finally:
             session.close()
 
+    def list_recommendation_run_items(self, trade_date: Optional[date] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        session = self.get_session()
+        try:
+            query = session.query(RecommendationItem).outerjoin(RecommendationPerformance)
+            if trade_date is not None:
+                query = query.filter(RecommendationItem.trade_date == trade_date)
+            query = query.order_by(RecommendationItem.trade_date.asc(), RecommendationItem.recommend_rank.asc().nullslast(), RecommendationItem.id.asc())
+            if limit is not None:
+                query = query.limit(limit)
+            return [self._serialize_recommendation_item(item) for item in query.all()]
+        finally:
+            session.close()
+
     def list_pending_performance_updates(self, lookback_days: int = 15, limit: int = 100) -> List[Dict[str, Any]]:
         session = self.get_session()
         try:
             cutoff_date = datetime.now().date() - timedelta(days=lookback_days)
             query = session.query(RecommendationItem).outerjoin(RecommendationPerformance).filter(
                 RecommendationItem.trade_date >= cutoff_date,
-                RecommendationItem.status.in_(['new', 'tracking', 'validated'])
+                RecommendationItem.status.in_(['new', 'tracking', 'validated', 'active'])
             ).order_by(RecommendationItem.trade_date.desc(), RecommendationItem.id.asc())
             return [self._serialize_recommendation_item(item) for item in query.limit(limit).all()]
         finally:
@@ -1120,6 +1920,80 @@ class DatabaseManager:
         finally:
             session.close()
 
+    def upsert_short_term_training_samples(self, samples: List[ShortTermTrainingSample]) -> List[Dict[str, Any]]:
+        session = self.get_session()
+        try:
+            persisted: List[Dict[str, Any]] = []
+            for sample in samples:
+                record = session.query(ShortTermTrainingSampleRecord).filter_by(
+                    trade_date=sample.trade_date,
+                    ts_code=sample.ts_code,
+                ).first()
+                if record is None:
+                    record = ShortTermTrainingSampleRecord(
+                        trade_date=sample.trade_date,
+                        ts_code=sample.ts_code,
+                        created_at=datetime.now(),
+                    )
+                    session.add(record)
+
+                payload = sample.model_dump()
+                for key, value in payload.items():
+                    if key in {"trade_date", "ts_code"}:
+                        continue
+                    if key in {"distribution_risk_flags", "continuation_positive_flags", "continuation_negative_flags"}:
+                        setattr(record, key, list(value or []))
+                    elif key == "action_plan":
+                        setattr(record, key, dict(value or {}))
+                    else:
+                        setattr(record, key, value)
+                record.updated_at = datetime.now()
+                persisted.append(self._serialize_short_term_training_sample(record))
+
+            session.commit()
+            return persisted
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def list_short_term_training_samples(
+        self,
+        *,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        session = self.get_session()
+        try:
+            query = session.query(ShortTermTrainingSampleRecord)
+            if start_date is not None:
+                query = query.filter(ShortTermTrainingSampleRecord.trade_date >= start_date)
+            if end_date is not None:
+                query = query.filter(ShortTermTrainingSampleRecord.trade_date <= end_date)
+            query = query.order_by(ShortTermTrainingSampleRecord.trade_date.asc(), ShortTermTrainingSampleRecord.ts_code.asc())
+            if limit is not None:
+                query = query.limit(limit)
+            return [self._serialize_short_term_training_sample(row) for row in query.all()]
+        finally:
+            session.close()
+
+    def get_short_term_training_sample_summary(self) -> Dict[str, Any]:
+        session = self.get_session()
+        try:
+            rows = session.query(ShortTermTrainingSampleRecord).all()
+            labeled_rows = [row for row in rows if row.label_up_1d is not None]
+            return {
+                "sample_count": len(rows),
+                "labeled_count": len(labeled_rows),
+                "trade_days": len({row.trade_date for row in rows if row.trade_date is not None}),
+                "symbols": len({row.ts_code for row in rows if row.ts_code}),
+                "schema_versions": sorted({row.feature_schema_version for row in rows if row.feature_schema_version}),
+            }
+        finally:
+            session.close()
+
     @staticmethod
     def _serialize_recommendation_pool_state(item: RecommendationPoolState) -> Dict[str, Any]:
         return {
@@ -1155,6 +2029,7 @@ class DatabaseManager:
             'pct_change': item.pct_change,
             'volume_ratio': item.volume_ratio,
             'turnover_rate': item.turnover_rate,
+            'ma20': getattr(item, 'ma20', None),
             'strategy_count': item.strategy_count,
             'divergence_score': item.divergence_score,
             'strategy_consistency_label': item.strategy_consistency_label,
@@ -1165,6 +2040,8 @@ class DatabaseManager:
             'distribution_risk_score': item.distribution_risk_score,
             'distribution_risk_flags': list(item.distribution_risk_flags or []),
             'moneyflow_3d_value': item.moneyflow_3d_value,
+            'recent_large_order_net_inflow': item.recent_large_order_net_inflow,
+            'recent_super_large_order_net_inflow': item.recent_super_large_order_net_inflow,
             'turnover_spike_ratio': item.turnover_spike_ratio,
             'recent_runup_5d': item.recent_runup_5d,
             'continuation_bias_score': item.continuation_bias_score,
@@ -1177,13 +2054,30 @@ class DatabaseManager:
             'top3_reason': item.top3_reason,
             'late_stage_momentum_flag': bool(item.late_stage_momentum_flag),
             'candidate_risk_blocked': bool(item.candidate_risk_blocked),
+            'top3_extreme_risk_blocked': bool(getattr(item, 'top3_extreme_risk_blocked', False)),
+            'top3_extreme_risk_reason': getattr(item, 'top3_extreme_risk_reason', None),
             'ai_confidence': item.ai_confidence,
             'display_confidence': item.display_confidence,
             'technical_signal': item.technical_signal,
             'summary': item.summary,
             'recommendation_text': item.recommendation_text,
             'entry_price': item.entry_price,
+            'fundamental_bonus': item.fundamental_bonus,
+            'fundamental_bonus_breakdown': dict(item.fundamental_bonus_breakdown or {}),
             'recommend_rank': item.recommend_rank,
+            'frontlist_rank': item.frontlist_rank,
+            'rerank_pool_rank': item.rerank_pool_rank,
+            'rerank_model_score': item.rerank_model_score,
+            'rerank_rule_score': item.rerank_rule_score,
+            'rerank_blend_score': item.rerank_blend_score,
+            'rerank_rule_weight': item.rerank_rule_weight,
+            'rerank_model_target': item.rerank_model_target,
+            'rerank_selected_for_llm': bool(item.rerank_selected_for_llm),
+            'selection_stage': getattr(item, 'selection_stage', None),
+            'selection_reason': getattr(item, 'selection_reason', None),
+            'selection_reason_components': dict(getattr(item, 'selection_reason_components', {}) or {}),
+            'structured_rank_score': getattr(item, 'structured_rank_score', None),
+            'structured_rank_position': getattr(item, 'structured_rank_position', None),
             'previous_recommendation_score': item.previous_recommendation_score,
             'previous_overall_score': item.previous_overall_score,
             'previous_confidence': item.previous_confidence,
@@ -1219,6 +2113,18 @@ class DatabaseManager:
             'tracking_days': item.tracking_days,
             'trade_date': item.trade_date.isoformat() if item.trade_date else None,
             'entry_price': item.entry_price,
+            'score_mode': item.score_mode,
+            'rerank_pool_rank': item.rerank_pool_rank,
+            'rerank_blend_score': item.rerank_blend_score,
+            'rerank_model_score': item.rerank_model_score,
+            'rerank_rule_score': item.rerank_rule_score,
+            'rerank_rule_weight': item.rerank_rule_weight,
+            'rerank_model_target': item.rerank_model_target,
+            'selection_stage': item.selection_stage,
+            'selection_reason': item.selection_reason,
+            'selection_reason_components': dict(item.selection_reason_components or {}),
+            'structured_rank_score': item.structured_rank_score,
+            'structured_rank_position': item.structured_rank_position,
             'latest_price': performance.latest_price if performance else None,
             'return_1d': performance.return_1d if performance else None,
             'return_3d': performance.return_3d if performance else None,
@@ -1230,3 +2136,72 @@ class DatabaseManager:
             'vs_benchmark_5d': performance.vs_benchmark_5d if performance else None,
             'hit_5d': performance.hit_5d if performance else None,
         }
+
+    @staticmethod
+    def _serialize_short_term_training_sample(item: ShortTermTrainingSampleRecord) -> Dict[str, Any]:
+        return {
+            'id': item.id,
+            'feature_schema_version': item.feature_schema_version,
+            'trade_date': item.trade_date.isoformat() if item.trade_date else None,
+            'ts_code': item.ts_code,
+            'name': item.name,
+            'source_tag': item.source_tag,
+            'in_frontlist': bool(item.in_frontlist),
+            'recommend_rank': item.recommend_rank,
+            'strategy_count': item.strategy_count,
+            'is_repeat_pick': bool(item.is_repeat_pick),
+            'news_mentioned': bool(item.news_mentioned),
+            'technical_signal': item.technical_signal,
+            'entry_price': item.entry_price,
+            'close': item.close,
+            'pct_change': item.pct_change,
+            'volume_ratio': item.volume_ratio,
+            'turnover_rate': item.turnover_rate,
+            'recommendation_score': item.recommendation_score,
+            'overall_score': item.overall_score,
+            'technical_score': item.technical_score,
+            'fundamental_score': item.fundamental_score,
+            'sentiment_score': item.sentiment_score,
+            'news_score': item.news_score,
+            'base_score': item.base_score,
+            'sentiment_adjustment': item.sentiment_adjustment,
+            'news_adjustment': item.news_adjustment,
+            'industry': item.industry,
+            'industry_heat_score': item.industry_heat_score,
+            'industry_flow_bias': item.industry_flow_bias,
+            'distribution_risk_score': item.distribution_risk_score,
+            'distribution_risk_flags': list(item.distribution_risk_flags or []),
+            'moneyflow_3d_value': item.moneyflow_3d_value,
+            'recent_large_order_net_inflow': item.recent_large_order_net_inflow,
+            'recent_super_large_order_net_inflow': item.recent_super_large_order_net_inflow,
+            'turnover_spike_ratio': item.turnover_spike_ratio,
+            'recent_runup_5d': item.recent_runup_5d,
+            'continuation_bias_score': item.continuation_bias_score,
+            'continuation_positive_flags': list(item.continuation_positive_flags or []),
+            'continuation_negative_flags': list(item.continuation_negative_flags or []),
+            'top3_risk_penalty': item.top3_risk_penalty,
+            'short_term_contradiction_penalty': item.short_term_contradiction_penalty,
+            'late_stage_momentum_flag': bool(item.late_stage_momentum_flag),
+            'candidate_risk_blocked': bool(item.candidate_risk_blocked),
+            'previous_recommendation_score': item.previous_recommendation_score,
+            'previous_overall_score': item.previous_overall_score,
+            'score_change': item.score_change,
+            'action_plan': dict(item.action_plan or {}),
+            'return_1d': item.return_1d,
+            'return_3d': item.return_3d,
+            'return_5d': item.return_5d,
+            'return_10d': item.return_10d,
+            'max_drawdown_10d': item.max_drawdown_10d,
+            'benchmark_return_5d': item.benchmark_return_5d,
+            'vs_benchmark_5d': item.vs_benchmark_5d,
+            'label_up_1d': item.label_up_1d,
+        }
+
+    @staticmethod
+    def _normalize_recommendation_status(raw_status: Any, tracking_status: Any) -> str:
+        status_text = str(raw_status or "").strip().lower()
+        if status_text == "active":
+            return "new"
+        if status_text:
+            return status_text
+        return 'tracking' if str(tracking_status or "").strip().lower() == 'active' else 'new'

@@ -7,12 +7,15 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from octts.config import Settings
 from octts.schemas.screener import ScreenResult, TrackedRecommendationState
+from octts.schemas.training import ShortTermTrainingSample
 
 
 def _recommendation_pool_sort_key(item: Dict[str, Any]) -> tuple:
     return (
         item.get("recommend_rank") is None,
         int(item.get("recommend_rank") or 9999),
+        item.get("rerank_pool_rank") is None,
+        int(item.get("rerank_pool_rank") or 9999),
         -float(item.get("recommendation_score") or 0.0),
         -float(item.get("overall_score") or item.get("priority_score") or 0.0),
         item.get("ts_code") or "",
@@ -370,6 +373,13 @@ class ScreeningStore:
     def list_recommendation_history(self, limit: int = 100) -> List[Dict[str, Any]]:
         return self._get_db_manager().list_recommendation_history(limit=limit)
 
+    def list_recommendation_run_items(
+        self,
+        trade_date: Optional[date] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        return self._get_db_manager().list_recommendation_run_items(trade_date=trade_date, limit=limit)
+
     def list_pending_performance_updates(self, lookback_days: int = 15, limit: int = 100) -> List[Dict[str, Any]]:
         return self._get_db_manager().list_pending_performance_updates(lookback_days=lookback_days, limit=limit)
 
@@ -381,6 +391,25 @@ class ScreeningStore:
             lookback_days=lookback_days,
             history_limit=history_limit,
         )
+
+    def upsert_short_term_training_samples(self, samples: List[ShortTermTrainingSample]) -> List[Dict[str, Any]]:
+        return self._get_db_manager().upsert_short_term_training_samples(samples)
+
+    def list_short_term_training_samples(
+        self,
+        *,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        return self._get_db_manager().list_short_term_training_samples(
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+        )
+
+    def get_short_term_training_sample_summary(self) -> Dict[str, Any]:
+        return self._get_db_manager().get_short_term_training_sample_summary()
 
     def get_latest_results(self) -> Dict[str, Dict[str, Any]]:
         """

@@ -26,6 +26,7 @@ from octts.schemas.report import (
 from octts.services.history_store import FileHistoryStore, build_initial_validation
 from octts.services.memory_store import MemoryStore
 from octts.services.position_store import FilePositionStore
+from octts.services.daily_analysis_context import DailyAnalysisScreeningContextProvider
 
 TREND_BIAS_LABELS = {
     "bullish": "看多",
@@ -66,6 +67,7 @@ class AnalysisPipeline:
         history_store: FileHistoryStore,
         position_store: FilePositionStore,
         wecom_client: Optional[WeComClient] = None,
+        screening_context_provider: Optional[DailyAnalysisScreeningContextProvider] = None,
     ) -> None:
         self._settings = settings
         self._tushare_client = tushare_client
@@ -74,6 +76,11 @@ class AnalysisPipeline:
         self._history_store = history_store
         self._position_store = position_store
         self._wecom_client = wecom_client
+        self._screening_context_provider = screening_context_provider or (
+            DailyAnalysisScreeningContextProvider(settings)
+            if settings.screening_enabled
+            else None
+        )
 
     def run(self, request: AnalysisRequest) -> AnalysisResult:
         stock_pool = request.stock_pool or self._settings.stock_pool
@@ -93,6 +100,7 @@ class AnalysisPipeline:
             previous_memory = None
             previous_record = None
             market_context = None
+            screening_context = None
             previous_trading_snapshot = None
             snapshot = None
             system_prompt = None
@@ -119,6 +127,7 @@ class AnalysisPipeline:
                 previous_memory = previous_record.report.memory if previous_record else None
                 market_context = _build_market_context(snapshot)
                 previous_trading_snapshot = market_context.get("previous_daily_bar")
+                screening_context = self._build_screening_context(ts_code)
                 system_prompt, user_prompt, report = self.generate_report_from_snapshot(
                     phase=request.phase,
                     snapshot=snapshot,
@@ -126,6 +135,7 @@ class AnalysisPipeline:
                     previous_record=previous_record,
                     market_context=market_context,
                     previous_trading_snapshot=previous_trading_snapshot,
+                    screening_context=screening_context,
                     is_default_pool_symbol=is_default_pool_symbol,
                     position_status=position_status,
                 )
@@ -149,6 +159,7 @@ class AnalysisPipeline:
                     "previous_memory": previous_memory.model_dump(mode="json") if previous_memory else None,
                     "previous_record": previous_record.model_dump(mode="json") if previous_record else None,
                     "market_context": market_context,
+                    "screening_context": screening_context,
                     "previous_trading_snapshot": previous_trading_snapshot,
                     "position_status": position_status,
                     "is_default_pool_symbol": is_default_pool_symbol,
@@ -161,6 +172,7 @@ class AnalysisPipeline:
                     "previous_memory": previous_memory.model_dump(mode="json") if previous_memory else None,
                     "previous_record": previous_record.model_dump(mode="json") if previous_record else None,
                     "market_context": market_context,
+                    "screening_context": screening_context,
                     "previous_trading_snapshot": previous_trading_snapshot,
                     "position_status": position_status,
                     "is_default_pool_symbol": is_default_pool_symbol,
@@ -197,6 +209,7 @@ class AnalysisPipeline:
         previous_record: Optional[HistoricalAnalysisRecord] = None,
         market_context: Optional[dict[str, object]] = None,
         previous_trading_snapshot: Optional[dict[str, object]] = None,
+        screening_context: Optional[dict[str, object]] = None,
         is_default_pool_symbol: bool = False,
         position_status: Optional[PositionStatus] = None,
     ) -> tuple[str, str, StructuredAnalysis]:
@@ -209,6 +222,7 @@ class AnalysisPipeline:
             previous_record=previous_record,
             market_context=market_context,
             previous_trading_snapshot=previous_trading_snapshot,
+            screening_context=screening_context,
             is_default_pool_symbol=is_default_pool_symbol,
             position_status=position_status,
         )
@@ -217,6 +231,18 @@ class AnalysisPipeline:
             user_prompt=user_prompt,
         )
         return system_prompt, user_prompt, report
+
+    def _build_screening_context(self, ts_code: str) -> Optional[dict[str, object]]:
+        if self._screening_context_provider is None:
+            return None
+        try:
+            context = self._screening_context_provider.build_for_symbol(ts_code)
+        except Exception:
+            return {
+                "data_available": False,
+                "message": "智能选股上下文读取失败；本次仅基于个股行情、财务和历史观点分析。",
+            }
+        return context or None
 
 
 def format_reports_as_markdown(reports: list[StructuredAnalysis]) -> str:

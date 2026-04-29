@@ -131,20 +131,78 @@ class StockScreener:
 
         # 应用筛选条件
         screened_items = []
+        failure_counts: Dict[str, int] = {}
+        failure_samples: Dict[str, List[Dict[str, Any]]] = {}
+        shallow_history_count = 0
+        shallow_history_samples: List[Dict[str, Any]] = []
         for stock in filtered_stocks:
             ts_code = stock["ts_code"]
             if ts_code not in stock_data:
+                failure_counts["missing_stock_data"] = failure_counts.get("missing_stock_data", 0) + 1
+                if len(failure_samples.setdefault("missing_stock_data", [])) < 5:
+                    failure_samples["missing_stock_data"].append({"ts_code": ts_code})
                 continue
 
-            item = self._evaluate_stock(
+            item, evaluation_meta = self._evaluate_stock(
                 stock,
                 stock_data[ts_code],
                 criteria,
                 resolved_trade_date
             )
 
-            if item and self._meets_criteria(item, criteria):
+            if item is None:
+                failure_counts["evaluation_failed"] = failure_counts.get("evaluation_failed", 0) + 1
+                if len(failure_samples.setdefault("evaluation_failed", [])) < 5:
+                    failure_samples["evaluation_failed"].append({"ts_code": ts_code})
+                continue
+
+            if evaluation_meta.get("shallow_history"):
+                shallow_history_count += 1
+                if len(shallow_history_samples) < 5:
+                    shallow_history_samples.append(
+                        {
+                            "ts_code": item.ts_code,
+                            "history_rows": evaluation_meta.get("history_rows"),
+                            "latest_trade_date": evaluation_meta.get("latest_trade_date"),
+                            "rsi": item.rsi,
+                            "price_position_20d": item.price_position_20d,
+                        }
+                    )
+
+            failure_reason = self._get_failure_reason(item, criteria)
+            if failure_reason is None:
                 screened_items.append(item)
+                continue
+
+            failure_counts[failure_reason] = failure_counts.get(failure_reason, 0) + 1
+            if len(failure_samples.setdefault(failure_reason, [])) < 5:
+                failure_samples[failure_reason].append(
+                    {
+                        "ts_code": item.ts_code,
+                        "technical_score": round(float(item.technical_score or 0.0), 2) if item.technical_score is not None else None,
+                        "recommendation_score": round(float(item.recommendation_score or 0.0), 2) if item.recommendation_score is not None else None,
+                        "pct_change": round(float(item.pct_change or 0.0), 2) if item.pct_change is not None else None,
+                        "volume_ratio": round(float(item.volume_ratio or 0.0), 2) if item.volume_ratio is not None else None,
+                        "turnover_rate": round(float(item.turnover_rate or 0.0), 2) if item.turnover_rate is not None else None,
+                        "rsi": round(float(item.rsi or 0.0), 2) if item.rsi is not None else None,
+                        "price_position_20d": round(float(item.price_position_20d or 0.0), 4) if item.price_position_20d is not None else None,
+                    }
+                )
+
+        if failure_counts:
+            logger.info(
+                "Stock screener %s failure distribution: %s, samples=%s",
+                screen_id,
+                dict(sorted(failure_counts.items(), key=lambda entry: (-entry[1], entry[0]))),
+                failure_samples,
+            )
+        if shallow_history_count:
+            logger.info(
+                "Stock screener %s technical snapshot shallow history summary: count=%s, samples=%s",
+                screen_id,
+                shallow_history_count,
+                shallow_history_samples,
+            )
 
         # 排序
         screened_items = self._sort_results(screened_items, criteria)
@@ -177,74 +235,7 @@ class StockScreener:
     @staticmethod
     def get_presets() -> List[ScreenPreset]:
         """获取预设筛选策略"""
-        return [
-            ScreenPreset(
-                id="oversold_bounce",
-                name="超跌反弹",
-                description="寻找RSI<30的超跌股票，可能存在反弹机会",
-                criteria=ScreenCriteria(
-                    rsi_max=35,
-                    volume_ratio_min=1.2,
-                    technical_score_min=45,
-                    exclude_st=True,
-                    max_recent_loss_years=1,
-                    sort_by="recommendation_score",
-                    sort_desc=True
-                ),
-                category="technical"
-            ),
-            ScreenPreset(
-                id="volume_breakout",
-                name="放量突破",
-                description="成交量放大且价格上涨的股票",
-                criteria=ScreenCriteria(
-                    volume_ratio_min=2.0,
-                    pct_change_min=2.0,
-                    require_macd_above_signal=True,
-                    price_position_min=0.6,
-                    technical_score_min=55,
-                    exclude_st=True,
-                    max_recent_loss_years=1,
-                    require_positive_3d_moneyflow=True,
-                    max_late_stage_price_position=0.98,
-                    sort_by="recommendation_score",
-                    sort_desc=True
-                ),
-                category="technical"
-            ),
-            ScreenPreset(
-                id="golden_cross",
-                name="均线金叉",
-                description="5日均线上穿20日均线",
-                criteria=ScreenCriteria(
-                    ma5_above_ma20=True,
-                    require_bullish_ma_alignment=True,
-                    require_macd_above_signal=True,
-                    volume_ratio_min=1.2,
-                    technical_score_min=60,
-                    exclude_st=True,
-                    max_recent_loss_years=1,
-                    sort_by="recommendation_score",
-                    sort_desc=True
-                ),
-                category="technical"
-            ),
-            ScreenPreset(
-                id="small_cap_growth",
-                name="小盘成长",
-                description="市值较小且上涨的股票",
-                criteria=ScreenCriteria(
-                    market_cap_max=50,
-                    pct_change_min=1.0,
-                    turnover_rate_min=3.0,
-                    exclude_st=True,
-                    max_recent_loss_years=1,
-                    sort_by="pct_change",
-                    sort_desc=True
-                ),
-                category="fundamental"
-            )
-        ]
+        return []
 
     @staticmethod
     def get_screen_result(screen_id: str) -> Optional[ScreenResult]:
@@ -263,17 +254,18 @@ class StockScreener:
     def _get_latest_trade_date(self) -> str:
         """获取最近交易日"""
         today = datetime.now()
+        try:
+            return self.client.resolve_latest_trade_date(
+                end_date=today.strftime("%Y%m%d"),
+                lookback_days=7,
+            )
+        except Exception:
+            logger.exception("Failed to resolve latest trade date with remote probe, fallback to local calendar")
+
         end_date = today.strftime("%Y%m%d")
         start_date = (today - timedelta(days=7)).strftime("%Y%m%d")
-
-        trade_dates = self.client.fetch_trading_dates(
-            start_date=start_date,
-            end_date=end_date
-        )
-
-        if trade_dates:
-            return trade_dates[-1]
-        return end_date
+        trade_dates = self.client.fetch_trading_dates(start_date=start_date, end_date=end_date)
+        return trade_dates[-1] if trade_dates else end_date
 
     def _pre_filter_stocks(
         self,
@@ -284,7 +276,10 @@ class StockScreener:
         filtered = []
 
         for stock in stocks:
+            ts_code = str(stock.get("ts_code") or "").upper()
             if criteria.exclude_st and ("ST" in stock.get("name", "")):
+                continue
+            if criteria.exclude_bj and ts_code.endswith(".BJ"):
                 continue
             if criteria.industries and stock.get("industry") not in criteria.industries:
                 continue
@@ -554,14 +549,14 @@ class StockScreener:
         stock_data: Dict[str, Any],
         criteria: ScreenCriteria,
         trade_date: str
-    ) -> Optional[StockScreenItem]:
+    ) -> tuple[Optional[StockScreenItem], Dict[str, Any]]:
         """评估单个股票"""
         ts_code = stock_info["ts_code"]
         basic = stock_data.get("basic", {})
         daily_list = stock_data.get("daily", [])
 
         if not basic or not daily_list:
-            return None
+            return None, {}
 
         ordered_daily = sorted(
             daily_list,
@@ -581,6 +576,11 @@ class StockScreener:
         ])
 
         snapshot = build_technical_snapshot(closes, highs, lows, volumes)
+        evaluation_meta = {
+            "shallow_history": snapshot.rsi is None or snapshot.price_position_20d is None,
+            "history_rows": len(ordered_daily),
+            "latest_trade_date": latest.get("trade_date"),
+        }
         volume_ratio = float(basic.get("volume_ratio", 0)) if basic.get("volume_ratio") else snapshot.volume_ratio
 
         pct_change = self._to_float(latest.get("pct_chg"))
@@ -661,92 +661,102 @@ class StockScreener:
 
         item.match_reasons = match_reasons
 
-        return item
+        return item, evaluation_meta
 
-    def _meets_criteria(
+    def _get_failure_reason(
         self,
         item: StockScreenItem,
-        criteria: ScreenCriteria
-    ) -> bool:
-        """检查是否满足筛选条件"""
+        criteria: ScreenCriteria,
+    ) -> Optional[str]:
+        """返回首个失败原因，便于统计策略失效分布。"""
         # 价格条件
         if criteria.price_min is not None and item.close < criteria.price_min:
-            return False
+            return "price_min"
         if criteria.price_max is not None and item.close > criteria.price_max:
-            return False
+            return "price_max"
 
         # 涨跌幅
         if criteria.pct_change_min is not None and (item.pct_change is None or item.pct_change < criteria.pct_change_min):
-            return False
+            return "pct_change_min"
         if criteria.pct_change_max is not None and (item.pct_change is None or item.pct_change > criteria.pct_change_max):
-            return False
+            return "pct_change_max"
 
         # 成交量
         if criteria.volume_ratio_min is not None and item.volume_ratio < criteria.volume_ratio_min:
-            return False
+            return "volume_ratio_min"
         if criteria.volume_ratio_max is not None and item.volume_ratio > criteria.volume_ratio_max:
-            return False
+            return "volume_ratio_max"
 
         # 换手率
         if criteria.turnover_rate_min is not None and item.turnover_rate < criteria.turnover_rate_min:
-            return False
+            return "turnover_rate_min"
         if criteria.turnover_rate_max is not None and item.turnover_rate > criteria.turnover_rate_max:
-            return False
+            return "turnover_rate_max"
 
         # RSI
         if criteria.rsi_min is not None:
             if item.rsi is None or item.rsi < criteria.rsi_min:
-                return False
+                return "rsi_min"
         if criteria.rsi_max is not None:
             if item.rsi is None or item.rsi > criteria.rsi_max:
-                return False
+                return "rsi_max"
 
         # 均线
         if criteria.ma5_above_ma20:
             if item.ma5 is None or item.ma20 is None or item.ma5 <= item.ma20:
-                return False
+                return "ma5_above_ma20"
 
         if criteria.price_above_ma5:
             if item.ma5 is None or item.close <= item.ma5:
-                return False
+                return "price_above_ma5"
+
+        if criteria.price_above_ma60:
+            if item.ma60 is None or item.close <= item.ma60:
+                return "price_above_ma60"
 
         if criteria.require_bullish_ma_alignment:
             if item.trend_status != "bullish":
-                return False
+                return "require_bullish_ma_alignment"
 
         if criteria.require_macd_above_signal:
             if item.macd is None or item.macd_signal is None or item.macd < item.macd_signal:
-                return False
+                return "require_macd_above_signal"
 
         if criteria.technical_score_min is not None:
             if item.technical_score is None or item.technical_score < criteria.technical_score_min:
-                return False
+                return "technical_score_min"
         if criteria.recommendation_score_min is not None:
             if item.recommendation_score is None or item.recommendation_score < criteria.recommendation_score_min:
-                return False
+                return "recommendation_score_min"
         if criteria.setup_quality_score_min is not None:
             if item.setup_quality_score is None or item.setup_quality_score < criteria.setup_quality_score_min:
-                return False
+                return "setup_quality_score_min"
         if criteria.setup_types:
             if item.setup_type is None or item.setup_type not in criteria.setup_types:
-                return False
+                return "setup_types"
         if criteria.risk_level_max is not None:
             item_risk = _RISK_LEVEL_ORDER.get(item.risk_level or "high")
             max_risk = _RISK_LEVEL_ORDER.get(criteria.risk_level_max)
             if max_risk is None or item_risk > max_risk:
-                return False
+                return "risk_level_max"
         if criteria.recommendation_min is not None:
             item_rec = _RECOMMENDATION_ORDER.get(item.recommendation or "avoid")
             min_rec = _RECOMMENDATION_ORDER.get(criteria.recommendation_min)
             if min_rec is None or item_rec < min_rec:
-                return False
+                return "recommendation_min"
 
         if criteria.price_position_min is not None:
             if item.price_position_20d is None or item.price_position_20d < criteria.price_position_min:
-                return False
+                return "price_position_min"
         if criteria.price_position_max is not None:
             if item.price_position_20d is None or item.price_position_20d > criteria.price_position_max:
-                return False
+                return "price_position_max"
+        if criteria.distance_to_ma60_pct_min is not None:
+            if item.distance_to_ma60_pct is None or item.distance_to_ma60_pct < criteria.distance_to_ma60_pct_min:
+                return "distance_to_ma60_pct_min"
+        if criteria.distance_to_ma60_pct_max is not None:
+            if item.distance_to_ma60_pct is None or item.distance_to_ma60_pct > criteria.distance_to_ma60_pct_max:
+                return "distance_to_ma60_pct_max"
         if self._hits_late_stage_risk_gate(
             pct_change=item.pct_change,
             turnover_rate=item.turnover_rate,
@@ -754,17 +764,25 @@ class StockScreener:
             price_position=item.price_position_20d,
             criteria=criteria,
         ):
-            return False
+            return "late_stage_risk_gate"
 
         # 市值
         if criteria.market_cap_min is not None:
             if item.market_cap is None or item.market_cap < criteria.market_cap_min:
-                return False
+                return "market_cap_min"
         if criteria.market_cap_max is not None:
             if item.market_cap is None or item.market_cap > criteria.market_cap_max:
-                return False
+                return "market_cap_max"
 
-        return True
+        return None
+
+    def _meets_criteria(
+        self,
+        item: StockScreenItem,
+        criteria: ScreenCriteria
+    ) -> bool:
+        """检查是否满足筛选条件"""
+        return self._get_failure_reason(item, criteria) is None
 
     def _sort_results(
         self,

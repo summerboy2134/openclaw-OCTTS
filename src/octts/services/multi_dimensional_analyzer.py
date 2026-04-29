@@ -87,23 +87,28 @@ class MultiDimensionalAnalyzer:
 
         base_data = await self._fetch_stock_data(ts_code)
         logger.info(
-            "Analyzer base data for %s: stock_info=%s, daily_rows=%s, financial_rows=%s, moneyflow_rows=%s",
+            "Analyzer base data for %s: stock_info=%s, daily_rows=%s, financial_rows=%s, express_rows=%s, moneyflow_rows=%s",
             ts_code,
             bool(base_data.get("stock_info")),
             len(base_data.get("daily_data") or []),
             len(base_data.get("financial_data") or []),
+            len(base_data.get("earnings_express") or []),
             len(base_data.get("moneyflow_data") or []),
         )
         logger.info(
-            "Analyzer base data detail for %s: stock_info=%s, latest_daily=%s, latest_financial=%s, latest_moneyflow=%s",
+            "Analyzer base data detail for %s: stock_info=%s, latest_daily=%s, latest_financial=%s, latest_express=%s, latest_moneyflow=%s",
             ts_code,
             base_data.get("stock_info"),
             (base_data.get("daily_data") or [])[-1] if (base_data.get("daily_data") or []) else None,
             (base_data.get("financial_data") or [None])[0],
+            (base_data.get("earnings_express") or [None])[0],
             (base_data.get("moneyflow_data") or [None])[0],
         )
         if news_context:
             base_data["news_context"] = news_context
+            focus_context = news_context.get("focus_stock_context")
+            if isinstance(focus_context, dict):
+                base_data["focus_stock_context"] = focus_context
         dimension_results = await self._run_parallel_analysis(ts_code, base_data)
         logger.info(
             "Analyzer dimension results for %s: technical=(score=%s, confidence=%s), fundamental=(score=%s, confidence=%s), sentiment=(score=%s, confidence=%s), news=(score=%s, confidence=%s)",
@@ -184,6 +189,8 @@ class MultiDimensionalAnalyzer:
                 end_date=end_date,
             ),
             "financial_data": self.tushare_client.fetch_financial_indicators(ts_code),
+            "earnings_express": self.tushare_client.fetch_earnings_express(ts_code),
+            "earnings_forecast": self.tushare_client.fetch_earnings_forecast(ts_code),
             "moneyflow_data": self.tushare_client.fetch_moneyflow(ts_code, trade_date=end_date),
         }
 
@@ -194,11 +201,12 @@ class MultiDimensionalAnalyzer:
     ) -> Dict[AnalysisDimension, DimensionAnalysis]:
         """并行执行多维度分析。"""
         logger.info(
-            "Analyzer round 1 input for %s: stock_info=%s, daily_rows=%s, financial_rows=%s, moneyflow_rows=%s, news_context_keys=%s",
+            "Analyzer round 1 input for %s: stock_info=%s, daily_rows=%s, financial_rows=%s, express_rows=%s, moneyflow_rows=%s, news_context_keys=%s",
             ts_code,
             base_data.get("stock_info"),
             len(base_data.get("daily_data") or []),
             len(base_data.get("financial_data") or []),
+            len(base_data.get("earnings_express") or []),
             len(base_data.get("moneyflow_data") or []),
             sorted(list((base_data.get("news_context") or {}).keys())),
         )
@@ -322,14 +330,28 @@ class MultiDimensionalAnalyzer:
         if breakout:
             key_points.append(breakout)
 
+        focus_context = base_data.get("focus_stock_context") if isinstance(base_data.get("focus_stock_context"), dict) else {}
         signal_payload = {
             "trend": trend,
             "latest_close": snapshot.close,
+            "ma20": focus_context.get("ma20") or snapshot.ma20,
             "rsi": snapshot.rsi,
             "price_position_20d": snapshot.price_position_20d,
             "technical_score": snapshot.technical_score,
             "momentum_status": momentum,
             "breakout": breakout or "无突破",
+            "model_and_risk_context": {
+                "model_rank": focus_context.get("model_rank"),
+                "model_score": focus_context.get("model_score"),
+                "distribution_risk_score": focus_context.get("distribution_risk_score"),
+                "distribution_risk_flags": focus_context.get("distribution_risk_flags") or [],
+                "moneyflow_3d_value": focus_context.get("moneyflow_3d_value"),
+                "recent_large_order_net_inflow": focus_context.get("recent_large_order_net_inflow"),
+                "recent_super_large_order_net_inflow": focus_context.get("recent_super_large_order_net_inflow"),
+                "turnover_rate": focus_context.get("turnover_rate"),
+                "turnover_spike_ratio": focus_context.get("turnover_spike_ratio"),
+                "volume_ratio": focus_context.get("volume_ratio"),
+            },
         }
 
         fallback_parts = [
@@ -367,7 +389,11 @@ class MultiDimensionalAnalyzer:
         del ts_code
         stock_info = base_data.get("stock_info", {})
         financial_data = base_data.get("financial_data", [])
+        earnings_express = base_data.get("earnings_express", [])
+        earnings_forecast = base_data.get("earnings_forecast", [])
         latest = financial_data[0] if financial_data else {}
+        latest_express = earnings_express[0] if earnings_express else {}
+        latest_forecast = earnings_forecast[0] if earnings_forecast else {}
 
         def _to_float(value: Any) -> Optional[float]:
             if value in (None, ""):
@@ -380,26 +406,52 @@ class MultiDimensionalAnalyzer:
         roe = _to_float(latest.get("roe"))
         profit_growth = _to_float(latest.get("netprofit_yoy"))
         revenue_growth = _to_float(latest.get("op_income_yoy"))
+        dt_profit_growth = _to_float(latest.get("dt_netprofit_yoy"))
         gross_margin = _to_float(latest.get("grossprofit_margin"))
         net_margin = _to_float(latest.get("netprofit_margin"))
         asset_turn = _to_float(latest.get("assets_turn"))
+        bps = _to_float(latest.get("bps"))
+        ocfps = _to_float(latest.get("ocfps"))
 
-        if not financial_data:
+        express_revenue_growth = _to_float(latest_express.get("yoy_sales"))
+        express_profit_growth = _to_float(latest_express.get("yoy_net_profit"))
+        express_roe = _to_float(latest_express.get("diluted_roe"))
+        express_eps = _to_float(latest_express.get("diluted_eps"))
+        express_summary = str(latest_express.get("perf_summary") or "").strip()
+        forecast_type = str(latest_forecast.get("type") or "").strip()
+        forecast_summary = str(latest_forecast.get("summary") or "").strip()
+        forecast_change_reason = str(latest_forecast.get("change_reason") or "").strip()
+        forecast_p_change_min = _to_float(latest_forecast.get("p_change_min"))
+        forecast_p_change_max = _to_float(latest_forecast.get("p_change_max"))
+
+        if not financial_data and not earnings_express and not earnings_forecast:
             industry = stock_info.get("industry", "行业未知")
             return DimensionAnalysis(
                 dimension=AnalysisDimension.FUNDAMENTAL,
                 score=38.0,
                 confidence=0.25,
-                analysis="最新财务指标缺失，基本面暂按偏保守处理，需等待财报或经营数据补充确认。",
-                key_points=[industry, "财务指标缺失", "基本面暂按保守分处理"],
+                analysis="最新财务指标、业绩快报与预告均缺失，基本面暂按偏保守处理，需等待后续披露确认。",
+                key_points=[industry, "财务指标缺失", "业绩快报缺失", "业绩预告缺失", "基本面暂按保守分处理"],
                 signals={
                     "roe": None,
                     "netprofit_yoy": None,
                     "op_income_yoy": None,
+                    "dt_netprofit_yoy": None,
                     "grossprofit_margin": None,
                     "netprofit_margin": None,
                     "assets_turn": None,
-                    "fundamental_summary": "数据缺失，保守评估",
+                    "bps": None,
+                    "ocfps": None,
+                    "express_yoy_sales": None,
+                    "express_yoy_net_profit": None,
+                    "express_diluted_roe": None,
+                    "express_diluted_eps": None,
+                    "forecast_type": None,
+                    "forecast_p_change_min": None,
+                    "forecast_p_change_max": None,
+                    "forecast_summary": None,
+                    "forecast_change_reason": None,
+                    "fundamental_summary": "财报/快报/预告均缺失，保守评估",
                 },
             )
 
@@ -423,6 +475,15 @@ class MultiDimensionalAnalyzer:
             else:
                 score -= 8
                 warning_reasons.append("ROE偏弱")
+        elif express_roe is not None:
+            if express_roe >= 15:
+                score += 6
+                score_reasons.append("快报ROE表现较强")
+            elif express_roe >= 8:
+                score += 2
+                score_reasons.append("快报ROE尚可")
+            else:
+                warning_reasons.append("快报ROE偏一般")
         else:
             warning_reasons.append("ROE缺失")
 
@@ -445,6 +506,22 @@ class MultiDimensionalAnalyzer:
             else:
                 score -= 18
                 warning_reasons.append("净利润同比大幅恶化")
+        elif express_profit_growth is not None:
+            if express_profit_growth >= 40:
+                score += 9
+                score_reasons.append("快报净利润同比高增")
+            elif express_profit_growth >= 15:
+                score += 5
+                score_reasons.append("快报净利润同比改善")
+            elif express_profit_growth >= 0:
+                score += 2
+                score_reasons.append("快报净利润保持增长")
+            elif express_profit_growth >= -20:
+                score -= 5
+                warning_reasons.append("快报净利润同比转弱")
+            else:
+                score -= 10
+                warning_reasons.append("快报净利润明显承压")
         else:
             warning_reasons.append("净利润同比缺失")
 
@@ -463,8 +540,26 @@ class MultiDimensionalAnalyzer:
             else:
                 score -= 8
                 warning_reasons.append("营收同比明显回落")
+        elif express_revenue_growth is not None:
+            if express_revenue_growth >= 20:
+                score += 5
+                score_reasons.append("快报营收增长较快")
+            elif express_revenue_growth >= 5:
+                score += 2
+                score_reasons.append("快报营收保持增长")
+            elif express_revenue_growth < -10:
+                score -= 5
+                warning_reasons.append("快报营收同比走弱")
         else:
             warning_reasons.append("营收同比缺失")
+
+        if dt_profit_growth is not None:
+            if dt_profit_growth >= 20:
+                score += 4
+                score_reasons.append("扣非净利改善")
+            elif dt_profit_growth < -20:
+                score -= 4
+                warning_reasons.append("扣非净利承压")
 
         if gross_margin is not None:
             if gross_margin >= 30:
@@ -490,51 +585,93 @@ class MultiDimensionalAnalyzer:
                 score -= 2
                 warning_reasons.append("资产周转偏慢")
 
+        if bps is not None and bps > 0:
+            score += 1
+        if ocfps is not None:
+            if ocfps > 0:
+                score += 2
+                score_reasons.append("经营现金流为正")
+            else:
+                score -= 3
+                warning_reasons.append("经营现金流承压")
+        if express_eps is not None and express_eps > 0:
+            score += 1
+
         industry = stock_info.get("industry", "行业未知")
-        clipped_score = max(20.0, min(score, 88.0))
+        clipped_score = max(20.0, min(score, 90.0))
         confidence = 0.72
         available_metrics = [
             metric
-            for metric in [roe, profit_growth, revenue_growth, gross_margin, net_margin, asset_turn]
+            for metric in [
+                roe,
+                profit_growth,
+                revenue_growth,
+                dt_profit_growth,
+                gross_margin,
+                net_margin,
+                asset_turn,
+                bps,
+                ocfps,
+                express_revenue_growth,
+                express_profit_growth,
+                express_roe,
+                express_eps,
+            ]
             if metric is not None
         ]
-        if len(available_metrics) <= 3:
+        if financial_data and earnings_express:
+            confidence = 0.82
+        elif len(available_metrics) <= 4:
             confidence = 0.6
-        if len(available_metrics) <= 1:
+        elif len(available_metrics) <= 2:
             confidence = 0.45
 
         analysis_parts = []
         metric_parts = []
         if roe is not None:
             metric_parts.append("ROE {0:.1f}%".format(roe))
+        elif express_roe is not None:
+            metric_parts.append("快报ROE {0:.1f}%".format(express_roe))
         if profit_growth is not None:
             metric_parts.append("净利润同比 {0:.1f}%".format(profit_growth))
+        elif express_profit_growth is not None:
+            metric_parts.append("快报净利润同比 {0:.1f}%".format(express_profit_growth))
         if revenue_growth is not None:
             metric_parts.append("营收同比 {0:.1f}%".format(revenue_growth))
+        elif express_revenue_growth is not None:
+            metric_parts.append("快报营收同比 {0:.1f}%".format(express_revenue_growth))
         if metric_parts:
             analysis_parts.append("、".join(metric_parts) + "。")
         if score_reasons:
             analysis_parts.append("当前加分主要来自{0}。".format("、".join(score_reasons[:3])))
         if warning_reasons:
             analysis_parts.append("拖累项主要为{0}。".format("、".join(warning_reasons[:3])))
-        if gross_margin is not None or net_margin is not None or asset_turn is not None:
-            quality_parts = []
-            if gross_margin is not None:
-                quality_parts.append("毛利率 {0:.1f}%".format(gross_margin))
-            if net_margin is not None:
-                quality_parts.append("净利率 {0:.1f}%".format(net_margin))
-            if asset_turn is not None:
-                quality_parts.append("资产周转 {0:.2f}".format(asset_turn))
+        quality_parts = []
+        if gross_margin is not None:
+            quality_parts.append("毛利率 {0:.1f}%".format(gross_margin))
+        if net_margin is not None:
+            quality_parts.append("净利率 {0:.1f}%".format(net_margin))
+        if asset_turn is not None:
+            quality_parts.append("资产周转 {0:.2f}".format(asset_turn))
+        if ocfps is not None:
+            quality_parts.append("每股经营现金流 {0:.2f}".format(ocfps))
+        if quality_parts:
             analysis_parts.append("质量修正参考{0}。".format("、".join(quality_parts)))
+        if express_summary:
+            analysis_parts.append("最新快报摘要：{0}。".format(express_summary[:80]))
         analysis = "".join(analysis_parts) or "最新财务指标有限，基本面暂按中性偏保守理解。"
 
         key_points = [industry, "基本面评分{0:.1f}".format(clipped_score)]
         if roe is not None:
             key_points.append("ROE {0:.1f}%".format(roe))
+        elif express_roe is not None:
+            key_points.append("快报ROE {0:.1f}%".format(express_roe))
         if profit_growth is not None:
             key_points.append("净利润同比 {0:.1f}%".format(profit_growth))
-        elif revenue_growth is not None:
-            key_points.append("营收同比 {0:.1f}%".format(revenue_growth))
+        elif express_profit_growth is not None:
+            key_points.append("快报净利润同比 {0:.1f}%".format(express_profit_growth))
+        if express_revenue_growth is not None:
+            key_points.append("快报营收同比 {0:.1f}%".format(express_revenue_growth))
         if warning_reasons:
             key_points.append(warning_reasons[0])
         elif score_reasons:
@@ -544,9 +681,22 @@ class MultiDimensionalAnalyzer:
             "roe": roe,
             "netprofit_yoy": profit_growth,
             "op_income_yoy": revenue_growth,
+            "dt_netprofit_yoy": dt_profit_growth,
             "grossprofit_margin": gross_margin,
             "netprofit_margin": net_margin,
             "assets_turn": asset_turn,
+            "bps": bps,
+            "ocfps": ocfps,
+            "express_yoy_sales": express_revenue_growth,
+            "express_yoy_net_profit": express_profit_growth,
+            "express_diluted_roe": express_roe,
+            "express_diluted_eps": express_eps,
+            "express_perf_summary": express_summary,
+            "forecast_type": forecast_type,
+            "forecast_p_change_min": forecast_p_change_min,
+            "forecast_p_change_max": forecast_p_change_max,
+            "forecast_summary": forecast_summary,
+            "forecast_change_reason": forecast_change_reason,
             "fundamental_summary": "；".join(score_reasons[:2] + warning_reasons[:2]) or "基本面中性",
         }
 
@@ -849,6 +999,7 @@ class MultiDimensionalAnalyzer:
             2,
         )
         stock_info = base_data.get("stock_info", {})
+        focus_context = base_data.get("focus_stock_context") if isinstance(base_data.get("focus_stock_context"), dict) else {}
         summary = "{0}（{1}）综合评分 {2:.1f}，主评分 {3:.1f} 由技术面与基本面构成，情绪面 {4:+.1f}、新闻面 {5:+.1f} 作为辅助修正，{6}。".format(
             stock_info.get("name", ts_code),
             ts_code,
@@ -857,6 +1008,44 @@ class MultiDimensionalAnalyzer:
             sentiment_adjustment,
             news_adjustment,
             conflict_resolution.final_decision,
+        )
+        review_decision = "watch"
+        if overall_score >= 72 and overall_confidence >= 0.65:
+            review_decision = "top3_candidate"
+        elif overall_score < 58 or overall_confidence < 0.45:
+            review_decision = "reject"
+        risk_score = round(
+            self._clip(
+                100.0 - overall_score + max(0.0, (0.6 - overall_confidence) * 35.0),
+                0.0,
+                100.0,
+            ),
+            2,
+        )
+        catalyst_score = round(
+            self._clip(
+                float(news.score) * 0.55 + float(sentiment.score) * 0.45,
+                0.0,
+                100.0,
+            ),
+            2,
+        )
+        continuation_score = round(
+            self._clip(
+                float(technical.score) * 0.55 + float(sentiment.score) * 0.30 + float(news.score) * 0.15,
+                0.0,
+                100.0,
+            ),
+            2,
+        )
+        review_summary = "综合{0:.1f}｜技{1:.1f} 基{2:.1f} 情{3:.1f} 新{4:.1f}｜风险{5:.1f}｜结论:{6}".format(
+            overall_score,
+            technical.score,
+            fundamental.score,
+            sentiment.score,
+            news.score,
+            risk_score,
+            review_decision,
         )
         result = {
             "ts_code": ts_code,
@@ -868,7 +1057,12 @@ class MultiDimensionalAnalyzer:
             "news_adjustment": news_adjustment,
             "score_model": self.SCORE_MODEL,
             "overall_confidence": round(overall_confidence, 4),
-            "summary": summary,
+            "summary": review_summary,
+            "review_summary": review_summary,
+            "review_decision": review_decision,
+            "risk_score": risk_score,
+            "catalyst_score": catalyst_score,
+            "continuation_score": continuation_score,
             "technical_score": technical.score,
             "fundamental_score": fundamental.score,
             "sentiment_score": sentiment.score,
@@ -877,7 +1071,9 @@ class MultiDimensionalAnalyzer:
             "fundamental_summary": fundamental.analysis,
             "sentiment_summary": sentiment.analysis,
             "news_summary": news.analysis,
+            "final_summary": summary,
             "technical_signal": technical.signals.get("trend", ""),
+            "fundamental_signals": fundamental.signals,
             "sentiment_signals": sentiment.signals,
             "news_signals": news.signals,
             "key_points": technical.key_points + fundamental.key_points[:1] + sentiment.key_points[:1],
@@ -887,6 +1083,34 @@ class MultiDimensionalAnalyzer:
             "final_decision": conflict_resolution.final_decision,
             "iteration_count": iteration_count,
         }
+        for key in [
+            "model_rank",
+            "model_score",
+            "model_blend_score",
+            "recommendation_score",
+            "risk_score",
+            "close",
+            "pct_change",
+            "turnover_rate",
+            "volume_ratio",
+            "ma20",
+            "price_position_20d",
+            "distribution_risk_score",
+            "distribution_risk_flags",
+            "candidate_risk_blocked",
+            "top3_extreme_risk_blocked",
+            "top3_extreme_risk_reason",
+            "moneyflow_3d_value",
+            "recent_large_order_net_inflow",
+            "recent_super_large_order_net_inflow",
+            "turnover_spike_ratio",
+            "recent_runup_5d",
+            "late_stage_momentum_flag",
+            "selection_stage",
+            "selection_reason",
+        ]:
+            if key in focus_context:
+                result[key] = focus_context.get(key)
         logger.info(
             "Analyzer final report for %s: overall_score=%s, base_score=%s, overall_confidence=%s, summary=%s, technical_signal=%s",
             ts_code,

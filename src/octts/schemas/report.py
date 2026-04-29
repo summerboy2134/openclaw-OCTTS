@@ -42,6 +42,8 @@ class PriceSnapshot(BaseModel):
     daily_summary: list[dict[str, Any]] = Field(default_factory=list)
     weekly_summary: list[dict[str, Any]] = Field(default_factory=list)
     moneyflow_summary: dict[str, Any] = Field(default_factory=dict)
+    financial_indicators: list[dict[str, Any]] = Field(default_factory=list)
+    earnings_express: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class MemorySummary(BaseModel):

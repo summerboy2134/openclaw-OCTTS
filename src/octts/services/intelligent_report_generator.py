@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional
 from octts.config import Settings
 from octts.clients.llm_client import LLMClient
 from octts.prompts.report_prompt import (
+    build_today_screening_analysis_prompt,
+    build_today_screening_format_prompt,
     build_today_screening_report_prompt,
     build_yesterday_review_report_prompt,
 )
@@ -33,7 +35,16 @@ TECHNICAL_SIGNAL_LABELS = {
 
 logger = logging.getLogger(__name__)
 
-SCREENING_REPORT_MIN_MAX_TOKENS = 4200
+SCREENING_REPORT_MIN_MAX_TOKENS = 6000
+INTERNAL_REPORT_TEXT_MARKERS = (
+    "回补样本",
+    "训练集构造",
+    "结构化特征近似",
+    "用于短线训练",
+    "fallback",
+    "fallback_reason",
+    "backfill",
+)
 
 
 class ReportType(Enum):
@@ -138,6 +149,9 @@ class IntelligentReportGenerator:
         screening_context: Dict[str, Any],
     ) -> Dict[str, Any]:
         serialized_news_clusters = [self._serialize_news_cluster(item) for item in news_clusters[:6]]
+        if not self.settings.screening_llm_enabled:
+            logger.info("Screening report LLM generation disabled, using fallback report blocks")
+            return self._build_fallback_report_blocks(stock_pool, market_data, screening_context, serialized_news_clusters)
         if not screening_context:
             return self._build_fallback_report_blocks(stock_pool, market_data, screening_context, serialized_news_clusters)
 
@@ -172,16 +186,193 @@ class IntelligentReportGenerator:
         news_clusters: List[Dict[str, Any]],
         screening_context: Dict[str, Any],
     ) -> Dict[str, Any]:
+        enriched_context = self._enrich_screening_context_for_report(screening_context)
+        two_stage_payload = await self._generate_two_stage_today_report_blocks(
+            market_data=market_data,
+            news_clusters=news_clusters,
+            screening_context=enriched_context,
+        )
+        if two_stage_payload:
+            return two_stage_payload
+
+        logger.info("Falling back to single-stage today screening report generation")
         system_prompt, user_prompt = build_today_screening_report_prompt(
             market_data=market_data,
             news_clusters=news_clusters,
-            screening_context=screening_context,
+            screening_context=enriched_context,
         )
         return await self._request_report_payload(
             user_prompt=user_prompt,
             system_prompt=system_prompt,
             log_label="today structured screening report",
         )
+
+    def _enrich_screening_context_for_report(self, screening_context: Dict[str, Any]) -> Dict[str, Any]:
+        enriched = dict(screening_context or {})
+        today_top3 = []
+        for item in enriched.get("today_top3") or []:
+            if not isinstance(item, dict):
+                continue
+            stock_payload = dict(item)
+            stock_payload.setdefault("evidence_digest", self._build_stock_evidence_digest(stock_payload))
+            today_top3.append(stock_payload)
+        enriched["today_top3"] = today_top3
+        enriched["comparison_candidates"] = list(today_top3)
+        enriched["cross_stock_synthesis"] = self._build_cross_stock_synthesis(today_top3)
+        return enriched
+
+    async def _generate_two_stage_today_report_blocks(
+        self,
+        *,
+        market_data: Dict[str, Any],
+        news_clusters: List[Dict[str, Any]],
+        screening_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        analysis_system_prompt, analysis_user_prompt = build_today_screening_analysis_prompt(
+            market_data=market_data,
+            news_clusters=news_clusters,
+            screening_context=screening_context,
+        )
+        reasoning_payload = await self._request_report_payload(
+            user_prompt=analysis_user_prompt,
+            system_prompt=analysis_system_prompt,
+            log_label="today screening reasoning draft",
+            model=self.settings.llm_report_analysis_model,
+        )
+        if not reasoning_payload:
+            return {}
+
+        format_system_prompt, format_user_prompt = build_today_screening_format_prompt(
+            market_data=market_data,
+            news_clusters=news_clusters,
+            screening_context=screening_context,
+            reasoning_payload=reasoning_payload,
+        )
+        return await self._request_report_payload(
+            user_prompt=format_user_prompt,
+            system_prompt=format_system_prompt,
+            log_label="today structured screening report formatter",
+            model=self.settings.llm_report_formatter_model,
+        )
+
+    def _build_stock_evidence_digest(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        positive: List[str] = []
+        risk: List[str] = []
+        missing: List[str] = []
+        operating: List[str] = []
+
+        name = item.get("name") or item.get("ts_code") or "该股"
+        score_snapshot = item.get("score_snapshot") or {}
+        model_rank = score_snapshot.get("model_rank", item.get("model_rank"))
+        recommendation_score = score_snapshot.get("recommendation_score", item.get("recommendation_score"))
+        overall_score = score_snapshot.get("overall_score", item.get("overall_score"))
+        risk_score = score_snapshot.get("risk_score", item.get("risk_score", item.get("distribution_risk_score")))
+        if model_rank not in (None, ""):
+            positive.append(f"模型全市场排序第{model_rank}，是进入Top3的主排序依据")
+        if recommendation_score not in (None, ""):
+            positive.append(f"最终推荐分为{recommendation_score}")
+        if overall_score not in (None, ""):
+            positive.append(f"多维综合分为{overall_score}")
+
+        pct_change = item.get("pct_change")
+        turnover_rate = item.get("turnover_rate")
+        ma20 = item.get("ma20")
+        price_position = item.get("price_position_20d")
+        if pct_change not in (None, ""):
+            positive.append(f"当日涨跌幅{float(pct_change):+.2f}%")
+        else:
+            missing.append("缺少当日涨跌幅，市场表现阶段只能保守判断")
+        if turnover_rate not in (None, ""):
+            positive.append(f"换手率{float(turnover_rate):.2f}%")
+        else:
+            missing.append("缺少换手率，量能承接判断不完整")
+        if ma20 not in (None, ""):
+            positive.append(f"MA20为{float(ma20):.2f}")
+        if price_position not in (None, ""):
+            positive.append(f"20日价格位置为{float(price_position):.2f}")
+
+        fund_flow = item.get("main_fund_flow_3d")
+        if fund_flow in (None, ""):
+            fund_flow = item.get("moneyflow_3d_value")
+        if fund_flow not in (None, ""):
+            flow_value = float(fund_flow)
+            if flow_value >= 0:
+                positive.append(f"近3日主力资金净流入约{flow_value:.1f}")
+            else:
+                risk.append(f"近3日主力资金净流出约{flow_value:.1f}")
+        else:
+            missing.append("缺少近3日资金流，资金承接需要盘中继续确认")
+
+        for flag in item.get("distribution_risk_flags") or []:
+            text = str(flag).strip()
+            if text:
+                risk.append(text)
+        if risk_score not in (None, ""):
+            risk_score_value = float(risk_score or 0.0)
+            if risk_score_value > 0:
+                risk.append(f"分歧/派发风险分约{risk_score_value:.2f}，需要作为排序扣分和执行风控依据")
+            else:
+                operating.append("结构化末端风险分暂未触发明显异常，但仍需结合资金承接和换手变化验证")
+        if item.get("top3_extreme_risk_blocked"):
+            risk.append(f"触发Top3极端风险排除：{item.get('top3_extreme_risk_reason') or '原因未明'}")
+        if item.get("late_stage_momentum_flag"):
+            risk.append("存在末端分歧风险")
+
+        forecast = item.get("earnings_forecast") or {}
+        if isinstance(forecast, dict) and forecast:
+            summary = forecast.get("summary") or forecast.get("change_reason") or forecast.get("type")
+            if summary:
+                positive.append(f"业绩预告线索：{str(summary)[:120]}")
+        else:
+            missing.append("缺少可用业绩预告，基本面催化不能编造")
+
+        top_list_summary = item.get("top_list_summary")
+        limit_status = item.get("limit_status")
+        if top_list_summary:
+            positive.append(f"龙虎榜线索：{top_list_summary}")
+        if limit_status:
+            positive.append(f"涨跌停/连板线索：{limit_status}")
+
+        action = item.get("action_plan") or {}
+        for key in ("entry_zone", "take_profit", "stop_loss", "invalid_condition"):
+            value = action.get(key)
+            if value not in (None, ""):
+                operating.append(f"{key}: {value}")
+        if not operating:
+            operating.append(f"{name} 缺少明确操作位，只能给条件型观察建议")
+
+        return {
+            "positive_evidence": positive[:10],
+            "risk_and_counter_evidence": risk[:8],
+            "missing_data": list(dict.fromkeys(missing)),
+            "operating_premises": operating[:6],
+            "analysis_task": "请基于正向证据、反证和缺失数据做归纳，不要逐字段复述。",
+        }
+
+    def _build_cross_stock_synthesis(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not items:
+            return {}
+
+        def _pick_max(key: str) -> Optional[str]:
+            candidates = [item for item in items if item.get(key) not in (None, "")]
+            if not candidates:
+                return None
+            return max(candidates, key=lambda item: float(item.get(key) or 0.0)).get("ts_code")
+
+        def _pick_min(key: str) -> Optional[str]:
+            candidates = [item for item in items if item.get(key) not in (None, "")]
+            if not candidates:
+                return None
+            return min(candidates, key=lambda item: float(item.get(key) or 0.0)).get("ts_code")
+
+        return {
+            "highest_model_priority": _pick_min("model_rank"),
+            "strongest_trade_score": _pick_max("recommendation_score"),
+            "highest_overall_quality": _pick_max("overall_score"),
+            "highest_risk": _pick_max("risk_score") or _pick_max("distribution_risk_score"),
+            "lowest_risk": _pick_min("risk_score") or _pick_min("distribution_risk_score"),
+            "task": "请比较三只Top3的交易性、质量、风险和证据完整度，给出横向综合判断。",
+        }
 
     async def _generate_yesterday_review_blocks(
         self,
@@ -205,14 +396,21 @@ class IntelligentReportGenerator:
         user_prompt: str,
         system_prompt: str,
         log_label: str,
+        model: Optional[str] = None,
     ) -> Dict[str, Any]:
         report_max_tokens = max(self.settings.llm_max_tokens, SCREENING_REPORT_MIN_MAX_TOKENS)
-        logger.info("Generating %s with max_tokens=%s", log_label, report_max_tokens)
+        logger.info(
+            "Generating %s with model=%s max_tokens=%s",
+            log_label,
+            model or self.settings.llm_model,
+            report_max_tokens,
+        )
         try:
             response = await self.llm_client.complete(
                 user_prompt,
                 system_prompt=system_prompt,
                 max_tokens=report_max_tokens,
+                model=model,
             )
             return self._parse_json_response(response)
         except Exception:
@@ -320,15 +518,41 @@ class IntelligentReportGenerator:
         comparison.setdefault("best_short_term", self._pick_code(today_top3))
         comparison.setdefault("most_robust", self._pick_code(comparison_candidates, key="overall_score"))
         comparison.setdefault("highest_risk", self._pick_code(comparison_candidates, key="risk_score", reverse=True))
+        comparison.setdefault(
+            "cross_stock_synthesis_view",
+            self._build_cross_stock_synthesis_view(screening_context.get("cross_stock_synthesis") or {}, today_top3),
+        )
         comparison = self._attach_comparison_names(comparison, comparison_candidates + today_top3)
 
         overall_action = dict(payload.get("overall_action") or {})
-        overall_action.setdefault("market_view", str(market_data.get("trend") or "震荡市，保持节奏"))
-        overall_action.setdefault("risk_summary", str(market_data.get("sentiment") or "注意波动与分化风险"))
+        overall_action.setdefault("market_view", str(market_data.get("trend") or "市场概览数据不可用"))
+        overall_action.setdefault("risk_summary", str(market_data.get("sentiment") or "市场风险概览数据不可用"))
         overall_action.setdefault("action_items", ["优先围绕今日 Top3 与昨日复评对象跟踪。"])
         overall_action.setdefault("headline", "围绕系统排序做解释与执行建议")
         overall_action.setdefault("theme_focuses", overall_action.get("theme_focuses") or [])
         return merged_focus, comparison, overall_action
+
+    @staticmethod
+    def _build_cross_stock_synthesis_view(synthesis: Dict[str, Any], today_top3: List[Dict[str, Any]]) -> str:
+        if not today_top3:
+            return "暂无Top3横向比较数据。"
+        name_map = {
+            item.get("ts_code"): item.get("name") or item.get("ts_code")
+            for item in today_top3
+            if item.get("ts_code")
+        }
+
+        def _name(code: Any) -> str:
+            return str(name_map.get(code) or code or "暂无")
+
+        parts = [
+            f"模型优先级最高的是{_name(synthesis.get('highest_model_priority'))}",
+            f"交易分最强的是{_name(synthesis.get('strongest_trade_score'))}",
+            f"综合质量最高的是{_name(synthesis.get('highest_overall_quality'))}",
+            f"风险最高的是{_name(synthesis.get('highest_risk'))}",
+            f"风险最低的是{_name(synthesis.get('lowest_risk'))}",
+        ]
+        return "；".join(parts) + "。"
 
     def _merge_yesterday_review_blocks(
         self,
@@ -380,7 +604,19 @@ class IntelligentReportGenerator:
         if self._focus_analysis_needs_fallback(focus_analysis, merged["overall_assessment"]):
             focus_analysis = ""
         merged["focus_analysis"] = focus_analysis or self._build_focus_analysis_fallback(merged)
-        merged["risk_warnings"] = [self._clean_generated_text(flag) for flag in (merged.get("risk_warnings") or []) if self._clean_generated_text(flag)]
+        merged["evidence_based_view"] = self._clean_generated_text(
+            merged.get("evidence_based_view") or self._build_evidence_based_view(merged)
+        )
+        merged["counter_evidence"] = self._clean_generated_text(
+            merged.get("counter_evidence") or self._build_counter_evidence_view(merged)
+        )
+        merged["core_highlights"] = self._clean_text_list(merged.get("core_highlights") or [])
+        if not merged["core_highlights"]:
+            merged["core_highlights"] = self._build_focus_core_highlights(merged, self._build_focus_risk_note(merged))
+        merged["risk_warnings"] = self._clean_text_list(merged.get("risk_warnings") or [])
+        if not merged["risk_warnings"]:
+            risk_note = self._build_focus_risk_note(merged)
+            merged["risk_warnings"] = [risk_note] if risk_note else ["需结合盘中承接继续确认风险"]
         return merged
 
     def _merge_review_item(self, item: Dict[str, Any], context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -435,29 +671,72 @@ class IntelligentReportGenerator:
         fallback["catalyst_and_capital_view"] = self._clean_generated_text(self._build_focus_catalyst_and_capital_view(fallback))
         fallback["overall_assessment"] = self._build_focus_overall_assessment(fallback)
         fallback["focus_analysis"] = self._clean_generated_text(self._build_focus_analysis_fallback(fallback))
-        fallback["risk_warnings"] = [self._clean_generated_text(flag) for flag in (fallback.get("risk_warnings") or []) if self._clean_generated_text(flag)]
+        fallback["evidence_based_view"] = self._clean_generated_text(self._build_evidence_based_view(fallback))
+        fallback["counter_evidence"] = self._clean_generated_text(self._build_counter_evidence_view(fallback))
+        fallback["core_highlights"] = self._clean_text_list(fallback.get("core_highlights") or [])
+        fallback["risk_warnings"] = self._clean_text_list(fallback.get("risk_warnings") or [])
         return fallback
+
+    def _build_evidence_based_view(self, item: Dict[str, Any]) -> str:
+        digest = item.get("evidence_digest") or {}
+        if not isinstance(digest, dict):
+            return ""
+        positives = [str(value).strip() for value in digest.get("positive_evidence") or [] if str(value).strip()]
+        premises = [str(value).strip() for value in digest.get("operating_premises") or [] if str(value).strip()]
+        parts: List[str] = []
+        if positives:
+            parts.append("核心证据包括" + "；".join(positives[:5]) + "。")
+        if premises:
+            parts.append("操作前提是" + "；".join(premises[:3]) + "。")
+        return "".join(parts)
+
+    def _build_counter_evidence_view(self, item: Dict[str, Any]) -> str:
+        digest = item.get("evidence_digest") or {}
+        if not isinstance(digest, dict):
+            return ""
+        risks = [str(value).strip() for value in digest.get("risk_and_counter_evidence") or [] if str(value).strip()]
+        missing = [str(value).strip() for value in digest.get("missing_data") or [] if str(value).strip()]
+        parts: List[str] = []
+        if risks:
+            parts.append("主要反证/风险是" + "；".join(risks[:5]) + "。")
+        if missing:
+            parts.append("缺失信息包括" + "；".join(missing[:3]) + "。")
+        return "".join(parts)
 
     def _build_focus_risk_note(self, item: Dict[str, Any]) -> str:
         moneyflow_value = item.get("moneyflow_3d_value")
         turnover_spike_ratio = item.get("turnover_spike_ratio")
         recent_runup_5d = item.get("recent_runup_5d")
+        distribution_risk_score = item.get("distribution_risk_score")
+        distribution_risk_flags = [
+            str(flag).strip()
+            for flag in (item.get("distribution_risk_flags") or [])
+            if str(flag).strip()
+        ]
         risk_parts: List[str] = []
-        if moneyflow_value not in (None, ""):
-            moneyflow_number = float(moneyflow_value or 0.0)
-            if moneyflow_number > 0:
-                risk_parts.append(f"近3日资金净流入为正({moneyflow_number:.0f})")
-            else:
-                risk_parts.append(f"近3日资金未转正({moneyflow_number:.0f})")
+        if distribution_risk_flags:
+            risk_parts.extend(distribution_risk_flags[:2])
+        if distribution_risk_score not in (None, ""):
+            risk_score = float(distribution_risk_score or 0.0)
+            if risk_score >= 6:
+                risk_parts.append(f"分歧/派发风险偏高({risk_score:.1f})")
+            elif risk_score >= 3:
+                risk_parts.append(f"分歧/派发风险中等({risk_score:.1f})")
         if turnover_spike_ratio not in (None, ""):
             turnover_ratio_value = float(turnover_spike_ratio or 0.0)
             if turnover_ratio_value >= 1.05:
                 risk_parts.append(f"换手较近5日均值放大{turnover_ratio_value:.2f}倍")
         if recent_runup_5d not in (None, ""):
-            risk_parts.append(f"近5日累计涨幅{float(recent_runup_5d or 0.0):.1f}%")
+            runup = float(recent_runup_5d or 0.0)
+            if runup >= 8:
+                risk_parts.append(f"近5日累计涨幅{runup:.1f}%，追高容错率下降")
+            elif runup <= -6:
+                risk_parts.append(f"近5日累计回撤{runup:.1f}%，仍需确认修复质量")
         if item.get("late_stage_momentum_flag"):
             risk_parts.append("存在末端分歧风险")
-        return "；".join(risk_parts) if risk_parts else "资金与换手风险暂未见明显异常"
+        if moneyflow_value not in (None, "") and float(moneyflow_value or 0.0) < 0:
+            risk_parts.append(f"近3日资金净流出({float(moneyflow_value or 0.0):.0f})，承接不足")
+        return "；".join(risk_parts) if risk_parts else "暂未触发明显末端风险，但仍需看资金承接能否延续"
 
     def _build_focus_core_highlights(self, item: Dict[str, Any], funds_text: str) -> List[str]:
         highlights: List[str] = []
@@ -664,15 +943,55 @@ class IntelligentReportGenerator:
         if not text:
             return ""
         text = self._sanitize_structured_field_leaks(text)
+        if self._contains_internal_report_text(text):
+            return ""
         for raw, label in TECHNICAL_SIGNAL_LABELS.items():
             text = text.replace(raw, label)
             text = text.replace(raw.upper(), label)
             text = text.replace(raw.capitalize(), label)
         return " ".join(text.split())
 
+    def _clean_text_list(self, values: List[Any]) -> List[str]:
+        cleaned_values: List[str] = []
+        seen = set()
+        for value in values:
+            cleaned = self._clean_generated_text(value)
+            if not cleaned or cleaned in seen:
+                continue
+            if self._is_low_signal_user_text(cleaned):
+                continue
+            seen.add(cleaned)
+            cleaned_values.append(cleaned)
+        return cleaned_values
+
+    @staticmethod
+    def _contains_internal_report_text(text: str) -> bool:
+        return any(marker.lower() in str(text or "").lower() for marker in INTERNAL_REPORT_TEXT_MARKERS)
+
+    @staticmethod
+    def _is_low_signal_user_text(text: str) -> bool:
+        compact = str(text or "").replace(" ", "")
+        if not compact:
+            return True
+        if re.fullmatch(r"(风险分|risk_score|distribution_risk_score)(为|=)?0(?:\.0+)?", compact, flags=re.IGNORECASE):
+            return True
+        return compact in {"风险分为0.0", "风险分为0", "风险分0.0", "风险分0"}
+
     @staticmethod
     def _sanitize_structured_field_leaks(text: str) -> str:
         cleaned = text
+        cleaned = re.sub(
+            r"[，,；;。]?\s*(?:风险分|risk_score|distribution_risk_score)\s*(?:为|=)?\s*0(?:\.0+)?\s*",
+            "，",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"(?:风险分|risk_score|distribution_risk_score)\s*(?:为|=)?\s*([-+]?[1-9]\d*(?:\.\d+)?)",
+            r"分歧/派发风险分约\1",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
         cleaned = re.sub(
             r"[（(]\s*[a-z_]{3,}\s+(?:true|false|null|none|\"[^\"]*\"|'[^']*'|[-+]?\d+(?:\.\d+)?)\s*[)）]",
             "",
@@ -698,6 +1017,8 @@ class IntelligentReportGenerator:
             flags=re.IGNORECASE,
         )
         cleaned = re.sub(r"\s+[，。；：]\s*", lambda m: m.group(0).strip(), cleaned)
+        cleaned = re.sub(r"[，,；;]{2,}", "，", cleaned)
+        cleaned = re.sub(r"，[。；]", "。", cleaned)
         cleaned = re.sub(r"[（(]\s*[)）]", "", cleaned)
         return cleaned.strip(" ，；。")
 
@@ -896,7 +1217,10 @@ class IntelligentReportGenerator:
             parts.append("，".join(support_parts[:2]) + "。")
 
         if risk_note:
-            parts.append(f"真正需要提防的不是普通波动，而是{risk_note}。")
+            if "暂未触发明显末端风险" in risk_note:
+                parts.append(f"风险侧看，{risk_note}，不能把低风险分简单理解成没有波动风险。")
+            else:
+                parts.append(f"真正需要提防的不是普通波动，而是{risk_note}。")
         if contradiction_penalty > 0:
             parts.append("这类票当前更像有交易性、但执行难度也更高的机会，适合先看分歧是否收敛，再决定是否提高参与度。")
         parts.append(f"综合来看，{overall_assessment}。")
@@ -938,9 +1262,11 @@ class IntelligentReportGenerator:
         cleaned_text = self._clean_generated_text(text)
         if not cleaned_text:
             return True
+        if self._contains_internal_report_text(cleaned_text):
+            return True
         if self._looks_like_score_template_text(cleaned_text):
             return True
-        if len(cleaned_text) < 80:
+        if len(cleaned_text) < 180:
             return True
         cleaned_assessment = self._clean_generated_text(overall_assessment)
         if cleaned_assessment and cleaned_text == cleaned_assessment:
@@ -1095,8 +1421,8 @@ class IntelligentReportGenerator:
         comparison = self._attach_comparison_names(comparison, comparison_candidates + today_top3)
         overall_action = {
             "headline": "结构化报告暂使用本地回退结果",
-            "market_view": str(market_data.get("trend") or "震荡市，优先控制节奏"),
-            "risk_summary": str(market_data.get("sentiment") or "关注分化与承接风险"),
+            "market_view": str(market_data.get("trend") or "市场概览数据不可用"),
+            "risk_summary": str(market_data.get("sentiment") or "市场风险概览数据不可用"),
             "action_items": ["优先跟踪今日 Top3，昨日对象重点看是否延续。"],
         }
         theme_focus_items = self._build_theme_focus_items(news_clusters, overall_action)
@@ -1160,6 +1486,7 @@ class IntelligentReportGenerator:
                 f"最适合短线：{comparison.get('best_short_term') or '暂无'}",
                 f"最稳健：{comparison.get('most_robust') or '暂无'}",
                 f"风险最高：{comparison.get('highest_risk') or '暂无'}",
+                f"横向综合：{comparison.get('cross_stock_synthesis_view') or '暂无'}",
             ]
         )
 
@@ -1313,8 +1640,8 @@ class IntelligentReportGenerator:
         return {
             "theme": "市场总线",
             "tier": "总览",
-            "summary": str(overall_action.get("market_view") or market_data.get("trend") or "今日以结构性轮动观察为主。"),
-            "continuity_view": "、".join(top_themes) if top_themes else str(market_data.get("sentiment") or overall_action.get("risk_summary") or "关注情绪与风格切换。"),
+            "summary": str(overall_action.get("market_view") or market_data.get("trend") or "市场概览数据不可用"),
+            "continuity_view": "、".join(top_themes) if top_themes else str(market_data.get("sentiment") or overall_action.get("risk_summary") or "市场风险概览数据不可用"),
             "related_stocks": related_stocks[:5],
         }
 
@@ -1322,8 +1649,8 @@ class IntelligentReportGenerator:
         return {
             "theme": "风险扰动",
             "tier": "风险",
-            "summary": str(overall_action.get("risk_summary") or market_data.get("sentiment") or "当前暂无突出的主题级风险扰动，仍需关注盘面分化与承接。"),
-            "continuity_view": "若核心主线承接走弱或高位分歧扩大，应及时下修仓位与预期。",
+            "summary": str(overall_action.get("risk_summary") or market_data.get("sentiment") or "市场风险概览数据不可用"),
+            "continuity_view": "市场风险数据不可用时，仅基于个股与主题输入做保守跟踪。",
             "related_stocks": [],
         }
 

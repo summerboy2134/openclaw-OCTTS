@@ -16,3 +16,37 @@ memory/
 *.db
 .vscode/
 .idea/
+
+# 敏感数据和模型文件
+.env
+.env.*
+!.env.example
+Private/
+data/
+tmp/
+*.pth
+*.pt
+*.bin
+*.h5
+*.pkl
+*.pickle
+
+# 训练数据和特征构建
+*_training_dataset*.csv
+*_features*.txt
+*_selected_features*.txt
+*_feature_engineering*.py
+short_term_feature_engineering.py
+short_term_training_data.py
+raw_market_training_dataset.py
+
+# 测试结果和评估文件
+*_eval.json
+*_result*.json
+*_distribution.json
+*_experiment*.json
+*_backtest*.json
+*_compare*.json
+
+# Conda环境
+.conda/
