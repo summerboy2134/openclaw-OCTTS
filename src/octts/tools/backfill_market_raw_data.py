@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import time
 from datetime import date, datetime
-from typing import Any, Iterable, List, Sequence
+from typing import Any, Iterable, List, Optional, Sequence
 
 from octts.config import get_settings
 from octts.models.screening_models import DatabaseManager, MarketAdjFactor, MarketDaily, MarketDailyBasic, MarketStockBasic
@@ -287,12 +287,12 @@ def _upsert_market_stock_basic(db: DatabaseManager, rows: Iterable[dict[str, Any
         session.close()
 
 
-def _clean_text(value: Any) -> str | None:
+def _clean_text(value: Any) -> Optional[str]:
     text = str(value or "").strip()
     return text or None
 
 
-def _parse_optional_yyyymmdd(value: Any) -> date | None:
+def _parse_optional_yyyymmdd(value: Any) -> Optional[date]:
     text = str(value or "").strip()
     if not text:
         return None

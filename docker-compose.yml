@@ -19,13 +19,14 @@ services:
     env_file:
       - .env
     environment:
-      REDIS_URL: redis://redis:6379/0
-      OCTTS_MEMORY_BACKEND: redis
-      OCTTS_HISTORY_DIR_PATH: /app/memory/history
-      OCTTS_DATABASE_URL: sqlite:////app/memory/octts_screening.db
-      PIP_EXTRA_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
+      - REDIS_URL=redis://redis:6379/0
+      - OCTTS_MEMORY_BACKEND=redis
+      - OCTTS_HISTORY_DIR_PATH=/app/memory/history
+      - OCTTS_DATABASE_URL=sqlite:////app/memory/octts_screening.db
+      - PIP_EXTRA_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+      - TZ=Asia/Shanghai
     ports:
-      - "8000:8000"
+      - "3003:8000"
     volumes:
       - ./memory:/app/memory
 

@@ -275,6 +275,75 @@ class MarketRawDataRepository:
         finally:
             session.close()
 
+    def get_market_daily_summary(self, *, trade_date: str) -> Dict[str, Any]:
+        """获取市场日线汇总统计：涨跌家数、平均涨跌幅、成交额等。"""
+        trade_date_value = self._parse_date(trade_date)
+        session = self._db.get_session()
+        try:
+            rows = session.query(MarketDaily).filter(MarketDaily.trade_date == trade_date_value).all()
+            if not rows:
+                return {"pct_count": 0, "rise_count": 0, "fall_count": 0, "flat_count": 0}
+            rise_count = 0
+            fall_count = 0
+            flat_count = 0
+            total_pct_chg = 0.0
+            total_amount = 0.0
+            limit_up_estimate = 0
+            limit_down_estimate = 0
+            for row in rows:
+                pct_chg = float(row.pct_chg or 0.0)
+                if pct_chg > 0.05:
+                    rise_count += 1
+                elif pct_chg < -0.05:
+                    fall_count += 1
+                else:
+                    flat_count += 1
+                total_pct_chg += pct_chg
+                total_amount += float(row.amount or 0.0)
+                if pct_chg >= 9.8:
+                    limit_up_estimate += 1
+                elif pct_chg <= -9.8:
+                    limit_down_estimate += 1
+            pct_count = len(rows)
+            avg_pct_chg = total_pct_chg / pct_count if pct_count else 0.0
+            return {
+                "trade_date": trade_date,
+                "pct_count": pct_count,
+                "rise_count": rise_count,
+                "fall_count": fall_count,
+                "flat_count": flat_count,
+                "avg_pct_chg": round(avg_pct_chg, 4),
+                "total_amount": round(total_amount, 2),
+                "limit_up_estimate": limit_up_estimate,
+                "limit_down_estimate": limit_down_estimate,
+            }
+        finally:
+            session.close()
+
+    def get_market_limit_summary(self, *, trade_date: str) -> Dict[str, Any]:
+        """获取涨跌停汇总统计。"""
+        trade_date_value = self._parse_date(trade_date)
+        session = self._db.get_session()
+        try:
+            limit_up_rows = (
+                session.query(MarketLimitListDaily)
+                .filter(MarketLimitListDaily.trade_date == trade_date_value, MarketLimitListDaily.limit == "U")
+                .all()
+            )
+            limit_down_rows = (
+                session.query(MarketLimitListDaily)
+                .filter(MarketLimitListDaily.trade_date == trade_date_value, MarketLimitListDaily.limit == "D")
+                .all()
+            )
+            return {
+                "trade_date": trade_date,
+                "limit_up": len(limit_up_rows),
+                "limit_down": len(limit_down_rows),
+                "total_count": len(limit_up_rows) + len(limit_down_rows),
+            }
+        finally:
+            session.close()
+
     def count_rows_for_trade_date(self, *, model, trade_date: str) -> int:
         trade_date_value = self._parse_date(trade_date)
         session = self._db.get_session()

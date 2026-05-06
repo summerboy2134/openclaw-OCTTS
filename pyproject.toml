@@ -14,6 +14,7 @@ dependencies = [
   "fastapi>=0.100.0",
   "httpx",
   "json-repair>=0.29.0",
+  "lightgbm",
   "numpy",
   "openai>=1.0.0",
   "pandas",
