@@ -358,6 +358,54 @@ class TushareClient:
             return []
         return df.to_dict(orient="records")
 
+    def fetch_top_list(self, ts_code: str, *, trade_date: Optional[str]) -> List[Dict[str, Any]]:
+        """Fetch Dragon Tiger list rows for one stock on one trade date."""
+        normalized_trade_date = _normalize_trade_date_value(trade_date)
+        if not normalized_trade_date:
+            return []
+        try:
+            local_map = self._raw_data_repo.get_top_list_by_trade_date(
+                ts_codes=[ts_code],
+                trade_date=normalized_trade_date,
+            )
+        except Exception:
+            local_map = {}
+        local_rows = list(local_map.get(ts_code) or [])
+        if local_rows:
+            return local_rows
+        try:
+            df = self._pro.top_list(trade_date=normalized_trade_date)
+        except Exception:
+            return []
+        rows = [] if df is None or getattr(df, "empty", True) else df.to_dict(orient="records")
+        return [row for row in rows if str(row.get("ts_code") or "").strip().upper() == ts_code.strip().upper()]
+
+    def fetch_limit_list(self, ts_code: str, *, trade_date: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Fetch limit-up/down event row for one stock on one trade date."""
+        normalized_trade_date = _normalize_trade_date_value(trade_date)
+        if not normalized_trade_date:
+            return None
+        try:
+            local_map = self._raw_data_repo.get_limit_list_by_trade_date(
+                ts_codes=[ts_code],
+                trade_date=normalized_trade_date,
+            )
+        except Exception:
+            local_map = {}
+        local_row = local_map.get(ts_code)
+        if local_row:
+            return local_row
+        try:
+            df = self._pro.limit_list_d(trade_date=normalized_trade_date)
+        except Exception:
+            return None
+        rows = [] if df is None or getattr(df, "empty", True) else df.to_dict(orient="records")
+        normalized_code = ts_code.strip().upper()
+        for row in rows:
+            if str(row.get("ts_code") or "").strip().upper() == normalized_code:
+                return row
+        return None
+
     def fetch_company_profile(self, ts_code: str) -> Dict[str, Any]:
         """Fetch company profile for business summary generation."""
         try:

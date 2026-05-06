@@ -67,11 +67,11 @@ def _format_trade_date_label(value: Any) -> str:
     return escape(text)
 
 
-def _format_metric_value(value: Any, *, percent: bool = False) -> str:
+def _format_metric_value(value: Any, *, percent: bool = False, percent_decimals: int = 1) -> str:
     if value is None or value == "":
         return "--"
     if percent:
-        return f"{_safe_float(value, 0.0) * 100:.1f}%"
+        return f"{_safe_float(value, 0.0) * 100:.{percent_decimals}f}%"
     return escape(_safe_text(value, "--"))
 
 
@@ -119,6 +119,9 @@ def _looks_like_score_template_text(text: Any) -> bool:
         "推荐分较昨日",
         "当前排序主要由推荐分",
         "命中策略数为",
+        "回补样本",
+        "训练集构造",
+        "结构化特征近似",
     )
     return any(marker in content for marker in markers)
 
@@ -630,9 +633,7 @@ def _render_theme_item_card(item: Dict[str, Any], *, fallback_title: str = "未�
     related_stocks = "、".join(item.get("related_stocks") or item.get("key_stocks") or []) or "暂无"
     action_view = escape(_build_theme_action_view(item))
     news_briefs = item.get("news_briefs") or []
-    news_brief_text = "<br>".join(escape(_safe_text(brief)) for brief in news_briefs[:3] if _safe_text(brief))
-    if not news_brief_text:
-        news_brief_text = "暂无相关新闻摘要"
+    news_brief_text = _render_news_briefs_html(news_briefs)
     return f"""
     <div class="news-cluster-card">
         <div class="news-cluster-head">
@@ -645,6 +646,16 @@ def _render_theme_item_card(item: Dict[str, Any], *, fallback_title: str = "未�
         <div class="news-cluster-meta"><strong>关联个股：</strong>{escape(related_stocks)}</div>
     </div>
     """
+
+
+def _render_news_briefs_html(news_briefs: List[Any]) -> str:
+    items = [escape(_safe_text(brief)) for brief in news_briefs[:3] if _safe_text(brief)]
+    if not items:
+        return '<div class="news-brief-empty">暂无相关新闻摘要</div>'
+    return '<div class="news-brief-list">' + ''.join(
+        f'<div class="news-brief-item"><span class="news-brief-index">{index}.</span><span>{text}</span></div>'
+        for index, text in enumerate(items, start=1)
+    ) + '</div>'
 
 
 def _build_theme_action_view(item: Dict[str, Any]) -> str:
@@ -782,8 +793,8 @@ def _render_focus_stock_block(items: List[Dict[str, Any]]) -> str:
 
 def _render_review_block(items: List[Dict[str, Any]]) -> str:
     if not items:
-        return '<div class="report-section"><div class="report-title">昨日 Top3 今日复盘</div><div class="report-content">暂无数据</div></div>'
-    html = '<div class="report-section"><div class="report-title">昨日 Top3 今日复盘</div>'
+        return '<div class="report-section"><div class="report-title">3日前 Top3 持仓复盘</div><div class="report-content">暂无数据</div></div>'
+    html = '<div class="report-section"><div class="report-title">3日前 Top3 持仓复盘</div>'
     for item in items:
         miss_reason_candidates = item.get('miss_reason_candidates') or []
         missing_factor_candidates = item.get('missing_factor_candidates') or []
@@ -808,8 +819,9 @@ def _render_review_block(items: List[Dict[str, Any]]) -> str:
         <div class="stock-item">
             <div class="stock-header"><div><span class="stock-code">{escape(_safe_text(item.get('ts_code')))}</span><span class="stock-name">{escape(_safe_text(item.get('name'), _safe_text(item.get('ts_code'))))}</span></div><span class="tag">{escape(_safe_text(item.get('status', item.get('today_verdict')), '观察'))}</span></div>
             <div class="detail-grid" style="margin-top:12px;">
-                <div class="detail-panel"><div class="detail-label">昨日结论</div><div class="detail-value">{escape(_safe_text(item.get('yesterday_conclusion'), '暂无'))}</div></div>
+                <div class="detail-panel"><div class="detail-label">3日前结论</div><div class="detail-value">{escape(_safe_text(item.get('yesterday_conclusion'), '暂无'))}</div></div>
                 <div class="detail-panel"><div class="detail-label">今日判断</div><div class="detail-value">{escape(_safe_text(item.get('today_verdict', item.get('status')), '暂无'))}</div></div>
+                <div class="detail-panel"><div class="detail-label">3日收益</div><div class="detail-value">{escape(_safe_text(item.get('review_return_pct'), '--'))}%</div></div>
                 <div class="detail-panel"><div class="detail-label">状态</div><div class="detail-value">{escape(_safe_text(item.get('status', '观察')))}</div></div>
             </div>
             <div class="report-content"><strong>复盘说明：</strong><br>{escape(review_analysis)}</div>
@@ -980,13 +992,6 @@ def render_intelligent_screening_dashboard(
         ]
     continuations = _merge_card_items(continuation_sources, report_blocks.get("yesterday_reviews") or [])
 
-    strategy_count = screening_results.get("strategy_count")
-    if strategy_count is None:
-        strategy_count = recommendation_methodology.get("strategy_count")
-    strategy_note = ""
-    if screening_results.get("strategy_count") is None:
-        strategy_note = "暂无本次运行快照，回退展示当前启用策略数"
-
     total_stocks = screening_results.get("total_stocks")
     total_stocks_value = _format_metric_value(total_stocks) if total_stocks is not None else "暂无本次运行数据"
     total_stocks_note = "本次所有策略命中的股票条目总数"
@@ -994,12 +999,37 @@ def render_intelligent_screening_dashboard(
         total_stocks_note = "未找到本次运行快照，因此不显示误导性的 0"
 
     win_rate_value = "--"
-    tracked_count = stats.get("window_count")
+    tracked_count = stats.get("validated_count")
+    if tracked_count in (None, ""):
+        tracked_count = stats.get("window_count")
+    win_rate_3d_value = "--"
+    validated_count_3d = stats.get("validated_count_3d")
+    if validated_count_3d in (None, ""):
+        validated_count_3d = tracked_count
+    win_rate_3d_note = "3日胜率为历史已验证推荐样本中 3 日收益为正的占比"
+    if stats.get("win_rate_3d") is not None and validated_count_3d:
+        win_rate_3d_value = _format_metric_value(stats.get("win_rate_3d"), percent=True)
+    else:
+        win_rate_3d_note = "仅在开启数据库且存在已验证样本时展示"
     win_rate_note = "5日胜率为历史已验证推荐样本中 5 日收益为正的占比"
     if stats.get("win_rate_5d") is not None and tracked_count:
         win_rate_value = _format_metric_value(stats.get("win_rate_5d"), percent=True)
     else:
         win_rate_note = "仅在开启数据库且存在已验证样本时展示"
+    average_return_5d = "--"
+    if stats.get("average_return_5d") is not None and tracked_count:
+        average_return_5d = _format_metric_value(
+            stats.get("average_return_5d"),
+            percent=True,
+            percent_decimals=2,
+        )
+    average_return_3d = "--"
+    if stats.get("average_return_3d") is not None and tracked_count:
+        average_return_3d = _format_metric_value(
+            stats.get("average_return_3d"),
+            percent=True,
+            percent_decimals=2,
+        )
 
     tab_labels = {
         "overview": "总览",
@@ -1032,19 +1062,18 @@ def render_intelligent_screening_dashboard(
 
       <section class="panel">
         <div class="section-title">历史统计摘要</div>
+        <div class="subtle" style="margin-bottom:12px;">仅回看历史今日 Top3 已验证样本的 3 日、5 日表现，用于辅助判断近期节奏。</div>
         <div class="metrics-grid">
           <div class="metric-card"><div class="mini-label">已验证样本数</div><div class="summary-value">{escape(_safe_text(tracked_count, '--'))}</div></div>
-          <div class="metric-card"><div class="mini-label">平均 5 日收益</div><div class="summary-value">{escape(_safe_text(stats.get('average_return_5d'), '--'))}</div></div>
+          <div class="metric-card"><div class="mini-label">平均 3 日收益</div><div class="summary-value">{escape(_safe_text(average_return_3d, '--'))}</div></div>
+          <div class="metric-card"><div class="mini-label">平均 5 日收益</div><div class="summary-value">{escape(_safe_text(average_return_5d, '--'))}</div></div>
           <div class="metric-card"><div class="mini-label">新闻主题数</div><div class="summary-value">{escape(_safe_text(len(news_clusters), '0'))}</div></div>
         </div>
       </section>
 
       <section class="panel">
         <div class="section-title">方法说明</div>
-        <div class="subtle" style="margin-bottom:12px;">当前启用策略数：{escape(_safe_text(recommendation_methodology.get('strategy_count'), '--'))}</div>
-        <div class="report-content" style="margin-bottom:12px;"><strong>当前启用策略</strong></div>
-        {_build_enabled_strategies_list(recommendation_methodology)}
-        <div class="report-content" style="margin:14px 0 12px 0;"><strong>筛选、评分与跟踪口径</strong></div>
+        <div class="subtle" style="margin-bottom:12px;">简要说明候选生成、排序约束、历史跟踪与 AI 分析补充的基本口径。</div>
         {_build_methodology_list(recommendation_methodology)}
       </section>
     """
@@ -1178,6 +1207,10 @@ def render_intelligent_screening_dashboard(
     .news-cluster-head {{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap; }}
     .news-cluster-title {{ font-size:16px; font-weight:800; color: var(--text-strong); }}
     .news-cluster-meta {{ margin-top:10px; color: var(--text-soft); line-height:1.75; }}
+    .news-brief-list {{ display:grid; gap:8px; margin-top:8px; }}
+    .news-brief-item {{ display:grid; grid-template-columns: 22px minmax(0, 1fr); gap:8px; align-items:flex-start; padding:8px 10px; background: rgba(255,255,255,0.72); border:1px solid rgba(210, 186, 154, 0.22); border-radius:10px; }}
+    .news-brief-index {{ font-weight:700; color: var(--accent); }}
+    .news-brief-empty {{ margin-top:8px; color: var(--muted); }}
     @media (max-width: 960px) {{ .hero {{ flex-direction:column; padding: 20px; }} .top-grid {{ grid-template-columns: 1fr; }} .analysis-grid {{ grid-template-columns: 1fr; }} .detail-grid {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
@@ -1206,9 +1239,9 @@ def render_intelligent_screening_dashboard(
     </section>
 
     <section class="summary-grid">
-      {_render_summary_card('策略数', _format_metric_value(strategy_count), strategy_note)}
       {_render_summary_card('筛选总数', total_stocks_value, total_stocks_note)}
       {_render_summary_card('前台推荐', _format_metric_value(screening_results.get('final_recommendations', len(frontlist))), '当前前台推荐池可见条目数')}
+      {_render_summary_card('3日胜率', win_rate_3d_value, win_rate_3d_note)}
       {_render_summary_card('5日胜率', win_rate_value, win_rate_note)}
     </section>
 
@@ -1219,7 +1252,7 @@ def render_intelligent_screening_dashboard(
     <section class="stack">
       <section class="panel" style="margin-bottom:18px;">
         <div class="section-title">运行状态与口径说明</div>
-        <div class="subtle">5日胜率不是今日筛选的实时胜率，而是历史推荐样本的回看统计。若未开启数据库或暂无已验证样本，则显示 --。</div>
+        <div class="subtle">3日胜率和5日胜率都不是今日筛选的实时胜率，而是历史今日 Top3 样本的回看统计。若未开启数据库或暂无已验证样本，则显示 --。</div>
       </section>
       {overview_sections if active_tab == 'overview' else ''}
       {report_section if active_tab == 'report' else ''}
@@ -1309,6 +1342,47 @@ def render_intelligent_screening_dashboard(
           statusEl.textContent = error.message || "任务状态同步失败";
         }}
       }}
+    }}
+
+    async function triggerIntelligentScreening() {{
+      if (buttonEl) {{
+        buttonEl.disabled = true;
+      }}
+      if (statusEl) {{
+        statusEl.textContent = "正在启动智能选股...";
+      }}
+      try {{
+        const response = await fetch(jobsApiBase, {{
+          method: "POST"
+        }});
+        const payload = await response.json();
+        if (!response.ok) {{
+          throw new Error(payload.detail || "启动智能选股失败");
+        }}
+        if (statusEl) {{
+          statusEl.textContent = "智能选股已启动，正在刷新状态...";
+        }}
+        const jobId = payload.job_id || payload.job?.job_id;
+        if (jobId) {{
+          window.sessionStorage.setItem("octts:intelligent-screening:pending-job-id", jobId);
+          window.location.href = `/intelligent-screening?job_id=${{encodeURIComponent(jobId)}}`;
+          return;
+        }}
+        await syncJobState();
+      }} catch (error) {{
+        if (statusEl) {{
+          statusEl.textContent = `启动失败：${{error.message || "未知错误"}}`;
+        }}
+        if (buttonEl) {{
+          buttonEl.disabled = false;
+        }}
+      }}
+    }}
+
+    if (buttonEl) {{
+      buttonEl.addEventListener("click", () => {{
+        triggerIntelligentScreening();
+      }});
     }}
 
     syncJobState();

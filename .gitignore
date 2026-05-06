@@ -35,10 +35,6 @@ tmp/
 *_training_dataset*.csv
 *_features*.txt
 *_selected_features*.txt
-*_feature_engineering*.py
-short_term_feature_engineering.py
-short_term_training_data.py
-raw_market_training_dataset.py
 
 # 测试结果和评估文件
 *_eval.json

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
 UTC = timezone.utc
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
+
+import pandas as pd
 
 from octts.clients.llm_client import LLMClient
 from octts.clients.tushare_client import TushareClient
 from octts.clients.wecom_client import WeComClient
 from octts.config import Settings
+from octts.indicators.technical import build_technical_snapshot
 from octts.prompts.report_prompt import build_report_prompt
 from octts.schemas.report import (
     AnalysisRequest,
@@ -27,6 +31,8 @@ from octts.services.history_store import FileHistoryStore, build_initial_validat
 from octts.services.memory_store import MemoryStore
 from octts.services.position_store import FilePositionStore
 from octts.services.daily_analysis_context import DailyAnalysisScreeningContextProvider
+
+logger = logging.getLogger(__name__)
 
 TREND_BIAS_LABELS = {
     "bullish": "看多",
@@ -127,7 +133,7 @@ class AnalysisPipeline:
                 previous_memory = previous_record.report.memory if previous_record else None
                 market_context = _build_market_context(snapshot)
                 previous_trading_snapshot = market_context.get("previous_daily_bar")
-                screening_context = self._build_screening_context(ts_code)
+                screening_context = self._build_screening_context(ts_code, snapshot=snapshot)
                 system_prompt, user_prompt, report = self.generate_report_from_snapshot(
                     phase=request.phase,
                     snapshot=snapshot,
@@ -232,17 +238,142 @@ class AnalysisPipeline:
         )
         return system_prompt, user_prompt, report
 
-    def _build_screening_context(self, ts_code: str) -> Optional[dict[str, object]]:
-        if self._screening_context_provider is None:
+    def _build_screening_context(
+        self,
+        ts_code: str,
+        *,
+        snapshot: Optional[PriceSnapshot] = None,
+    ) -> Optional[dict[str, object]]:
+        context: Optional[dict[str, object]] = None
+        if self._screening_context_provider is not None:
+            try:
+                context = self._screening_context_provider.build_for_symbol(ts_code)
+            except Exception:
+                context = {
+                    "data_available": False,
+                    "message": "智能选股上下文读取失败；本次仅基于个股行情、财务和历史观点分析。",
+                }
+        if snapshot is None:
+            return context or None
+        return self._augment_symbol_context(ts_code=ts_code, snapshot=snapshot, context=context)
+
+    def _augment_symbol_context(
+        self,
+        *,
+        ts_code: str,
+        snapshot: PriceSnapshot,
+        context: Optional[dict[str, object]],
+    ) -> Optional[dict[str, object]]:
+        enriched_context: Dict[str, Any] = dict(context or {})
+        normalized_code = ts_code.strip().upper()
+        existing_stock_context = enriched_context.get("stock_context")
+        symbol_in_latest_pool = isinstance(existing_stock_context, dict) and bool(existing_stock_context)
+        standalone_context = self._build_standalone_stock_context(ts_code=normalized_code, snapshot=snapshot)
+        if not enriched_context and not standalone_context:
             return None
-        try:
-            context = self._screening_context_provider.build_for_symbol(ts_code)
-        except Exception:
-            return {
-                "data_available": False,
-                "message": "智能选股上下文读取失败；本次仅基于个股行情、财务和历史观点分析。",
-            }
-        return context or None
+        enriched_context.setdefault("ts_code", normalized_code)
+        enriched_context["symbol_in_latest_pool"] = symbol_in_latest_pool
+        if standalone_context:
+            enriched_context["standalone_stock_context"] = standalone_context
+            if not symbol_in_latest_pool:
+                standalone_stock_context = dict(standalone_context.get("stock_context") or {})
+                if standalone_stock_context:
+                    enriched_context["stock_context"] = standalone_stock_context
+                    enriched_context["latest_pool_state"] = standalone_stock_context
+                    enriched_context["message"] = (
+                        "该股未出现在最新智能选股池中，已补充单股实时增强分析上下文。"
+                    )
+            enriched_context["data_available"] = True
+        return enriched_context or None
+
+    def _build_standalone_stock_context(
+        self,
+        *,
+        ts_code: str,
+        snapshot: PriceSnapshot,
+    ) -> Optional[Dict[str, Any]]:
+        technical_snapshot = _build_snapshot_technical_context(snapshot)
+        moneyflow_context = _build_moneyflow_context(
+            rows=self._tushare_client.fetch_moneyflow(ts_code, trade_date=snapshot.trade_date),
+            fallback_summary=snapshot.moneyflow_summary,
+        )
+        top_list_rows = self._tushare_client.fetch_top_list(ts_code, trade_date=snapshot.trade_date)
+        limit_list_row = self._tushare_client.fetch_limit_list(ts_code, trade_date=snapshot.trade_date)
+        company_profile = self._tushare_client.fetch_company_profile(ts_code)
+        earnings_forecast_rows = self._tushare_client.fetch_earnings_forecast(ts_code)
+        stock_info = self._tushare_client.fetch_stock_info(ts_code)
+
+        business_summary = _build_business_summary(company_profile=company_profile, stock_info=stock_info)
+        top_list_summary = _summarize_top_list_rows(top_list_rows)
+        limit_status = _summarize_limit_list_row(limit_list_row)
+        earnings_forecast_summary = _summarize_earnings_forecast(earnings_forecast_rows)
+
+        stock_context: Dict[str, Any] = {
+            "ts_code": ts_code,
+            "name": snapshot.name or stock_info.get("name"),
+            "trade_date": snapshot.trade_date,
+            "source_tag": "单股增强分析",
+            "tracking_status": "standalone",
+            "today_present": False,
+            "absence_reason": "not_in_latest_screening_pool",
+            "close": _safe_float(snapshot.close),
+            "pct_change": _safe_float(snapshot.pct_chg),
+            "turnover_rate": _safe_float(snapshot.turnover_rate),
+            "volume_ratio": _safe_float(snapshot.vol_ratio),
+            "industry": stock_info.get("industry"),
+            "recommendation_score": technical_snapshot.get("recommendation_score"),
+            "overall_score": technical_snapshot.get("setup_quality_score"),
+            "priority_score": technical_snapshot.get("setup_quality_score"),
+            "risk_score": technical_snapshot.get("risk_score"),
+            "risk_level": technical_snapshot.get("risk_level"),
+            "risk_flags": list(technical_snapshot.get("risk_flags") or []),
+            "ma20": technical_snapshot.get("ma20"),
+            "moneyflow_3d_value": moneyflow_context.get("recent_3d_net_inflow"),
+            "recent_large_order_net_inflow": moneyflow_context.get("recent_large_order_net_inflow"),
+            "recent_super_large_order_net_inflow": moneyflow_context.get("recent_super_large_order_net_inflow"),
+            "top_list_summary": top_list_summary,
+            "limit_status": limit_status,
+            "business_summary": business_summary,
+            "earnings_forecast_summary": earnings_forecast_summary,
+            "standalone_score_context": True,
+            "standalone_context_source": "tushare_single_stock",
+        }
+        stock_context = _drop_empty_values(stock_context)
+
+        standalone_context: Dict[str, Any] = {
+            "context_source": "tushare_single_stock",
+            "symbol_in_latest_pool": False,
+            "stock_context": stock_context,
+            "technical_snapshot": technical_snapshot,
+            "moneyflow_context": moneyflow_context,
+            "market_event_context": _drop_empty_values(
+                {
+                    "top_list": top_list_rows,
+                    "top_list_summary": top_list_summary,
+                    "limit_list": limit_list_row,
+                    "limit_status": limit_status,
+                }
+            ),
+            "company_profile": _drop_empty_values(
+                {
+                    "industry": stock_info.get("industry"),
+                    "market": stock_info.get("market"),
+                    "area": stock_info.get("area"),
+                    "list_date": stock_info.get("list_date"),
+                    "business_summary": business_summary,
+                    "employees": company_profile.get("employees"),
+                    "website": company_profile.get("website"),
+                }
+            ),
+            "earnings_context": _drop_empty_values(
+                {
+                    "earnings_forecast_summary": earnings_forecast_summary,
+                    "earnings_forecast": earnings_forecast_rows[:2],
+                }
+            ),
+        }
+        return _drop_empty_values(standalone_context) or None
+
 
 
 def format_reports_as_markdown(reports: list[StructuredAnalysis]) -> str:
@@ -434,3 +565,159 @@ def _safe_float(value: object) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _build_snapshot_technical_context(snapshot: PriceSnapshot) -> Dict[str, Any]:
+    bars = _normalize_bar_series(snapshot.daily_summary)
+    current_bar = _snapshot_to_daily_bar(snapshot)
+    if current_bar:
+        bars = _merge_bar_series(bars, [current_bar])
+    if not bars:
+        return {}
+    closes = pd.Series([float(item.get("close") or 0.0) for item in bars], dtype="float64")
+    highs = pd.Series(
+        [float(item.get("high") or item.get("close") or 0.0) for item in bars],
+        dtype="float64",
+    )
+    lows = pd.Series(
+        [float(item.get("low") or item.get("close") or 0.0) for item in bars],
+        dtype="float64",
+    )
+    volumes = pd.Series([float(item.get("vol") or 0.0) for item in bars], dtype="float64")
+    technical = build_technical_snapshot(closes, highs, lows, volumes)
+    return _drop_empty_values(
+        {
+            "close": technical.close,
+            "ma5": technical.ma5,
+            "ma10": technical.ma10,
+            "ma20": technical.ma20,
+            "ma60": technical.ma60,
+            "rsi": technical.rsi,
+            "macd": technical.macd,
+            "macd_signal": technical.macd_signal,
+            "macd_histogram": technical.macd_histogram,
+            "volume_ratio": technical.volume_ratio,
+            "price_position_20d": technical.price_position_20d,
+            "breakout": technical.breakout,
+            "trend_status": technical.trend_status,
+            "momentum_status": technical.momentum_status,
+            "technical_score": technical.technical_score,
+            "trend_score": technical.trend_score,
+            "momentum_score": technical.momentum_score,
+            "volume_score": technical.volume_score,
+            "breakout_score": technical.breakout_score,
+            "risk_score": technical.risk_score,
+            "setup_quality_score": technical.setup_quality_score,
+            "recommendation_score": technical.recommendation_score,
+            "recommendation": technical.recommendation,
+            "setup_type": technical.setup_type,
+            "risk_level": technical.risk_level,
+            "entry_style": technical.entry_style,
+            "confidence": technical.confidence,
+            "risk_flags": list(technical.risk_flags or []),
+            "setup_notes": list(technical.setup_notes or []),
+            "distance_to_ma20_pct": technical.distance_to_ma20_pct,
+            "distance_to_ma60_pct": technical.distance_to_ma60_pct,
+            "breakout_strength": technical.breakout_strength,
+        }
+    )
+
+
+def _build_moneyflow_context(
+    *,
+    rows: List[Dict[str, Any]],
+    fallback_summary: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    sorted_rows = sorted(
+        [row for row in rows if isinstance(row, dict)],
+        key=lambda item: str(item.get("trade_date") or ""),
+    )
+    latest_rows = sorted_rows[-3:]
+    recent_3d_net_inflow = 0.0
+    recent_large_order_net_inflow = 0.0
+    recent_super_large_order_net_inflow = 0.0
+    for row in latest_rows:
+        recent_3d_net_inflow += _safe_float(row.get("net_mf_amount")) or 0.0
+        recent_large_order_net_inflow += (_safe_float(row.get("buy_lg_amount")) or 0.0) - (
+            _safe_float(row.get("sell_lg_amount")) or 0.0
+        )
+        recent_super_large_order_net_inflow += (_safe_float(row.get("buy_elg_amount")) or 0.0) - (
+            _safe_float(row.get("sell_elg_amount")) or 0.0
+        )
+    result = {
+        "rows": len(sorted_rows),
+        "recent_3d_net_inflow": round(recent_3d_net_inflow, 2) if latest_rows else None,
+        "recent_large_order_net_inflow": round(recent_large_order_net_inflow, 2) if latest_rows else None,
+        "recent_super_large_order_net_inflow": round(recent_super_large_order_net_inflow, 2) if latest_rows else None,
+        "latest_net_mf_amount": _safe_float((sorted_rows[-1] if sorted_rows else {}).get("net_mf_amount")),
+        "fallback_net_mf_amount": _safe_float((fallback_summary or {}).get("net_mf_amount")),
+    }
+    return _drop_empty_values(result)
+
+
+def _build_business_summary(*, company_profile: Dict[str, Any], stock_info: Dict[str, Any]) -> Optional[str]:
+    parts: List[str] = []
+    main_business = str(company_profile.get("main_business") or "").strip()
+    if main_business:
+        parts.append(main_business)
+    industry = str(stock_info.get("industry") or "").strip()
+    if industry and industry not in "".join(parts):
+        parts.append(f"所属行业{industry}")
+    text = "；".join(part for part in parts if part)
+    return text[:220] if text else None
+
+
+def _summarize_earnings_forecast(rows: List[Dict[str, Any]]) -> Optional[str]:
+    if not rows:
+        return None
+    latest = rows[0]
+    summary = str(latest.get("summary") or "").strip()
+    change_reason = str(latest.get("change_reason") or "").strip()
+    forecast_type = str(latest.get("type") or "").strip()
+    parts = [part for part in [forecast_type, summary, change_reason] if part]
+    if not parts:
+        return None
+    text = "；".join(parts)
+    return text[:220]
+
+
+def _summarize_top_list_rows(rows: List[Dict[str, Any]]) -> Optional[str]:
+    if not rows:
+        return None
+    parts: List[str] = []
+    for row in rows[:3]:
+        reason = str(row.get("reason") or "龙虎榜").strip()
+        net_amount = _safe_float(row.get("net_amount"))
+        net_rate = _safe_float(row.get("net_rate"))
+        text = reason
+        if net_amount is not None:
+            text += f"，净买入{net_amount:.1f}万"
+        if net_rate is not None:
+            text += f"，净买率{net_rate:.1f}%"
+        parts.append(text)
+    return "；".join(parts) if parts else None
+
+
+def _summarize_limit_list_row(row: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not row:
+        return None
+    limit_status = str(row.get("limit") or "").strip()
+    open_times = row.get("open_times")
+    last_time = str(row.get("last_time") or "").strip()
+    parts = [limit_status or "涨跌停异动"]
+    if open_times not in (None, ""):
+        try:
+            parts.append(f"开板{int(float(open_times or 0))}次")
+        except (TypeError, ValueError):
+            logger.debug("Invalid limit list open_times: %s", open_times)
+    if last_time:
+        parts.append(f"最后封板/触及时间{last_time}")
+    return "，".join(parts)
+
+
+def _drop_empty_values(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in payload.items()
+        if value not in (None, "", [], {})
+    }

@@ -29,6 +29,7 @@ from octts.services.screening_validator import ScreeningValidator
 from octts.services.short_term_training_data import ShortTermTrainingDataBuilder
 from octts.services.regression_rerank_service import RegressionRerankResult, RegressionRerankService
 from octts.services.market_raw_data_repository import MarketRawDataRepository
+from octts.models.screening_models import DatabaseManager, MarketStockBasic
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,7 @@ class EnhancedScreeningScheduler:
         self.regression_rerank_service = RegressionRerankService(settings)
         self.market_raw_data_repo = MarketRawDataRepository(settings.database_url)
         self.market_data_sync_service = MarketDataSyncService(settings)
+        self._stock_name_cache: Optional[Dict[str, str]] = None
         self.wecom_client = wecom_client
         if self.wecom_client is None and settings.wecom_webhook_url:
             self.wecom_client = WeComClient(settings)
@@ -391,7 +393,7 @@ class EnhancedScreeningScheduler:
             message="正在生成智能报告...",
             details={"final_recommendations": len(final_recommendations)},
         )
-        market_data = await self._get_market_data()
+        market_data = await self._get_market_data(trade_date=trade_date)
         await self._report_progress(
             current_step=5,
             total_steps=total_steps,
@@ -2939,12 +2941,14 @@ class EnhancedScreeningScheduler:
 
         return [code for code, _ in sorted_stocks[:limit]]
 
-    async def _get_market_data(self) -> Dict[str, Any]:
-        """获取市场数据"""
-        return {
+    async def _get_market_data(self, *, trade_date: Optional[str] = None) -> Dict[str, Any]:
+        """获取市场总览数据，优先使用本地 Tushare 原始行情缓存。"""
+        target_trade_date = str(trade_date or self.screener._get_latest_trade_date()).replace("-", "")
+        fallback_payload = {
             "indices": {},
             "rise_count": None,
             "fall_count": None,
+            "flat_count": None,
             "limit_up": None,
             "limit_down": None,
             "total_amount": None,
@@ -2953,6 +2957,64 @@ class EnhancedScreeningScheduler:
             "sentiment": "暂无实时市场情绪数据",
             "data_available": False,
         }
+        try:
+            daily_summary = self.market_raw_data_repo.get_market_daily_summary(trade_date=target_trade_date)
+            if int(daily_summary.get("pct_count") or 0) <= 0:
+                return fallback_payload
+            limit_summary = self.market_raw_data_repo.get_market_limit_summary(trade_date=target_trade_date)
+            rise_count = int(daily_summary.get("rise_count") or 0)
+            fall_count = int(daily_summary.get("fall_count") or 0)
+            flat_count = int(daily_summary.get("flat_count") or 0)
+            pct_count = int(daily_summary.get("pct_count") or 0)
+            avg_pct_chg = self._safe_float(daily_summary.get("avg_pct_chg")) or 0.0
+            limit_up = (
+                int(limit_summary.get("limit_up") or 0)
+                if int(limit_summary.get("total_count") or 0) > 0
+                else int(daily_summary.get("limit_up_estimate") or 0)
+            )
+            limit_down = (
+                int(limit_summary.get("limit_down") or 0)
+                if int(limit_summary.get("total_count") or 0) > 0
+                else int(daily_summary.get("limit_down_estimate") or 0)
+            )
+            total_amount = self._safe_float(daily_summary.get("total_amount"))
+            total_amount_yi = (total_amount / 100000.0) if total_amount is not None else None
+            up_ratio = rise_count / pct_count if pct_count else 0.0
+            if up_ratio >= 0.58 and avg_pct_chg >= 0:
+                trend_label = "市场整体偏强"
+            elif up_ratio <= 0.42 and avg_pct_chg <= 0:
+                trend_label = "市场整体偏弱"
+            else:
+                trend_label = "市场整体分化"
+            amount_text = f"，全市场成交额约{total_amount_yi:.0f}亿元" if total_amount_yi is not None else ""
+            trend = (
+                f"{trend_label}：上涨{rise_count}家、下跌{fall_count}家、平盘{flat_count}家，"
+                f"平均涨跌幅{avg_pct_chg:+.2f}%{amount_text}。"
+            )
+            sentiment = (
+                f"涨停{limit_up}家、跌停{limit_down}家，"
+                f"上涨占比{up_ratio * 100:.1f}%，短线情绪{'偏活跃' if limit_up > limit_down and up_ratio >= 0.5 else '偏谨慎' if up_ratio < 0.45 else '分化'}。"
+            )
+            return {
+                "indices": {},
+                "rise_count": rise_count,
+                "fall_count": fall_count,
+                "flat_count": flat_count,
+                "limit_up": limit_up,
+                "limit_down": limit_down,
+                "total_amount": total_amount,
+                "total_amount_yi": round(total_amount_yi, 2) if total_amount_yi is not None else None,
+                "avg_pct_chg": round(avg_pct_chg, 4),
+                "up_ratio": round(up_ratio, 4),
+                "trend": trend,
+                "volume_trend": amount_text.lstrip("，") if amount_text else None,
+                "sentiment": sentiment,
+                "data_available": True,
+                "trade_date": target_trade_date,
+            }
+        except Exception:
+            logger.exception("Failed to build market overview from local market data: trade_date=%s", target_trade_date)
+            return fallback_payload
 
     async def _send_intelligent_notifications(
         self,
@@ -3205,6 +3267,15 @@ class EnhancedScreeningScheduler:
                     "importance": getattr(cluster, "importance", 0.0),
                     "summary": getattr(cluster, "summary", ""),
                     "key_stocks": list(getattr(cluster, "key_stocks", []) or []),
+                    "news_briefs": [
+                        (
+                            f"{getattr(item, 'title', '')}：{getattr(item, 'content', '')}"
+                            if getattr(item, "title", "") and getattr(item, "content", "") and getattr(item, "content", "") != getattr(item, "title", "")
+                            else getattr(item, "title", "") or getattr(item, "content", "")
+                        )
+                        for item in (getattr(cluster, "news_items", []) or [])[:3]
+                        if (getattr(item, "title", "") or getattr(item, "content", ""))
+                    ],
                     "news_items": [
                         {
                             "title": getattr(item, "title", ""),
@@ -3440,14 +3511,28 @@ class EnhancedScreeningScheduler:
         recommendations: Dict[str, Dict[str, Any]],
         stock_name_map: Optional[Dict[str, str]] = None,
     ) -> List[str]:
-        del stock_name_map
         selected_codes: List[str] = []
         vetoed_count = 0
+        st_excluded_count = 0
+        stock_name_map = stock_name_map or {}
         for rank, code in enumerate(model_candidate_codes, start=1):
             payload = recommendations.get(code)
             if not payload:
                 continue
             payload["rerank_pool_rank"] = payload.get("rerank_pool_rank") or rank
+            if self._is_st_stock_for_final_veto(code=code, payload=payload, stock_name_map=stock_name_map):
+                payload["top3_st_excluded"] = True
+                payload["top3_st_excluded_reason"] = "stock_name_contains_ST"
+                payload["selection_stage"] = "model_top100_st_veto"
+                payload["selection_reason_components"] = {
+                    **dict(payload.get("selection_reason_components") or {}),
+                    "top3_st_excluded": True,
+                    "top3_st_excluded_reason": "stock_name_contains_ST",
+                }
+                st_excluded_count += 1
+                continue
+            payload["top3_st_excluded"] = False
+            payload["top3_st_excluded_reason"] = None
             extreme_risk_reason = self._get_top3_extreme_risk_reason(payload)
             if extreme_risk_reason:
                 payload["top3_extreme_risk_blocked"] = True
@@ -3485,12 +3570,53 @@ class EnhancedScreeningScheduler:
             }
 
         logger.info(
-            "Model Top3 selected with extreme-risk veto: selected=%s, vetoed=%s, model_pool=%s",
+            "Model Top3 selected with final vetoes: selected=%s, risk_vetoed=%s, st_excluded=%s, model_pool=%s",
             selected_codes,
             vetoed_count,
+            st_excluded_count,
             len(model_candidate_codes),
         )
         return selected_codes
+
+    def _is_st_stock_for_final_veto(
+        self,
+        *,
+        code: str,
+        payload: Dict[str, Any],
+        stock_name_map: Dict[str, str],
+    ) -> bool:
+        names = [
+            stock_name_map.get(code),
+            payload.get("name"),
+            payload.get("stock_name"),
+            payload.get("display_name"),
+        ]
+        basic_name = self._get_stock_basic_name(code)
+        if basic_name:
+            names.append(basic_name)
+        return any(self._name_indicates_st(name) for name in names)
+
+    def _get_stock_basic_name(self, code: str) -> Optional[str]:
+        if not code:
+            return None
+        if self._stock_name_cache is None:
+            self._stock_name_cache = {}
+            try:
+                session = DatabaseManager(self.settings.database_url).get_session()
+                try:
+                    for row in session.query(MarketStockBasic.ts_code, MarketStockBasic.name).all():
+                        if row.ts_code and row.name:
+                            self._stock_name_cache[str(row.ts_code).upper()] = str(row.name).strip()
+                finally:
+                    session.close()
+            except Exception as exc:
+                logger.warning("Failed to load stock basic names for ST veto: %s", exc)
+        return self._stock_name_cache.get(str(code).upper())
+
+    @staticmethod
+    def _name_indicates_st(name: Any) -> bool:
+        text = str(name or "").strip().upper().replace(" ", "")
+        return bool(text) and (text.startswith("ST") or text.startswith("*ST") or "退" in text[:3])
 
     @staticmethod
     def _get_top3_extreme_risk_reason(payload: Dict[str, Any]) -> Optional[str]:
@@ -3917,20 +4043,56 @@ class EnhancedScreeningScheduler:
         return round(min(float(confidence) + REPEAT_CONFIDENCE_BONUS, MAX_CONFIDENCE), 4)
 
     @staticmethod
+    def _is_code_like_name(code: str, value: Any) -> bool:
+        name = str(value or "").strip()
+        if not name:
+            return True
+        normalized_code = str(code or "").strip().upper()
+        normalized_name = name.upper()
+        return normalized_name == normalized_code or normalized_name == normalized_code.split(".")[0]
+
+    def _load_stock_name_cache(self) -> Dict[str, str]:
+        if self._stock_name_cache is not None:
+            return self._stock_name_cache
+        db = DatabaseManager(self.settings.database_url)
+        session = db.get_session()
+        try:
+            rows = session.query(MarketStockBasic.ts_code, MarketStockBasic.name).all()
+            self._stock_name_cache = {
+                str(ts_code).strip().upper(): str(name).strip()
+                for ts_code, name in rows
+                if str(ts_code or "").strip() and not self._is_code_like_name(str(ts_code), name)
+            }
+        except Exception:
+            logger.exception("Failed to load stock basic names")
+            self._stock_name_cache = {}
+        finally:
+            session.close()
+        return self._stock_name_cache
+
     def _resolve_stock_name(
+        self,
         code: str,
         stock: Any,
         recommendation: Dict[str, Any],
         current_state: Optional[Dict[str, Any]],
         historical_state: Optional[Dict[str, Any]],
     ) -> str:
-        return (
-            getattr(stock, "name", None)
-            or (current_state or {}).get("name")
-            or recommendation.get("name")
-            or (historical_state or {}).get("name")
-            or code
-        )
+        normalized_code = str(code or "").strip().upper()
+        candidates = [
+            getattr(stock, "name", None),
+            (current_state or {}).get("name"),
+            recommendation.get("name"),
+            recommendation.get("stock_name"),
+            recommendation.get("display_name"),
+            (historical_state or {}).get("name"),
+            self._load_stock_name_cache().get(normalized_code),
+        ]
+        for candidate in candidates:
+            name = str(candidate or "").strip()
+            if name and not self._is_code_like_name(normalized_code, name):
+                return name
+        return normalized_code
 
     @staticmethod
     def _has_real_ai_overall_score(payload: Optional[Dict[str, Any]]) -> bool:
@@ -4502,81 +4664,76 @@ class EnhancedScreeningScheduler:
             for item in today_top_states
             if item.get("ts_code")
         ]
-        previous_trade_date = self.store.get_previous_recommendation_pool_trade_date(trade_date)
-        previous_states = {
-            item.get("ts_code"): item
-            for item in self.store.load_recommendation_pool_state(trade_date=previous_trade_date)
-            if previous_trade_date and item.get("ts_code")
-        }
-        previous_top3_codes = self._get_previous_top3_codes(trade_date)
-        previous_top3 = [
-            previous_states[code] for code in previous_top3_codes if code in previous_states
-        ]
+        review_signal_trade_date = self._get_review_signal_trade_date(trade_date, lookback_trading_days=3)
+        review_entry_trade_date = self._get_next_trade_date(review_signal_trade_date) if review_signal_trade_date else None
+        review_signal_states = {}
+        if review_signal_trade_date:
+            review_signal_states = {
+                item.get("ts_code"): item
+                for item in self.store.load_recommendation_pool_state(trade_date=review_signal_trade_date)
+                if item.get("ts_code")
+            }
+        review_top3 = self._select_authoritative_today_top_states(list(review_signal_states.values())) if review_signal_states else []
 
         yesterday_top3_review: List[Dict[str, Any]] = []
-        for previous_item in previous_top3:
+        for previous_item in review_top3:
             code = previous_item.get("ts_code")
             current_item = state_map.get(code)
+            performance = self._build_review_performance(
+                code=code,
+                signal_trade_date=review_signal_trade_date,
+                entry_trade_date=review_entry_trade_date,
+                current_trade_date=trade_date,
+            )
             current_review = self._build_report_stock_payload(current_item, ai_analyses, final_recommendations) if current_item else {}
-            review_status = "失效"
-            today_verdict = "失效"
-            if current_item:
-                score_change = current_item.get("score_change")
-                if current_item.get("source_tag") == "今日Top3":
-                    review_status = "延续"
-                    today_verdict = "延续走强，继续列入今日Top3"
-                elif current_item.get("source_tag") == WINDOW_RECOMMENDATION_TAG:
-                    if isinstance(score_change, (int, float)) and score_change < 0:
-                        review_status = "转弱"
-                        today_verdict = "降级至今日候选，强度不及今日主推"
-                    else:
-                        review_status = "观察"
-                        today_verdict = "仅保留复盘跟踪，暂未回到今日主推"
-                elif isinstance(score_change, (int, float)) and score_change < 0:
-                    review_status = "转弱"
-                    today_verdict = "明显转弱，优先评估减仓或卖出"
-                else:
-                    review_status = "观察"
-                    today_verdict = "仅作中性复盘观察，暂不视为今日继续推荐"
-                current_review.update(
-                    {
-                        "yesterday_conclusion": self._resolve_yesterday_conclusion(previous_item),
-                        "today_verdict": today_verdict,
-                        "review_status": review_status,
-                        "analysis": current_review.get("analysis") or current_review.get("summary") or current_item.get("recommendation_text") or "结合昨日结论与今日表现，重点判断强势是否延续、仓位是否需要收缩，以及当前主要风险。",
-                        "miss_reason_candidates": [] if review_status == "延续" else ["评分排序下滑", "技术结构转弱", "资金承接分流"],
-                        "missing_factor_candidates": [] if review_status == "延续" else ["热点持续性", "量能变化", "相对强度"],
-                    }
-                )
-                yesterday_top3_review.append(current_review)
-                continue
-            yesterday_top3_review.append(
+            return_value = performance.get("review_return")
+            sellable = bool(performance.get("sellable_by_weak_profit_rule"))
+            if sellable:
+                review_status = "可卖出"
+                today_verdict = "持有满3个交易日后收益未超过3%，可按弱票规则卖出或调仓"
+            elif isinstance(return_value, (int, float)):
+                review_status = "继续观察"
+                today_verdict = "持有满3个交易日后收益超过3%，暂不触发弱票卖出规则"
+            elif current_item:
+                review_status = "观察"
+                today_verdict = "价格数据不足，先按当前候选状态继续观察"
+            else:
+                review_status = "失效"
+                today_verdict = "今日未进入候选池或展示池，且价格数据不足，需人工复核"
+
+            analysis_text = self._build_three_day_review_analysis(
+                previous_item=previous_item,
+                current_item=current_item,
+                performance=performance,
+                sellable=sellable,
+            )
+            current_review.update(
                 {
                     "ts_code": code,
-                    "name": previous_item.get("name") or code,
-                    "recommendation_score": None,
-                    "overall_score": None,
-                    "display_confidence": None,
-                    "source_tag": "昨日复盘",
-                    "today_present": False,
-                    "absence_reason": "今日未进入候选池或展示池",
+                    "name": self._resolve_stock_name(code, None, {}, previous_item, current_item),
+                    "source_tag": "3日前Top3复盘",
+                    "review_signal_date": review_signal_trade_date.isoformat() if review_signal_trade_date else None,
+                    "review_entry_date": review_entry_trade_date.isoformat() if review_entry_trade_date else None,
+                    "review_current_date": trade_date.isoformat(),
+                    "review_entry_open": performance.get("entry_open"),
+                    "review_current_price": performance.get("current_price"),
+                    "review_return": return_value,
+                    "review_return_pct": round(return_value * 100.0, 2) if isinstance(return_value, (int, float)) else None,
+                    "sellable_by_weak_profit_rule": sellable,
                     "yesterday_conclusion": self._resolve_yesterday_conclusion(previous_item),
-                    "today_verdict": "失效，今日未重新满足条件，仅保留复盘结论，不再作为今日推荐",
-                    "review_status": "失效",
-                    "previous_recommendation_score": previous_item.get("recommendation_score"),
-                    "previous_overall_score": self._resolve_real_overall_score(previous_item),
-                    "previous_confidence": previous_item.get("display_confidence") or previous_item.get("ai_confidence"),
-                    "strategy_count": 0,
-                    "news_mentioned": False,
-                    "technical_signal": None,
-                    "summary": previous_item.get("summary") or previous_item.get("recommendation_text"),
-                    "overview_reason": previous_item.get("overview_reason") or self._resolve_yesterday_conclusion(previous_item),
-                    "analysis": "今日未能延续到候选池，需要从卖出与风险角度复盘。",
-                    "miss_reason_candidates": ["评分因子缺口", "技术趋势破坏", "资金承接不足"],
-                    "missing_factor_candidates": ["盘中承接强度", "热点持续性", "量能变化"],
-                    "action_plan": {},
+                    "today_verdict": today_verdict,
+                    "review_status": review_status,
+                    "status": review_status,
+                    "analysis": analysis_text,
+                    "review_analysis": analysis_text,
+                    "strength_change": self._build_three_day_review_strength_change(performance, review_status),
+                    "market_context_view": self._build_three_day_review_market_context(performance, today_verdict),
+                    "miss_reason_candidates": ["3日收益未达3%", "资金占用效率偏低", "相对强度不足"] if sellable else [],
+                    "missing_factor_candidates": [] if isinstance(return_value, (int, float)) else ["入场开盘价", "今日收盘价", "有效交易日数据"],
+                    "action_plan": self._build_three_day_review_action_plan(performance, sellable),
                 }
             )
+            yesterday_top3_review.append(current_review)
 
         return {
             "trade_date": trade_date.isoformat(),
@@ -4586,6 +4743,119 @@ class EnhancedScreeningScheduler:
             "today_top3_live_context": [],
             "yesterday_top3_live_context": [],
             "comparison_candidates": list(today_top3),
+        }
+
+    def _get_review_signal_trade_date(self, trade_date: date, *, lookback_trading_days: int = 3) -> Optional[date]:
+        start_date = (trade_date - timedelta(days=45)).strftime("%Y%m%d")
+        end_date = trade_date.strftime("%Y%m%d")
+        trading_dates = self.market_raw_data_repo.list_trading_dates(start_date=start_date, end_date=end_date)
+        parsed_dates = [datetime.strptime(value, "%Y%m%d").date() for value in trading_dates]
+        if trade_date not in parsed_dates:
+            parsed_dates.append(trade_date)
+            parsed_dates = sorted(set(parsed_dates))
+        current_index = parsed_dates.index(trade_date) if trade_date in parsed_dates else -1
+        target_index = current_index - max(int(lookback_trading_days), 1)
+        if target_index < 0:
+            return None
+        return parsed_dates[target_index]
+
+    def _get_next_trade_date(self, trade_date: Optional[date]) -> Optional[date]:
+        if trade_date is None:
+            return None
+        start_date = trade_date.strftime("%Y%m%d")
+        end_date = (trade_date + timedelta(days=15)).strftime("%Y%m%d")
+        trading_dates = self.market_raw_data_repo.list_trading_dates(start_date=start_date, end_date=end_date)
+        parsed_dates = [datetime.strptime(value, "%Y%m%d").date() for value in trading_dates]
+        for value in parsed_dates:
+            if value > trade_date:
+                return value
+        return None
+
+    def _build_review_performance(
+        self,
+        *,
+        code: str,
+        signal_trade_date: Optional[date],
+        entry_trade_date: Optional[date],
+        current_trade_date: date,
+    ) -> Dict[str, Any]:
+        if not code or signal_trade_date is None or entry_trade_date is None:
+            return {}
+        entry_bar = self.market_raw_data_repo.get_daily(ts_code=code, trade_date=entry_trade_date.strftime("%Y%m%d")) or {}
+        current_bar = self.market_raw_data_repo.get_daily(ts_code=code, trade_date=current_trade_date.strftime("%Y%m%d")) or {}
+        entry_open = self._safe_float(entry_bar.get("open"))
+        current_price = self._safe_float(current_bar.get("close"))
+        if current_price is None:
+            current_price = self._safe_float(current_bar.get("open"))
+        review_return = None
+        if entry_open is not None and entry_open > 0 and current_price is not None:
+            review_return = round(current_price / entry_open - 1.0, 6)
+        return {
+            "signal_date": signal_trade_date.isoformat(),
+            "entry_date": entry_trade_date.isoformat(),
+            "current_date": current_trade_date.isoformat(),
+            "entry_open": entry_open,
+            "current_price": current_price,
+            "review_return": review_return,
+            "sellable_by_weak_profit_rule": isinstance(review_return, (int, float)) and review_return <= 0.03,
+        }
+
+    @staticmethod
+    def _build_three_day_review_analysis(
+        *,
+        previous_item: Dict[str, Any],
+        current_item: Optional[Dict[str, Any]],
+        performance: Dict[str, Any],
+        sellable: bool,
+    ) -> str:
+        del current_item
+        signal_date = performance.get("signal_date") or "3个交易日前"
+        entry_date = performance.get("entry_date") or "次日"
+        entry_open = performance.get("entry_open")
+        current_price = performance.get("current_price")
+        return_value = performance.get("review_return")
+        previous_reason = str(previous_item.get("overview_reason") or previous_item.get("summary") or "当日入选Top3").strip()
+        if isinstance(return_value, (int, float)):
+            action_text = "收益未超过3%，可按弱票规则卖出或调仓" if sellable else "收益超过3%，暂不触发弱票卖出规则"
+            return (
+                f"复盘对象为{signal_date}生成的Top3，按{entry_date}开盘价{entry_open:.2f}作为入场基准，"
+                f"当前参考价{current_price:.2f}，区间收益{return_value * 100:+.2f}%。{action_text}。"
+                f"原始入选逻辑：{previous_reason}"
+            )
+        return f"复盘对象为{signal_date}生成的Top3，但入场开盘价或当前价格缺失，暂不能计算3日收益；原始入选逻辑：{previous_reason}"
+
+    @staticmethod
+    def _build_three_day_review_strength_change(performance: Dict[str, Any], review_status: str) -> str:
+        return_value = performance.get("review_return")
+        if isinstance(return_value, (int, float)):
+            return f"从次日开盘基准到当前参考价的收益为{return_value * 100:+.2f}%，状态为{review_status}。"
+        return "价格数据不足，强弱变化需要人工结合行情复核。"
+
+    @staticmethod
+    def _build_three_day_review_market_context(performance: Dict[str, Any], today_verdict: str) -> str:
+        entry_date = performance.get("entry_date") or "次日"
+        return f"本段复盘按{entry_date}开盘买入、当前价格复核的短线持仓规则执行。{today_verdict}。"
+
+    @staticmethod
+    def _build_three_day_review_action_plan(performance: Dict[str, Any], sellable: bool) -> Dict[str, Any]:
+        current_price = performance.get("current_price")
+        if sellable:
+            action_bias = "可卖出/调仓"
+            entry_zone = "不新增，优先处理存量仓位"
+            take_profit = "若盘中冲高可优先减仓"
+            stop_loss = f"跌破{current_price:.2f}附近弱势延续" if isinstance(current_price, (int, float)) else "跌破当日弱势结构"
+        else:
+            action_bias = "继续观察"
+            entry_zone = "已有仓位可继续观察，不因3日弱票规则卖出"
+            take_profit = "结合后续强弱分批止盈"
+            stop_loss = "若收益回落到3%以内且承接转弱，再评估调仓"
+        return {
+            "action_bias": action_bias,
+            "entry_zone": entry_zone,
+            "take_profit": take_profit,
+            "stop_loss": stop_loss,
+            "holding_horizon": "3日复盘后滚动判断",
+            "invalid_condition": "3日收益未超过3%或资金承接继续转弱",
         }
 
     def _build_market_event_contexts(

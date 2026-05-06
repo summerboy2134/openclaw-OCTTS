@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Optional, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -72,6 +72,7 @@ def create_automation_scheduler(
             coalesce=True,
             misfire_grace_time=900,
             kwargs={
+                "settings": settings,
                 "screening_scheduler_factory": screening_scheduler_factory,
             },
         )
@@ -152,6 +153,7 @@ def _run_scheduled_email(
 
 def _run_scheduled_screening(
     *,
+    settings: Settings,
     screening_scheduler_factory: Callable[[], Any],
 ) -> None:
     """运行定时选股任务"""
@@ -166,6 +168,25 @@ def _run_scheduled_screening(
             asyncio.run(run_method())
         else:
             run_method()
+        _refresh_recommendation_performance(settings)
         logger.info("Scheduled stock screening completed")
     except Exception:
         logger.exception("Scheduled stock screening failed")
+
+
+def _refresh_recommendation_performance(settings: Settings) -> None:
+    if not settings.use_database:
+        return
+    try:
+        from octts.services.recommendation_tracker import RecommendationTracker
+
+        summary = RecommendationTracker(settings).update_recommendation_performance(lookback_days=30)
+        logger.info(
+            "Scheduled recommendation performance refresh completed",
+            extra={
+                "pending_count": summary.get("pending_count", 0),
+                "updated_count": summary.get("updated_count", 0),
+            },
+        )
+    except Exception:
+        logger.exception("Scheduled recommendation performance refresh failed")

@@ -6,7 +6,7 @@ from datetime import date, datetime
 from typing import Any, Iterable, List, Sequence
 
 from octts.config import get_settings
-from octts.models.screening_models import DatabaseManager, MarketAdjFactor, MarketDaily, MarketDailyBasic
+from octts.models.screening_models import DatabaseManager, MarketAdjFactor, MarketDaily, MarketDailyBasic, MarketStockBasic
 from octts.tools.common import configure_tool_logging, print_json
 from octts.services.market_raw_data_repository import MarketRawDataRepository
 
@@ -22,8 +22,9 @@ DEFAULT_EXCHANGE = "SSE"
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Backfill raw market data into SQLite.")
-    parser.add_argument("--start-date", required=True, help="YYYY-MM-DD")
-    parser.add_argument("--end-date", required=True, help="YYYY-MM-DD")
+    parser.add_argument("--start-date", help="YYYY-MM-DD")
+    parser.add_argument("--end-date", help="YYYY-MM-DD")
+    parser.add_argument("--stock-basic-only", action="store_true", help="Only backfill market_stock_basic from stock_basic.")
     parser.add_argument("--skip-trade-cal", action="store_true")
     parser.add_argument("--skip-daily", action="store_true")
     parser.add_argument("--skip-daily-basic", action="store_true")
@@ -38,6 +39,26 @@ def main() -> None:
 
     settings = get_settings()
     logger = configure_tool_logging(settings, "backfill_market_raw_data")
+    client = _build_tushare_client(settings)
+    db = DatabaseManager(settings.database_url)
+
+    if args.stock_basic_only:
+        rows = _fetch_stock_basic_rows(client)
+        inserted = _upsert_market_stock_basic(db, rows)
+        summary = {
+            "stock_basic": {
+                "fetched_rows": len(rows),
+                "inserted_rows": inserted,
+                "force_refresh": bool(args.force_refresh),
+            }
+        }
+        logger.info("Stock basic backfill complete: %s", summary)
+        print_json(summary)
+        return
+
+    if not args.start_date or not args.end_date:
+        raise ValueError("--start-date and --end-date are required unless --stock-basic-only is used")
+
     logger.info(
         "Raw market backfill started: start_date=%s, end_date=%s, only_missing=%s, force_refresh=%s",
         args.start_date,
@@ -53,8 +74,6 @@ def main() -> None:
     if args.only_missing and args.force_refresh:
         raise ValueError("only-missing and force-refresh cannot be used together")
 
-    client = _build_tushare_client(settings)
-    db = DatabaseManager(settings.database_url)
     repo = MarketRawDataRepository(settings.database_url)
 
     summary: dict[str, Any] = {
@@ -226,6 +245,61 @@ def _fetch_rows(df) -> List[dict[str, Any]]:
     if df is None or getattr(df, "empty", True):
         return []
     return list(df.to_dict(orient="records"))
+
+
+def _fetch_stock_basic_rows(client) -> List[dict[str, Any]]:
+    df = client._pro.stock_basic(
+        exchange="",
+        list_status="L",
+        fields="ts_code,symbol,name,area,industry,market,list_date,delist_date,is_hs",
+    )
+    return _fetch_rows(df)
+
+
+def _upsert_market_stock_basic(db: DatabaseManager, rows: Iterable[dict[str, Any]]) -> int:
+    session = db.get_session()
+    count = 0
+    try:
+        for row in rows:
+            ts_code = str(row.get("ts_code") or "").strip().upper()
+            if not ts_code:
+                continue
+            session.merge(
+                MarketStockBasic(
+                    ts_code=ts_code,
+                    symbol=_clean_text(row.get("symbol")),
+                    name=_clean_text(row.get("name")),
+                    area=_clean_text(row.get("area")),
+                    industry=_clean_text(row.get("industry")),
+                    market=_clean_text(row.get("market")),
+                    list_date=_parse_optional_yyyymmdd(row.get("list_date")),
+                    delist_date=_parse_optional_yyyymmdd(row.get("delist_date")),
+                    is_hs=_clean_text(row.get("is_hs")),
+                )
+            )
+            count += 1
+        session.commit()
+        return count
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def _clean_text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _parse_optional_yyyymmdd(value: Any) -> date | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y%m%d").date()
+    except ValueError:
+        return None
 
 
 if __name__ == "__main__":

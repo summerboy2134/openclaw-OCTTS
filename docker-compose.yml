@@ -21,12 +21,13 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       OCTTS_MEMORY_BACKEND: redis
+      OCTTS_HISTORY_DIR_PATH: /app/memory/history
+      OCTTS_DATABASE_URL: sqlite:////app/memory/octts_screening.db
       PIP_EXTRA_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
     ports:
       - "8000:8000"
     volumes:
-      - octts_memory:/app/memory
+      - ./memory:/app/memory
 
 volumes:
   redis_data:
-  octts_memory:

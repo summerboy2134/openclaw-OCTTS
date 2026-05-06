@@ -222,7 +222,34 @@ def _normalize_intelligent_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         blocks[key] = _normalize_intelligent_item_list(blocks.get(key))
     report["blocks"] = blocks
     normalized_payload["intelligent_report"] = report
+
+    news_clusters = normalized_payload.get("news_clusters")
+    normalized_payload["news_clusters"] = _normalize_news_clusters(news_clusters)
     return normalized_payload
+
+
+def _normalize_news_clusters(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    normalized_clusters: List[Dict[str, Any]] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        cluster = dict(entry)
+        news_briefs = [str(item).strip() for item in (cluster.get("news_briefs") or []) if str(item).strip()]
+        if not news_briefs:
+            rebuilt_briefs: List[str] = []
+            for item in cluster.get("news_items") or []:
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title") or "").strip()
+                source = str(item.get("source") or "").strip()
+                if not title:
+                    continue
+                rebuilt_briefs.append(f"{title}（{source}）" if source else title)
+            cluster["news_briefs"] = rebuilt_briefs[:3]
+        normalized_clusters.append(cluster)
+    return normalized_clusters
 
 
 app = _DisabledLegacyRouteRegistrar()
@@ -1344,6 +1371,14 @@ def _build_intelligent_overview_payload(payload: Dict[str, Any]) -> Dict[str, An
             "continuation_bias_score": item.get("continuation_bias_score"),
             "continuation_positive_flags": list(item.get("continuation_positive_flags") or []),
             "continuation_negative_flags": list(item.get("continuation_negative_flags") or []),
+            "recommend_rank": item.get("recommend_rank"),
+            "frontlist_rank": item.get("frontlist_rank"),
+            "rerank_pool_rank": item.get("rerank_pool_rank"),
+            "structured_rank_position": item.get("structured_rank_position"),
+            "selection_stage": item.get("selection_stage"),
+            "selection_reason_components": item.get("selection_reason_components") or {},
+            "fusion_70_30": item.get("fusion_70_30"),
+            "stage3_final_score": item.get("stage3_final_score"),
         }
 
     def _merge_authoritative_cards(primary_items: List[Dict[str, Any]], fallback_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1359,13 +1394,36 @@ def _build_intelligent_overview_payload(payload: Dict[str, Any]) -> Dict[str, An
             merged_cards.append(item)
         return merged_cards[:10]
 
-    def _frontlist_sort_key(item: Dict[str, Any]) -> tuple:
+    def _stage_rank_value(item: Dict[str, Any], key: str) -> float:
+        value = item.get(key)
+        if value in (None, ""):
+            value = (item.get("selection_reason_components") or {}).get(key)
+        if value in (None, ""):
+            return 999999.0
+        return float(value)
+
+    def _stage_order_sort_key(item: Dict[str, Any]) -> tuple:
+        is_top3 = (item.get("source_tag") == "今日Top3") or (item.get("selection_stage") == "stage3_final_top3")
+        stage3_rank = _stage_rank_value(item, "stage3_rank")
+        stage2_rank = _stage_rank_value(item, "stage2_rank")
+        rerank_rank = _stage_rank_value(item, "rerank_rank")
+        if rerank_rank == 999999.0:
+            rerank_rank = _stage_rank_value(item, "rerank_pool_rank")
+        structured_rank = _stage_rank_value(item, "structured_rank_position")
         return (
+            0 if is_top3 else 1,
+            stage3_rank,
+            stage2_rank,
+            rerank_rank,
+            structured_rank,
+            -_score_value(item, "fusion_70_30"),
+            -_score_value(item, "stage3_final_score", "score"),
             -_score_value(item, "recommendation_score"),
-            -_score_value(item, "final_display_recommendation_score"),
-            -_score_value(item, "overall_score", "priority_score", "score"),
             str(item.get("ts_code") or ""),
         )
+
+    def _frontlist_sort_key(item: Dict[str, Any]) -> tuple:
+        return _stage_order_sort_key(item)
 
     ai_analyses = payload.get("ai_analyses", {}) or {}
     recommendation_pool = payload.get("recommendation_pool", {}) or {}
@@ -1390,11 +1448,14 @@ def _build_intelligent_overview_payload(payload: Dict[str, Any]) -> Dict[str, An
         if isinstance(item, dict)
     ], key=_frontlist_sort_key)
     if authoritative_today_top10:
-        sorted_recommendations = [
-            _normalize_recommendation_item(item, item.get("source_tag") or "今日候选")
-            for item in authoritative_today_top10
-            if isinstance(item, dict)
-        ][:10]
+        sorted_recommendations = sorted(
+            [
+                _normalize_recommendation_item(item, item.get("source_tag") or "今日候选")
+                for item in authoritative_today_top10
+                if isinstance(item, dict)
+            ],
+            key=_stage_order_sort_key,
+        )[:10]
     elif normalized_today_top3:
         sorted_recommendations = _merge_authoritative_cards(normalized_today_top3, frontlist_cards)
     elif frontlist_cards:
