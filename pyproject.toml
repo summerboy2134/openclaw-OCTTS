@@ -16,6 +16,7 @@ dependencies = [
   "json-repair>=0.29.0",
   "lightgbm",
   "numpy",
+  "xgboost",
   "openai>=1.0.0",
   "pandas",
   "pydantic>=2.8.0",
