@@ -83,7 +83,7 @@ def _dashboard_content(*, interactive: bool) -> str:
             <div id="intelligentScreeningSummary" class="summary-grid" style="margin-top:16px;"></div>
             <div class="metrics-grid" style="margin-top:16px;">
               <div class="metric">
-                <div class="label">AI 推荐列表</div>
+                <div class="label">今日智能推荐 Top3</div>
                 <div id="intelligentRecommendations"></div>
               </div>
               <div class="metric">
@@ -262,15 +262,9 @@ def _detail_content(*, back_href: str, interactive: bool) -> str:
         <section class="layout detail-layout">
           <div class="main-column">
             <section class="hero-card" id="heroCard"></section>
-            <section class="chart-and-summary">
-              <div class="panel">
-                <div class="section-title">Price Context</div>
-                <div id="detailSparkline"></div>
-              </div>
-              <div class="panel">
-                <div class="section-title">Validation Snapshot</div>
-                <div id="validationSummary" class="summary-grid compact"></div>
-              </div>
+            <section class="panel">
+              <div class="section-title">完整分析</div>
+              <div id="detailFullAnalysis" class="stack"></div>
             </section>
             <section class="metrics-grid" id="detailMetrics"></section>
             <section class="panel">
@@ -720,7 +714,109 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
       margin: 0;
       padding-left: 18px;
       color: var(--muted);
-      line-height: 1.65;
+      line-height: 1.72;
+    }}
+
+    .analysis-summary-card {{
+      display: grid;
+      gap: 14px;
+      padding: 18px;
+      border-radius: 18px;
+      background: linear-gradient(145deg, rgba(13, 25, 47, 0.92), rgba(11, 21, 38, 0.78));
+      border: 1px solid rgba(96, 165, 250, 0.18);
+    }}
+
+    .analysis-summary-text {{
+      font-size: 16px;
+      line-height: 1.85;
+      color: var(--text);
+      white-space: pre-wrap;
+    }}
+
+    .analysis-meta-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+    }}
+
+    .analysis-meta-item {{
+      padding: 14px 16px;
+      border-radius: 16px;
+      background: rgba(15, 23, 42, 0.54);
+      border: 1px solid rgba(148, 163, 184, 0.12);
+      display: grid;
+      gap: 8px;
+    }}
+
+    .analysis-grid {{
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(280px, 0.85fr);
+      gap: 14px;
+      align-items: start;
+    }}
+
+    .analysis-column {{
+      display: grid;
+      gap: 14px;
+    }}
+
+    .analysis-section {{
+      padding: 16px 18px;
+      border-radius: 18px;
+      background: rgba(15, 23, 42, 0.52);
+      border: 1px solid rgba(148, 163, 184, 0.12);
+      display: grid;
+      gap: 12px;
+    }}
+
+    .analysis-section-title {{
+      font-size: 13px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }}
+
+    .analysis-section-text {{
+      color: var(--text);
+      line-height: 1.8;
+      white-space: pre-wrap;
+    }}
+
+    .analysis-prediction-list {{
+      display: grid;
+      gap: 10px;
+    }}
+
+    .analysis-prediction-item {{
+      padding: 14px 16px;
+      border-radius: 16px;
+      background: rgba(15, 23, 42, 0.54);
+      border: 1px solid rgba(148, 163, 184, 0.1);
+      display: grid;
+      gap: 6px;
+    }}
+
+    .analysis-prediction-head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      color: var(--text);
+      font-weight: 700;
+    }}
+
+    .analysis-prediction-note {{
+      color: var(--muted);
+      line-height: 1.7;
+    }}
+
+    .analysis-empty {{
+      padding: 16px 18px;
+      border-radius: 16px;
+      background: rgba(15, 23, 42, 0.42);
+      border: 1px dashed rgba(148, 163, 184, 0.18);
+      color: var(--muted);
     }}
 
     .empty {{
@@ -813,7 +909,7 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
     }}
 
     @media (max-width: 1100px) {{
-      .layout, .detail-layout, .chart-and-summary, .chart-grid {{
+      .layout, .detail-layout, .chart-and-summary, .chart-grid, .analysis-grid {{
         grid-template-columns: 1fr;
       }}
 
@@ -1112,7 +1208,7 @@ def _overview_script(
       summaryGrid.innerHTML = [
         renderSummaryCard("跟踪股票数", items.length),
         renderSummaryCard("默认股票池", (payload.default_stock_pool || []).length),
-        renderSummaryCard("智能推荐数", intelligent.final_recommendations || 0),
+        renderSummaryCard("今日 Top3", intelligent.today_top_count || 0),
         renderSummaryCard("热点主题数", intelligent.news_cluster_count || 0),
         renderSummaryCard("止盈触发", statuses.take_profit_hit || 0),
         renderSummaryCard("止损触发", statuses.stop_loss_hit || 0),
@@ -1317,7 +1413,7 @@ def _overview_script(
         const sourceTag = item.source_tag || "今日Top3";
         const repeatTag = item.is_repeat_pick ? ' · 连续入选' : '';
         return `
-        <a class="recommendation-item" href="${buildStockDetailHref(item.ts_code)}">
+        <div class="recommendation-item">
           <div class="row">
             <strong>${escapeHtml(item.ts_code)}${item.name ? ` · ${escapeHtml(item.name)}` : ""}</strong>
             <span class="badge hold">${escapeHtml(Number(item.recommendation_score || item.score || 0).toFixed(1))} 分</span>
@@ -1325,7 +1421,7 @@ def _overview_script(
           <div class="subtle">${escapeHtml(sourceTag + repeatTag)} · 技术信号：${escapeHtml(item.technical_signal || "信号待确认")} · 置信度 ${escapeHtml(formatConfidencePercent(item.confidence))}</div>
           <div>${escapeHtml(item.recommendation || "建议继续观察")}</div>
           <div class="subtle">${escapeHtml(item.summary || "")}</div>
-        </a>`;
+        </div>`;
       }).join("")}</div>`;
     }
 
@@ -1338,7 +1434,7 @@ def _overview_script(
         renderSummaryCard("今日 Top3", intelligent.today_top_count || 0),
         renderSummaryCard("昨日延续", intelligent.continuation_count || 0)
       ].join("");
-      intelligentRecommendations.innerHTML = renderIntelligentRecommendations(intelligent.top_recommendations || []);
+      intelligentRecommendations.innerHTML = renderIntelligentRecommendations(intelligent.today_top3 || []);
       intelligentReportSummary.innerHTML = `
         <div><strong>${escapeHtml(intelligent.report_title || "智能选股报告")}</strong></div>
         <div class="subtle" style="margin-top:8px;">${escapeHtml(intelligent.generated_at ? `最近刷新：${intelligent.generated_at}` : "暂无最近运行时间")}</div>
@@ -1890,8 +1986,7 @@ def _detail_script(
     const detailGeneratedAt = document.getElementById("detailGeneratedAt");
     const generatedAt = detailGeneratedAt;
     const heroCard = document.getElementById("heroCard");
-    const detailSparkline = document.getElementById("detailSparkline");
-    const validationSummary = document.getElementById("validationSummary");
+    const detailFullAnalysis = document.getElementById("detailFullAnalysis");
     const detailMetrics = document.getElementById("detailMetrics");
     const detailHistory = document.getElementById("detailHistory");
     const detailIntelligentInsight = document.getElementById("detailIntelligentInsight");
@@ -1918,28 +2013,88 @@ def _detail_script(
             <span class="badge ${{escapeHtml(symbol.validation.status)}}">${{escapeHtml(formatValidationStatus(symbol.validation.status))}}</span>
           </div>
         </div>
-        <div class="row">
+        <div class="stack">
           <div>
             <div class="mini-label">趋势判断</div>
-            <div class="big-number">${{escapeHtml(symbol.trend_judgement)}}</div>
-          </div>
-          <div style="text-align:right;">
-            <div class="mini-label">操作建议</div>
-            <div class="value">${{escapeHtml(symbol.operation_advice)}}</div>
+            <div class="value">${{escapeHtml(symbol.trend_judgement || '暂无')}}</div>
           </div>
         </div>
       `;
     }}
 
-    function renderValidationSummary(summary) {{
-      validationSummary.innerHTML = [
-        renderSummaryCard("止盈触发", summary.take_profit_hit || 0),
-        renderSummaryCard("止损触发", summary.stop_loss_hit || 0),
-        renderSummaryCard("等待条件成熟", summary.watching_setup || 0),
-        renderSummaryCard("等待入场", summary.watching_entry || 0),
-        renderSummaryCard("持仓跟踪", summary.tracking_position || 0),
-        renderSummaryCard("已进入区间", summary.entered || 0)
-      ].join("");
+    function formatSignedAmount(value) {{
+      if (value === null || value === undefined || value === "") return "—";
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) return "—";
+      const sign = numeric > 0 ? "+" : "";
+      return `${{sign}}${{numeric.toFixed(2)}}万`;
+    }}
+
+    function formatPercentValue(value, digits = 2) {{
+      if (value === null || value === undefined || value === "") return "—";
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) return "—";
+      return `${{(numeric * 100).toFixed(digits)}}%`;
+    }}
+
+    function renderPredictionWindows(predictionWindows) {{
+      if (!predictionWindows || !predictionWindows.length) return '<div class="analysis-empty">暂无预测窗口说明</div>';
+      return `
+        <div class="analysis-prediction-list">
+          ${{predictionWindows.map(item => {{
+            const confidence = Math.round((item.confidence_score || 0) * 100);
+            return `
+              <div class="analysis-prediction-item">
+                <div class="analysis-prediction-head">
+                  <span>${{escapeHtml(formatPredictionWindow(item.window))}}：${{escapeHtml(formatTrendBias(item.bias))}}</span>
+                  <span class="mini-label">置信度 ${{confidence}}%</span>
+                </div>
+                <div class="analysis-prediction-note">${{escapeHtml(item.rationale || '暂无补充说明')}}</div>
+              </div>
+            `;
+          }}).join("")}}
+        </div>
+      `;
+    }}
+
+    function renderFullAnalysis(symbol) {{
+      if (!detailFullAnalysis) return;
+      const riskItems = (symbol.risk_warning || []).length ? symbol.risk_warning : ((symbol.memory || {{}}).key_risks || []);
+      const observationItems = symbol.observation_points || [];
+      detailFullAnalysis.innerHTML = `
+        <div class="analysis-summary-card">
+          <div class="analysis-section-title">分析摘要</div>
+          <div class="analysis-summary-text">${{escapeHtml(symbol.summary_markdown || '暂无')}} </div>
+          <div class="analysis-meta-grid">
+            <div class="analysis-meta-item">
+              <div class="analysis-section-title">操作建议</div>
+              <div class="analysis-section-text">${{escapeHtml(symbol.operation_advice || '暂无')}}</div>
+            </div>
+            <div class="analysis-meta-item">
+              <div class="analysis-section-title">验证说明</div>
+              <div class="analysis-section-text">${{escapeHtml((symbol.validation || {{}}).note || '暂无')}}</div>
+            </div>
+          </div>
+        </div>
+        <div class="analysis-grid">
+          <div class="analysis-column">
+            <div class="analysis-section">
+              <div class="analysis-section-title">未来 1/3/5 日判断</div>
+              ${{renderPredictionWindows(symbol.prediction_windows || [])}}
+            </div>
+          </div>
+          <div class="analysis-column">
+            <div class="analysis-section">
+              <div class="analysis-section-title">观察点</div>
+              ${{renderList(observationItems)}}
+            </div>
+            <div class="analysis-section">
+              <div class="analysis-section-title">风险提示</div>
+              ${{renderList(riskItems)}}
+            </div>
+          </div>
+        </div>
+      `;
     }}
 
     function renderIntelligentInsight(insight) {{
@@ -1977,24 +2132,28 @@ def _detail_script(
     function renderMetrics(symbol) {{
       const zone = symbol.decision.entry_zone || {{}};
       const trendBreakdown = symbol.trend_breakdown || {{}};
-      const predictionText = (symbol.prediction_windows || []).map(item => {{
-        const confidence = Math.round((item.confidence_score || 0) * 100);
-        return `${{formatPredictionWindow(item.window)}}：${{formatTrendBias(item.bias)}} (${{confidence}}%)`;
-      }}).join("\\n") || "—";
+      const analysisContext = symbol.analysis_context || {{}};
+      const technical = analysisContext.technical || {{}};
+      const moneyflow = analysisContext.moneyflow || {{}};
+      const largeOrderNet = (moneyflow.buy_lg_amount !== undefined && moneyflow.buy_lg_amount !== null && moneyflow.sell_lg_amount !== undefined && moneyflow.sell_lg_amount !== null)
+        ? Number(moneyflow.buy_lg_amount) - Number(moneyflow.sell_lg_amount)
+        : null;
+      const superLargeOrderNet = (moneyflow.buy_elg_amount !== undefined && moneyflow.buy_elg_amount !== null && moneyflow.sell_elg_amount !== undefined && moneyflow.sell_elg_amount !== null)
+        ? Number(moneyflow.buy_elg_amount) - Number(moneyflow.sell_elg_amount)
+        : null;
       detailMetrics.innerHTML = [
-        ["行情截至", escapeHtml(formatSnapshotTradeDate(symbol.snapshot).replace("行情截至 ", ""))],
         ["入场区间", formatEntryZoneDisplay(symbol.decision.signal, zone)],
         ["止损位", formatValue(symbol.decision.stop_loss)],
         ["目标位", (symbol.decision.take_profit || []).map(v => formatValue(v)).join(" / ") || "—"],
         ["持有周期", escapeHtml(formatHoldingHorizon(symbol.decision.holding_horizon))],
         ["失效条件", escapeHtml(symbol.decision.invalidation_condition)],
         ["历史观点状态", escapeHtml(formatPreviousViewStatus(symbol.previous_view_status))],
-        ["短线趋势", escapeHtml(formatTrendBias(trendBreakdown.short_term)) + "\\n" + escapeHtml(trendBreakdown.short_term_reason || "")],
-        ["中线趋势", escapeHtml(formatTrendBias(trendBreakdown.mid_term)) + "\\n" + escapeHtml(trendBreakdown.mid_term_reason || "")],
-        ["长线趋势", escapeHtml(formatTrendBias(trendBreakdown.long_term)) + "\\n" + escapeHtml(trendBreakdown.long_term_reason || "")],
-        ["预测窗口", escapeHtml(predictionText)],
-        ["分析摘要", escapeHtml(symbol.summary_markdown)],
-        ["验证说明", escapeHtml(symbol.validation.note)]
+        ["MA20 / 偏离", `${{formatValue(technical.ma20)}} / ${{formatPercentValue(technical.distance_to_ma20_pct)}}`],
+        ["量比 / 换手率", `${{formatValue(technical.vol_ratio)}} / ${{formatValue(technical.turnover_rate)}}`],
+        ["近5日高低", `${{formatValue(technical.recent_5d_low)}} - ${{formatValue(technical.recent_5d_high)}}`],
+        ["主力资金", formatSignedAmount(moneyflow.net_mf_amount)],
+        ["大单 / 超大单", `${{formatSignedAmount(largeOrderNet)}} / ${{formatSignedAmount(superLargeOrderNet)}}`],
+        ["中长线结构", escapeHtml(formatTrendBias(trendBreakdown.mid_term)) + "\\n" + escapeHtml(trendBreakdown.mid_term_reason || "") + "\\n\\n" + escapeHtml(formatTrendBias(trendBreakdown.long_term)) + "\\n" + escapeHtml(trendBreakdown.long_term_reason || "")]
       ].map(([label, value]) => `<div class="metric"><div class="label">${{label}}</div><div class="value">${{value}}</div></div>`).join("");
     }}
 
@@ -2089,8 +2248,7 @@ def _detail_script(
       const symbol = payload.symbol;
       generatedAt.textContent = payload.generated_at ? `最近更新：${{payload.generated_at}}` : "暂无数据";
       heroCard.innerHTML = renderHero(symbol);
-      detailSparkline.innerHTML = sparkline(symbol.snapshot.minute_summary);
-      renderValidationSummary(payload.validation_summary || {{}});
+      renderFullAnalysis(symbol);
       renderMetrics(symbol);
       detailHistory.innerHTML = renderHistoryTimeline(symbol.history);
       if (detailIntelligentInsight) {{
@@ -2121,12 +2279,13 @@ def _detail_script(
 
         detailGeneratedAt.textContent = `已清空 ${{(payload.cleared_symbols || []).join(", ")}} 的 ${{(payload.removed_records || 0)}} 条历史记录。`;
         heroCard.innerHTML = '<div class="empty">该股票历史已清空，可返回总览后重新触发分析。</div>';
-        detailSparkline.innerHTML = '<div class="empty">暂无分时样本</div>';
+        if (detailFullAnalysis) {{
+          detailFullAnalysis.innerHTML = '<div class="empty">暂无分析数据</div>';
+        }}
         detailHistory.innerHTML = '<div class="empty">暂无历史记录</div>';
         detailMetrics.innerHTML = "";
         detailEvidence.innerHTML = '<div class="empty">暂无数据</div>';
         detailRisks.innerHTML = '<div class="empty">暂无数据</div>';
-        validationSummary.innerHTML = "";
       }} catch (error) {{
         detailGeneratedAt.textContent = `清空失败：${{error.message}}`;
       }} finally {{

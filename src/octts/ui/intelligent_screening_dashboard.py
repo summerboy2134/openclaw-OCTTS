@@ -634,6 +634,7 @@ def _render_theme_item_card(item: Dict[str, Any], *, fallback_title: str = "未�
     action_view = escape(_build_theme_action_view(item))
     news_briefs = item.get("news_briefs") or []
     news_brief_text = _render_news_briefs_html(news_briefs)
+    news_brief_html = f'<div class="news-cluster-meta"><strong>相关新闻摘要：</strong>{news_brief_text}</div>' if news_brief_text else ''
     return f"""
     <div class="news-cluster-card">
         <div class="news-cluster-head">
@@ -642,16 +643,16 @@ def _render_theme_item_card(item: Dict[str, Any], *, fallback_title: str = "未�
         </div>
         <div class="news-cluster-meta"><strong>操作判断：</strong>{action_view}</div>
         <div class="news-cluster-meta"><strong>主题摘要：</strong>{summary}</div>
-        <div class="news-cluster-meta"><strong>相关新闻摘要：</strong>{news_brief_text}</div>
+        {news_brief_html}
         <div class="news-cluster-meta"><strong>关联个股：</strong>{escape(related_stocks)}</div>
     </div>
     """
 
 
 def _render_news_briefs_html(news_briefs: List[Any]) -> str:
-    items = [escape(_safe_text(brief)) for brief in news_briefs[:3] if _safe_text(brief)]
+    items = [escape(_safe_text(brief)) for brief in news_briefs[:3] if _safe_text(brief) and _safe_text(brief) != '暂无相关新闻摘要']
     if not items:
-        return '<div class="news-brief-empty">暂无相关新闻摘要</div>'
+        return ''
     return '<div class="news-brief-list">' + ''.join(
         f'<div class="news-brief-item"><span class="news-brief-index">{index}.</span><span>{text}</span></div>'
         for index, text in enumerate(items, start=1)
@@ -763,13 +764,16 @@ def _render_focus_stock_block(items: List[Dict[str, Any]]) -> str:
         market_performance = escape(_safe_text(item.get("market_performance_view"), "暂无"))
         catalyst_capital = escape(_safe_text(item.get("catalyst_and_capital_view"), "暂无"))
         focus_analysis = escape(_safe_text(item.get("focus_analysis"), _safe_text(item.get("analysis"), _safe_text(item.get("overall_assessment"), "暂无分析"))))
+        fusion_score = _safe_float(item.get('fusion_70_30'), 0.0)
+        quality_score = _safe_float(item.get('overall_score'), 0.0)
         execution_score = _safe_float(item.get('recommendation_score'), 0.0)
         badge = escape(_format_focus_badge(item))
         html += f"""
         <div class="stock-item">
             <div class="stock-header"><div><span class="stock-code">{escape(_safe_text(item.get('ts_code')))}</span><span class="stock-name">{escape(_safe_text(item.get('name'), _safe_text(item.get('ts_code'))))}</span></div><span class="score-badge">{badge}</span></div>
             <div class="detail-grid" style="margin-top:12px;">
-                <div class="detail-panel"><div class="detail-label">综合分</div><div class="detail-value">{_safe_float(item.get('overall_score'), 0.0):.1f}</div></div>
+                <div class="detail-panel"><div class="detail-label">融合分</div><div class="detail-value">{fusion_score:.1f}</div></div>
+                <div class="detail-panel"><div class="detail-label">质量分</div><div class="detail-value">{quality_score:.1f}</div></div>
                 <div class="detail-panel"><div class="detail-label">执行分（风险后）</div><div class="detail-value">{execution_score:.1f}</div></div>
                 <div class="detail-panel"><div class="detail-label">置信度</div><div class="detail-value">{_format_confidence_text(item)}</div></div>
                 <div class="detail-panel"><div class="detail-label">来源</div><div class="detail-value">{escape(_safe_text(item.get('source_tag'), '--'))}</div></div>
@@ -805,16 +809,7 @@ def _render_review_block(items: List[Dict[str, Any]]) -> str:
             miss_reason_html = f'<div class="report-content"><strong>失误候选：</strong>{escape("、".join(miss_reason_candidates))}</div>'
         if missing_factor_candidates:
             missing_factor_html = f'<div class="report-content"><strong>缺失因子：</strong>{escape("、".join(missing_factor_candidates))}</div>'
-        review_analysis = _safe_text(item.get('review_analysis'), _safe_text(item.get('analysis'), _safe_text(item.get('absence_reason'), '暂无')))
         strength_change = _safe_text(item.get('strength_change'), '暂无')
-        if _looks_like_score_template_text(review_analysis):
-            review_analysis = _safe_text(item.get('analysis'), _safe_text(item.get('absence_reason'), '暂无'))
-        if _looks_like_score_template_text(review_analysis):
-            review_analysis = '今日复盘说明暂未生成有效结论，建议优先结合当日强弱、量能与板块承接人工复核。'
-        if _looks_like_score_template_text(strength_change):
-            strength_change = _safe_text(item.get('strength_change_fallback'), _safe_text(item.get('analysis'), '暂无'))
-        if _looks_like_score_template_text(strength_change):
-            strength_change = '强弱变化说明暂未生成有效内容，请以分数变化、量能变化与今日判断为主。'
         html += f"""
         <div class="stock-item">
             <div class="stock-header"><div><span class="stock-code">{escape(_safe_text(item.get('ts_code')))}</span><span class="stock-name">{escape(_safe_text(item.get('name'), _safe_text(item.get('ts_code'))))}</span></div><span class="tag">{escape(_safe_text(item.get('status', item.get('today_verdict')), '观察'))}</span></div>
@@ -824,7 +819,6 @@ def _render_review_block(items: List[Dict[str, Any]]) -> str:
                 <div class="detail-panel"><div class="detail-label">3日收益</div><div class="detail-value">{escape(_safe_text(item.get('review_return_pct'), '--'))}%</div></div>
                 <div class="detail-panel"><div class="detail-label">状态</div><div class="detail-value">{escape(_safe_text(item.get('status', '观察')))}</div></div>
             </div>
-            <div class="report-content"><strong>复盘说明：</strong><br>{escape(review_analysis)}</div>
             <div class="analysis-grid">
                 <div class="detail-panel"><div class="detail-label">强弱变化</div><div class="detail-value">{escape(strength_change)}</div></div>
                 <div class="detail-panel"><div class="detail-label">市场环境</div><div class="detail-value">{escape(_safe_text(item.get('market_context_view'), '暂无'))}</div></div>

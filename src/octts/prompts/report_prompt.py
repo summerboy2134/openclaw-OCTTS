@@ -8,6 +8,37 @@ from typing import Optional
 from octts.schemas.report import AnalysisPhase, HistoricalAnalysisRecord, MemorySummary, PositionStatus, PriceSnapshot
 
 
+def _today_screening_hard_constraints() -> list[str]:
+    return [
+        "不能改写系统排序，也不能擅自调整推荐先后。",
+        "只生成 focus_stocks、comparison、overall_action 三块，不要输出 yesterday_reviews。",
+        "严禁把内部工程、训练或回补说明写入用户报告，例如“回补样本”“结构化特征近似”“训练集构造”“fallback”“backfill”等词一律不得输出。",
+        "风险分为0或0.0时，不要写成核心亮点，也不要输出“风险分为0.0”；应解释为“结构化末端风险暂未触发明显异常，但仍需看资金承接和换手延续”。",
+        "如果 recommendation_score 低于 overall_score，不得写“短线交易排序分相对综合分更占优”；应解释为“综合质量尚可，但风险/执行分被短期涨幅、位置或承接约束压低”。只有 recommendation_score 明显高于 overall_score 时，才可说交易性强于质量端。",
+        "若输入存在 top_list/top_list_summary/limit_list/limit_status，要把龙虎榜资金方向、上榜原因、涨跌停强弱作为交易结构证据，但不得据此改写排序。",
+        "若输入存在 earnings_forecast，要说明业绩预告对基本面判断的支持或拖累；没有则不要编造业绩预告。",
+        "focus_stocks 必须逐只覆盖 today_top3；comparison 只基于 today_top3。",
+        "若 today_top3_live_context 中存在对应个股的实时资讯，focus_analysis 必须优先引用其中的新闻、公告与发布时间线索；若为空，再回退到 news_clusters 与个股自身字段。",
+        "若无法联网补充外部信息，就严格基于输入里的价格、资金、财务、主营摘要、主题线索做推演，不要编造缺失数据。",
+        "comparison 必须包含 cross_stock_synthesis_view：横向比较三只股票谁更偏交易性、谁更偏基本面质量、谁风险更高、谁证据最完整。",
+    ]
+
+
+def _today_screening_writing_style_guidelines() -> list[str]:
+    return [
+        "不要逐字段罗列输入；必须先理解 evidence_digest，再归纳成结论、证据、反证和操作前提。报告应该像研究员写给交易员的判断，不像字段解释说明书。",
+        "生成内容必须充分展开，today_top3 每只 focus_analysis 建议不少于 220 个中文字符，market_performance_view、catalyst_and_capital_view、trading_context_view 各输出 2-3 句；但不要空泛重复，也不要为了凑长度复述字段名。",
+        "排序来源优先解释为：全市场模型排名、极端风险剔除后的Top3席位、资金/风险后的执行分、综合质量分。不要把 recommendation_score 直接称为最终推荐分；它更接近风险调整后的执行分/排序分。",
+        "不要连续列举超过3个数字。数字只作为证据，不作为段落主语；先给判断，再用关键数字支撑。",
+        "每只股票必须用至少一个非指标化判断句开头，例如“这是高位资金博弈票”“这是资金推动的修复票”“这是质量一般但情绪强的短线票”，然后再展开证据。",
+        "focus_analysis 必须是完整段落，不要堆标签；应覆盖主结论、核心证据、反证风险、缺失信息和操作前提。",
+        "focus_analysis 要优先按这个顺序组织：先给一句人话结论和交易画像，再写市场表现阶段（今日涨跌、日内强弱、当前处于启动/加速/高位分歧/调整/修复哪个阶段），再写主营逻辑或基本面质地，再写技术位置与量价结构、资金承接、板块与主题共振，最后写主要风险与操作前提。段落要真正围绕该股输入数据做判断，避免三只股票复用同样开头或同样结论句。",
+        "focus_analysis 要尽量回答四个问题：这只股票今天是强还是弱、为什么走到当前位置、当前主要催化是什么、接下来最该防什么风险。",
+        "短线建议必须基于输入中的 close、entry_price、技术描述、支撑阻力或总结信息；证据不足时只给观察区间。",
+        "主题新闻输出优先概括市场总线、核心主线、风险扰动、观察线；overall_action 中的 market_view、risk_summary、action_items 要简明可执行。",
+    ]
+
+
 def build_today_screening_report_prompt(
     *,
     market_data: dict[str, object],
@@ -52,34 +83,17 @@ def build_today_screening_report_prompt(
             "cross_stock_synthesis": "Top3横向综合任务，要求比较交易性、质量、风险和证据完整度",
             "source_tag": "来源标签，如今日Top3/今日候选/昨日复盘",
         },
+        "hard_constraints": _today_screening_hard_constraints(),
+        "writing_style_guidelines": _today_screening_writing_style_guidelines(),
         "instructions": [
-            "不能改写系统排序，你的任务是解释为什么排这样。",
-            "只生成 focus_stocks、comparison、overall_action 三块，不要输出 yesterday_reviews。",
-            "不要逐字段罗列输入；必须先理解 evidence_digest，再归纳成结论、证据、反证和操作前提。报告应该像研究员写给交易员的判断，不像字段解释说明书。",
-            "生成内容必须充分展开，today_top3 每只 focus_analysis 建议不少于 220 个中文字符，market_performance_view、catalyst_and_capital_view、trading_context_view 各输出 2-3 句；但不要空泛重复，也不要为了凑长度复述字段名。",
-            "严禁把内部工程、训练或回补说明写入用户报告，例如“回补样本”“结构化特征近似”“训练集构造”“fallback”“backfill”等词一律不得输出。",
-            "风险分为0或0.0时，不要写成核心亮点，也不要输出“风险分为0.0”；应解释为“结构化末端风险暂未触发明显异常，但仍需看资金承接和换手延续”。",
-            "排序来源优先解释为：全市场模型排名、极端风险剔除后的Top3席位、资金/风险后的执行分、综合质量分。不要把 recommendation_score 直接称为最终推荐分；它更接近风险调整后的执行分/排序分。",
-            "如果 recommendation_score 低于 overall_score，不得写“短线交易排序分相对综合分更占优”；应解释为“综合质量尚可，但风险/执行分被短期涨幅、位置或承接约束压低”。只有 recommendation_score 明显高于 overall_score 时，才可说交易性强于质量端。",
-            "不要连续列举超过3个数字。数字只作为证据，不作为段落主语；先给判断，再用关键数字支撑。",
-            "每只股票必须用至少一个非指标化判断句开头，例如“这是高位资金博弈票”“这是资金推动的修复票”“这是质量一般但情绪强的短线票”，然后再展开证据。",
+            "先满足 hard_constraints，再尽量满足 writing_style_guidelines。",
             "若输入存在 distribution_risk_score、distribution_risk_flags、moneyflow_3d_value、turnover_spike_ratio、recent_runup_5d、late_stage_momentum_flag、industry_flow_bias、industry_heat_score，必须写出加分、扣分与风险含义；其中 distribution_risk_score 只是分歧/派发风险子分，不代表全部风险。",
-            "若输入存在 top_list/top_list_summary/limit_list/limit_status，要把龙虎榜资金方向、上榜原因、涨跌停强弱作为交易结构证据，但不得据此改写排序。",
-            "若输入存在 earnings_forecast，要说明业绩预告对基本面判断的支持或拖累；没有则不要编造业绩预告。",
-            "focus_stocks 必须逐只覆盖 today_top3；comparison 只基于 today_top3。",
-            "若 today_top3_live_context 中存在对应个股的实时资讯，focus_analysis 必须优先引用其中的新闻、公告与发布时间线索；若为空，再回退到 news_clusters 与个股自身字段。",
-            "focus_analysis 必须是完整段落，不要堆标签；应覆盖主结论、核心证据、反证风险、缺失信息和操作前提。",
-            "focus_analysis 要优先按这个顺序组织：先给一句人话结论和交易画像，再写市场表现阶段（今日涨跌、日内强弱、当前处于启动/加速/高位分歧/调整/修复哪个阶段），再写主营逻辑或基本面质地，再写技术位置与量价结构、资金承接、板块与主题共振，最后写主要风险与操作前提。段落要真正围绕该股输入数据做判断，避免三只股票复用同样开头或同样结论句。",
-            "focus_analysis 要尽量回答四个问题：这只股票今天是强还是弱、为什么走到当前位置、当前主要催化是什么、接下来最该防什么风险。",
             "若输入中存在 close/open/high/low/pct_change/turnover_rate/amount/amplitude/recent_runup_5d 等市场表现字段，要明确写出冲高回落、高位震荡、放量分歧、强势延续、回踩整理等阶段判断，不要只写笼统的技术面偏强/偏弱。",
             "若输入中存在 business_summary、latest_revenue_yoy、latest_profit_yoy、pe_ttm、industry_pe_median 等基本面或估值字段，要明确判断基本面是否支持当前涨幅、是否存在估值透支或基本面与股价背离。",
             "若输入中存在 catalyst_summary、main_fund_flow_1d、main_fund_flow_3d、main_fund_flow_10d、margin_balance_change_10d 等催化或资金字段，要区分主催化与次催化，并写出资金承接还是资金分歧。",
+            "若大盘、板块广度、主题新闻簇等外部环境数据不足，不要写成‘缺乏实时市场数据支持’或暗示个股行情缺失；应明确表达为‘外部环境证据有限，当前判断主要依赖个股价格、量能、资金和风险结构’，并继续基于已有个股证据分析。",
             "focus_stocks 的 market_performance_view 与 catalyst_and_capital_view 应尽量输出 2-3 句短摘要，作为总览和重点分析之间的桥接层；证据不足时可保守但不要空泛重复。focus_analysis 不要机械重复这两个字段原句，而要在其基础上进一步归纳、串联和判断。",
             "focus_stocks 的 core_highlights 控制为 3-4 条，risk_warnings 控制为 2-3 条，overall_assessment 用 2-3 句给出完整结论。",
-            "今日 Top3 重点写清：交易画像、市场表现阶段、为什么即使有风险仍进入Top3、基本面或行业逻辑、技术位置与量价、近3日资金承接、近5日涨幅与分歧风险、市场/主题共振、短线建议。若无法联网补充外部信息，就严格基于输入里的价格、资金、财务、主营摘要、主题线索做推演，并明确写出这些已知信息支持了什么判断、又缺了什么关键验证。",
-            "短线建议必须基于输入中的 close、entry_price、技术描述、支撑阻力或总结信息；证据不足时只给观察区间。",
-            "comparison 必须包含 cross_stock_synthesis_view：横向比较三只股票谁更偏交易性、谁更偏基本面质量、谁风险更高、谁证据最完整。",
-            "主题新闻输出优先概括市场总线、核心主线、风险扰动、观察线；overall_action 中的 market_view、risk_summary、action_items 要简明可执行。",
             "theme_focuses 若能稳定判断再输出；证据不足可返回空数组，不要编造。",
         ],
         "output_schema": {
@@ -89,7 +103,7 @@ def build_today_screening_report_prompt(
                     "name": "string",
                     "score_rationale": "解释 recommendation_score / overall_score 的主要加分、减分来源",
                     "fundamental_view": "基本面、质地、业绩或行业逻辑判断",
-                    "market_context_view": "大盘、板块、主题环境与个股匹配度判断",
+                    "market_context_view": "大盘、板块、主题环境与个股匹配度判断；如果外部环境证据不足，应说明外部环境证据有限，不能写‘缺乏实时市场数据支持’",
                     "trading_context_view": "技术结构、位置、量能、节奏、承接情况",
                     "market_performance_view": "概括今日涨跌、日内走势、当前阶段判断",
                     "catalyst_and_capital_view": "概括主催化、次催化、资金承接或资金分歧",
@@ -224,16 +238,46 @@ def build_today_screening_format_prompt(
     base_payload["instructions"] = [
         "最终输出必须符合 output_schema。",
         "必须优先吸收 reasoning_payload 的主论点、反证、缺失数据和操作逻辑。",
-        "不要逐字段复述；要把证据组织成清晰完整的分析段落。",
-        "不得改写Top3顺序，不得编造市场指数、涨跌家数或缺失数据。",
-        "focus_analysis 必须充分展开，每只建议不少于 220 个中文字符，必须包含主结论、证据、反证风险、缺失数据、操作前提。",
-        "最终报告严禁出现“回补样本”“结构化特征近似”“训练集构造”“fallback”“backfill”等内部工程词。",
-        "不要把“风险分为0.0”写入报告；0风险分只能表述为结构化末端风险暂未触发明显异常，仍需看承接。",
-        "最终报告不得出现“低执行分相对综合分更占优”这类逻辑错误；分数关系只能作为辅助解释。",
-        "最终文风要先给交易画像、机会来源、关键反证，再落到操作条件，避免围绕字段名逐项解释。",
+        "先满足 hard_constraints，再尽量满足 writing_style_guidelines。",
+        "如果某只股票的主分析仍然像字段说明书，要优先改写成研究员式点评，而不是继续补分数字段。",
         "comparison.cross_stock_synthesis_view 必须总结Top3横向取舍。",
-    ] + list(base_payload.get("instructions") or [])
+    ]
     return system_prompt, json.dumps(base_payload, ensure_ascii=False, indent=2)
+
+
+def build_focus_analysis_rewrite_prompt(
+    *,
+    stock_context: dict[str, object],
+    reasoning_item: Optional[dict[str, object]],
+    existing_focus_analysis: str,
+) -> tuple[str, str]:
+    system_prompt = (
+        "你是一名A股智能选股报告编辑，只负责重写单只股票的主分析。"
+        "你必须保留原始事实与排序背景，不能编造数据，不能改写推荐顺序。"
+        "你只能输出一个合法JSON对象，不要Markdown、代码块或额外解释。"
+    )
+    payload = {
+        "task": "重写单只重点个股的主分析，使其更像研究员点评而不是字段堆砌",
+        "stock_context": stock_context,
+        "reasoning_item": reasoning_item or {},
+        "existing_focus_analysis": existing_focus_analysis,
+        "hard_constraints": [
+            "只能重写 focus_analysis，不要输出其他字段。",
+            "不得改写排序、结论方向、关键价位和已有事实。",
+            "不得编造市场指数、涨跌家数、外部新闻或缺失数据。",
+            "不得出现内部工程、训练、fallback/backfill 等词。",
+        ],
+        "writing_style_guidelines": [
+            "开头先给交易画像或一句人话判断，不要以上来就堆数字。",
+            "优先写机会来源、当前阶段、核心反证和操作前提，不要逐字段解释 recommendation_score / overall_score。",
+            "避免使用这些套话：它能进入今日重点名单、真正需要提防的不是普通波动、综合来看当前这只票、操作上先看。",
+            "focus_analysis 保持单段落，控制在 220-360 个中文字符，像研究员写给交易员的盘前/复盘点评。",
+        ],
+        "output_schema": {
+            "focus_analysis": "string",
+        },
+    }
+    return system_prompt, json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def build_yesterday_review_report_prompt(
@@ -435,9 +479,12 @@ def build_report_prompt(
             "把 market_context 视为主要分析输入，其中 current_daily_bar、previous_daily_bar、recent_daily_bars、current_weekly_bar、previous_weekly_bar、recent_weekly_bars 为程序整理后的可靠行情上下文。",
             "如果 screening_context.data_available 为 true，必须吸收其中的 stock_context/latest_pool_state/latest_model_top3：说明该股是否进入最新智能选股池、全市场模型排序、Top3/候选状态、风险分与资金/行业证据；但不得因为模型排序单独给出买入结论。",
             "如果 screening_context.data_available 为 false 或 stock_context 缺失，要明确表示智能选股上下文不可用或该股未出现在最新模型池中，并回到行情、财务和历史观点进行判断。",
+            "如果 screening_context.symbol_in_latest_pool 为 false 但存在 standalone_stock_context，要明确说明该股不在最新模型池中；同时吸收 standalone_stock_context 里的单股增强信息，包括 technical_snapshot、moneyflow_context、market_event_context、company_profile、earnings_context。若 technical_snapshot 中存在 ma20、distance_to_ma20_pct、risk_score、risk_flags、setup_notes，summary_markdown、trend_judgement 与 decision.rationale 至少要明确落地其中 2 项，不能只泛泛描述'震荡'或'转强'。",
+            "如果 stock_context.standalone_score_context 为 true，stock_context.recommendation_score / overall_score 只是单股独立评估下的执行分与形态质量分，不代表全市场池内排序、Top100席位或今日Top3资格。",
             "对于默认跟踪池股票，若它不在最新智能选股Top100或Top3中，应把这作为相对强度不足的一个反证，而不是直接否定个股；仍需结合价格、量能、资金和持仓状态给出跟踪/观察/回避建议。",
             "若 screening_context 中存在 distribution_risk_score、distribution_risk_flags、top3_extreme_risk_blocked、top3_extreme_risk_reason、recent_runup_5d、turnover_spike_ratio，必须在风险提示或决策证据中解释其含义。",
-            "若 screening_context 中存在 moneyflow_3d_value、recent_large_order_net_inflow、recent_super_large_order_net_inflow、industry_heat_score、industry_flow_bias，必须用于判断资金承接、行业共振或资金分歧。",
+            "若 screening_context 中存在 moneyflow_3d_value、recent_large_order_net_inflow、recent_super_large_order_net_inflow、industry_heat_score、industry_flow_bias，必须用于判断资金承接、行业共振或资金分歧。若 standalone_stock_context.moneyflow_context 存在 recent_3d_net_inflow、recent_large_order_net_inflow、recent_super_large_order_net_inflow，也必须在 summary_markdown、risk_warning 或 decision.evidence 中至少引用 1 项，说明是资金承接改善还是主力仍偏谨慎。",
+            "若 screening_context 或 standalone_stock_context 中存在 top_list/top_list_summary/limit_list/limit_status，要把龙虎榜资金方向、上榜原因、涨跌停异动强弱写入交易结构判断；若存在 business_summary 或 earnings_forecast_summary，要补充主营逻辑、预告变化或业绩预期对当前走势的支持/拖累。",
             "凡是描述'收涨/收跌'、'放量/缩量'、'站上/跌破'、'今日/本次'相对变化时，优先基于 market_context.current_daily_bar 与 market_context.previous_daily_bar 做比较；仅在缺失时，才回退为当前 snapshot 截面描述。",
             "凡是引用 snapshot.amount 或 market_context 中的 amount 描述成交额时，必须按'千元'理解；若输出为'亿'，请用 amount / 100000 换算，禁止把千元误写成万元或亿元。",
             "成交额是高频易错项：若 snapshot.amount=128386.959，则成交额只能写成 1.284 亿、约 1.28 亿或 12838.6959 万，绝不能写成 12.84 亿。",
@@ -466,18 +513,52 @@ def build_report_prompt(
             "如果 symbol_context.position_status 为 watching，优先在 buy 与 avoid 中做决策；若暂不入场但存在明确触发位，可使用 avoid 并给出 entry_zone 作为观察区间。",
             "如果 symbol_context.is_default_pool_symbol 为 true 且 position_status 为空，也要尽量给出可执行参考；只有在边界不清晰时才使用 avoid。",
             "给出可执行但克制的操作建议，不要承诺收益。",
-            "trend_judgement 控制在 80 字内。",
-            "trend_breakdown 中每个 reason 控制在 110 字内。",
-            "operation_advice 控制在 90 字内。",
-            "risk_warning 最多 4 条，每条控制在 60 字内。",
-            "observation_points 最多 4 条，每条控制在 60 字内。",
-            "decision.rationale 控制在 120 字内，decision.evidence 最多 4 条。",
-            "prediction_windows 每条 rationale 控制在 90 字内。",
-            "summary_markdown 控制在 320 字内，memory.summary 控制在 180 字内。",
+            "trend_judgement 控制在 120 字内。",
+            "trend_breakdown 中每个 reason 控制在 180 字内。",
+            "operation_advice 控制在 140 字内。",
+            "risk_warning 最多 5 条，每条控制在 90 字内。",
+            "observation_points 最多 5 条，每条控制在 90 字内。",
+            "decision.rationale 控制在 220 字内，decision.evidence 最多 6 条。",
+            "prediction_windows 每条 rationale 控制在 140 字内。",
+            "summary_markdown 作为详情页主要阅读内容，目标 260-420 个中文字符，最多 600 个中文字符；要覆盖趋势结论、关键价位/均线、量能或资金、主要风险与操作前提，不要只写一句泛化摘要。memory.summary 控制在 260 字内。",
         ],
     }
 
     return system_prompt, json.dumps(user_payload, ensure_ascii=False, indent=2)
+
+
+
+def build_single_stock_main_analysis_rewrite_prompt(
+    *,
+    stock_payload: dict[str, object],
+    screening_context: Optional[dict[str, object]] = None,
+) -> tuple[str, str]:
+    system_prompt = (
+        "你是一名擅长 A 股盘后复盘的重点个股分析师。"
+        "你的任务不是重复结构化字段，而是把技术结构、关键价位、资金承接、风险分歧、龙虎榜/异动、业绩催化串成一段自然、具体、可读的主分析。"
+        "只输出纯文本，不要输出 JSON，不要输出 Markdown 标题，不要列表化堆砌。"
+        "避免模板腔，避免机械重复‘综合来看’‘操作上先看’‘它能进入重点名单’这类话术。"
+    )
+    user_payload = {
+        "task": "将单股结构化分析重写为一段更自然的重点个股主分析",
+        "stock_payload": stock_payload,
+        "screening_context": screening_context,
+        "writing_requirements": [
+            "输出 1 段主分析，目标长度 220 到 350 字。",
+            "必须优先串联以下维度中的可用信息：技术结构、MA20 或关键支撑压力、资金流、风险分歧、龙虎榜/涨跌停异动、业绩催化。",
+            "如果某个维度没有数据就跳过，不要硬编。",
+            "不要简单复述 summary_markdown、operation_advice、decision.rationale 原句；要重新组织成更自然的分析段落。",
+            "如果存在 ma20、distance_to_ma20_pct、recent_5d_high、recent_5d_low，要明确解释当前价格所处位置、回踩/追高风险或突破门槛。",
+            "如果存在 recent_3d_net_inflow、recent_large_order_net_inflow、recent_super_large_order_net_inflow 或 moneyflow_summary，要明确说明资金承接改善、分歧扩大还是主力仍偏谨慎。",
+            "如果存在 risk_flags、distribution_risk_flags、recent_runup_5d、turnover_spike_ratio，要写出风险来自哪里，而不是只说‘风险较高’。",
+            "如果存在 top_list_summary、limit_status，要解释这是情绪强化、资金背书，还是高波动信号。",
+            "如果存在 earnings_forecast_summary、financial_indicators、earnings_express，要说明业绩催化对走势的支持或拖累。",
+            "结尾允许给一句执行提醒，但不要把整段写成条目式操作指南。",
+            "禁止输出空泛套话，禁止只堆数据。",
+        ],
+    }
+    return system_prompt, json.dumps(user_payload, ensure_ascii=False, indent=2)
+
 
 
 def _build_time_context(

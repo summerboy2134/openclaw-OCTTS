@@ -276,70 +276,57 @@ class MarketRawDataRepository:
             session.close()
 
     def get_market_daily_summary(self, *, trade_date: str) -> Dict[str, Any]:
-        """获取市场日线汇总统计：涨跌家数、平均涨跌幅、成交额等。"""
         trade_date_value = self._parse_date(trade_date)
         session = self._db.get_session()
         try:
-            rows = session.query(MarketDaily).filter(MarketDaily.trade_date == trade_date_value).all()
-            if not rows:
-                return {"pct_count": 0, "rise_count": 0, "fall_count": 0, "flat_count": 0}
-            rise_count = 0
-            fall_count = 0
-            flat_count = 0
-            total_pct_chg = 0.0
-            total_amount = 0.0
-            limit_up_estimate = 0
-            limit_down_estimate = 0
-            for row in rows:
-                pct_chg = float(row.pct_chg or 0.0)
-                if pct_chg > 0.05:
-                    rise_count += 1
-                elif pct_chg < -0.05:
-                    fall_count += 1
-                else:
-                    flat_count += 1
-                total_pct_chg += pct_chg
-                total_amount += float(row.amount or 0.0)
-                if pct_chg >= 9.8:
-                    limit_up_estimate += 1
-                elif pct_chg <= -9.8:
-                    limit_down_estimate += 1
-            pct_count = len(rows)
-            avg_pct_chg = total_pct_chg / pct_count if pct_count else 0.0
+            rows = (
+                session.query(MarketDaily)
+                .filter(MarketDaily.trade_date == trade_date_value)
+                .all()
+            )
+            pct_values = [float(row.pct_chg) for row in rows if row.pct_chg is not None]
+            amount_values = [float(row.amount) for row in rows if row.amount is not None]
+            rise_count = sum(1 for value in pct_values if value > 0)
+            fall_count = sum(1 for value in pct_values if value < 0)
+            flat_count = sum(1 for value in pct_values if value == 0)
             return {
-                "trade_date": trade_date,
-                "pct_count": pct_count,
+                "trade_date": trade_date_value.strftime("%Y%m%d"),
+                "total_count": len(rows),
+                "pct_count": len(pct_values),
                 "rise_count": rise_count,
                 "fall_count": fall_count,
                 "flat_count": flat_count,
-                "avg_pct_chg": round(avg_pct_chg, 4),
-                "total_amount": round(total_amount, 2),
-                "limit_up_estimate": limit_up_estimate,
-                "limit_down_estimate": limit_down_estimate,
+                "avg_pct_chg": sum(pct_values) / len(pct_values) if pct_values else None,
+                "total_amount": sum(amount_values) if amount_values else None,
+                "limit_up_estimate": sum(1 for value in pct_values if value >= 9.5),
+                "limit_down_estimate": sum(1 for value in pct_values if value <= -9.5),
             }
         finally:
             session.close()
 
     def get_market_limit_summary(self, *, trade_date: str) -> Dict[str, Any]:
-        """获取涨跌停汇总统计。"""
         trade_date_value = self._parse_date(trade_date)
         session = self._db.get_session()
         try:
-            limit_up_rows = (
+            rows = (
                 session.query(MarketLimitListDaily)
-                .filter(MarketLimitListDaily.trade_date == trade_date_value, MarketLimitListDaily.limit == "U")
+                .filter(MarketLimitListDaily.trade_date == trade_date_value)
                 .all()
             )
-            limit_down_rows = (
-                session.query(MarketLimitListDaily)
-                .filter(MarketLimitListDaily.trade_date == trade_date_value, MarketLimitListDaily.limit == "D")
-                .all()
-            )
+            limit_up = 0
+            limit_down = 0
+            for row in rows:
+                limit_text = str(row.limit or "").upper()
+                pct_chg = float(row.pct_chg) if row.pct_chg is not None else None
+                if limit_text in {"U", "UP", "涨停"} or (pct_chg is not None and pct_chg >= 9.5):
+                    limit_up += 1
+                elif limit_text in {"D", "DOWN", "跌停"} or (pct_chg is not None and pct_chg <= -9.5):
+                    limit_down += 1
             return {
-                "trade_date": trade_date,
-                "limit_up": len(limit_up_rows),
-                "limit_down": len(limit_down_rows),
-                "total_count": len(limit_up_rows) + len(limit_down_rows),
+                "trade_date": trade_date_value.strftime("%Y%m%d"),
+                "total_count": len(rows),
+                "limit_up": limit_up,
+                "limit_down": limit_down,
             }
         finally:
             session.close()

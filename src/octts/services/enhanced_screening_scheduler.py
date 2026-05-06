@@ -5133,6 +5133,12 @@ class EnhancedScreeningScheduler:
             "overall_score": overall_score,
             "risk_score": risk_score,
         }
+        fusion_70_30 = cls._first_defined_value(
+            item.get("fusion_70_30"),
+            recommendation.get("fusion_70_30"),
+            (item.get("selection_reason_components") or {}).get("fusion_70_30"),
+            (recommendation.get("selection_reason_components") or {}).get("fusion_70_30"),
+        )
         return {
             "model_rank": model_rank,
             "model_score": model_score,
@@ -5140,6 +5146,7 @@ class EnhancedScreeningScheduler:
             "recommendation_score": recommendation_score,
             "overall_score": overall_score,
             "risk_score": risk_score,
+            "fusion_70_30": fusion_70_30,
             "score_snapshot": score_snapshot,
         }
 

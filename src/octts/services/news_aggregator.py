@@ -142,13 +142,68 @@ class CailianNewsCollector(NewsCollector):
 class EastMoneyNewsCollector(NewsCollector):
     """东方财富新闻采集器"""
 
+    _DEFAULT_KEYWORDS = ("A股", "财报", "业绩", "涨停")
+
     def __init__(self):
         super().__init__(NewsSource.EASTMONEY)
         self.api_url = "https://search-api-web.eastmoney.com/search/jsonp"
 
     async def collect(self) -> List[NewsItem]:
         """采集东方财富新闻"""
-        return []
+        timeout = httpx.Timeout(connect=5.0, read=8.0, write=5.0, pool=5.0)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Referer": "https://so.eastmoney.com/",
+        }
+        results: List[NewsItem] = []
+        seen = set()
+        async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
+            for keyword in self._DEFAULT_KEYWORDS:
+                try:
+                    response = await client.get(
+                        self.api_url,
+                        params=_build_eastmoney_search_params(
+                            keyword=keyword,
+                            page_size=6,
+                            types=["cmsArticleWeb"],
+                        ),
+                    )
+                    response.raise_for_status()
+                except Exception as e:
+                    self.logger.warning("Failed to collect EastMoney news for %s: %s", keyword, e)
+                    continue
+                payload = _parse_eastmoney_jsonp_payload(response.text)
+                for item in self._parse_news_response(payload, limit=3):
+                    dedupe_key = (item.title, item.url)
+                    if dedupe_key in seen:
+                        continue
+                    seen.add(dedupe_key)
+                    results.append(item)
+        return results
+
+    def _parse_news_response(self, payload: Dict[str, Any], *, limit: int) -> List[NewsItem]:
+        results: List[NewsItem] = []
+        for item in payload.get("result", {}).get("cmsArticleWeb", []):
+            title = _clean_html_text(item.get("title") or item.get("titlecolor") or "")
+            content = _clean_html_text(item.get("content") or item.get("summary") or "")
+            raw_url = str(item.get("url") or item.get("shareUrl") or "").strip()
+            url = raw_url if raw_url.startswith("http") else f"https://so.eastmoney.com/news/s?keyword={quote_plus(title or content)}"
+            if not title:
+                continue
+            results.append(
+                NewsItem(
+                    source=self.source,
+                    title=title,
+                    content=content or title,
+                    url=url,
+                    publish_time=_parse_publish_time_value(item.get("date") or item.get("showTime") or item.get("pubTime")),
+                    tags=["财经新闻"],
+                )
+            )
+            if len(results) >= limit:
+                break
+        return results
 
 
 class EastMoneyStockNewsCollector(NewsCollector):
@@ -166,24 +221,6 @@ class EastMoneyStockNewsCollector(NewsCollector):
     ) -> List[StockLiveNewsItem]:
         if not keyword:
             return []
-        params = {
-            "cb": "jQuery3510875346244069884_1710000000000",
-            "param": json.dumps(
-                {
-                    "uid": "",
-                    "keyword": keyword,
-                    "type": ["cmsArticleWeb", "notice"],
-                    "client": "web",
-                    "clientType": "web",
-                    "pageIndex": 1,
-                    "pageSize": max(limit * 2, 6),
-                    "searchScope": "default",
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
-            "_": str(int(datetime.now().timestamp() * 1000)),
-        }
         timeout = httpx.Timeout(connect=5.0, read=8.0, write=5.0, pool=5.0)
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -193,7 +230,14 @@ class EastMoneyStockNewsCollector(NewsCollector):
 
         async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
             try:
-                response = await client.get(self.api_url, params=params)
+                response = await client.get(
+                    self.api_url,
+                    params=_build_eastmoney_search_params(
+                        keyword=keyword,
+                        page_size=max(limit * 2, 6),
+                        types=["cmsArticleWeb", "notice"],
+                    ),
+                )
                 response.raise_for_status()
                 return self._parse_stock_news_response(response.text, limit=limit)
             except Exception as e:
@@ -201,24 +245,16 @@ class EastMoneyStockNewsCollector(NewsCollector):
                 return []
 
     def _parse_stock_news_response(self, payload: str, *, limit: int) -> List[StockLiveNewsItem]:
-        start = payload.find("(")
-        end = payload.rfind(")")
-        if start == -1 or end == -1 or end <= start:
-            return []
-        try:
-            data = json.loads(payload[start + 1:end])
-        except Exception:
-            return []
-
+        data = _parse_eastmoney_jsonp_payload(payload)
         results: List[StockLiveNewsItem] = []
         seen = set()
         for item in data.get("result", {}).get("cmsArticleWeb", []) + data.get("result", {}).get("notice", []):
-            title = self._clean_html_text(item.get("title") or item.get("titlecolor") or "")
-            summary = self._clean_html_text(item.get("content") or item.get("summary") or "")
-            source = self._clean_html_text(item.get("mediaName") or item.get("source") or self.source.value)
+            title = _clean_html_text(item.get("title") or item.get("titlecolor") or "")
+            summary = _clean_html_text(item.get("content") or item.get("summary") or "")
+            source = _clean_html_text(item.get("mediaName") or item.get("source") or self.source.value)
             raw_url = str(item.get("url") or item.get("shareUrl") or "").strip()
             url = raw_url if raw_url.startswith("http") else f"https://so.eastmoney.com/news/s?keyword={quote_plus(title or summary)}"
-            publish_time = self._normalize_publish_time(item.get("date") or item.get("showTime") or item.get("pubTime"))
+            publish_time = _normalize_publish_time_text(item.get("date") or item.get("showTime") or item.get("pubTime"))
             category = "公告" if item.get("artType") == "notice" or item.get("noticeType") else "新闻"
             dedupe_key = (title, url)
             if not title or dedupe_key in seen:
@@ -238,16 +274,73 @@ class EastMoneyStockNewsCollector(NewsCollector):
                 break
         return results
 
-    @staticmethod
-    def _clean_html_text(value: str) -> str:
-        return BeautifulSoup(str(value or ""), "html.parser").get_text(" ", strip=True)
 
-    @staticmethod
-    def _normalize_publish_time(value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        text = str(value).strip()
-        return text or None
+def _build_eastmoney_search_params(*, keyword: str, page_size: int, types: List[str]) -> Dict[str, str]:
+    return {
+        "cb": "jQuery3510875346244069884_1710000000000",
+        "param": json.dumps(
+            {
+                "uid": "",
+                "keyword": keyword,
+                "type": types,
+                "client": "web",
+                "clientType": "web",
+                "pageIndex": 1,
+                "pageSize": page_size,
+                "searchScope": "default",
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        "_": str(int(datetime.now().timestamp() * 1000)),
+    }
+
+
+def _parse_eastmoney_jsonp_payload(payload: str) -> Dict[str, Any]:
+    start = payload.find("(")
+    end = payload.rfind(")")
+    if start == -1 or end == -1 or end <= start:
+        return {}
+    try:
+        data = json.loads(payload[start + 1:end])
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _clean_html_text(value: Any) -> str:
+    return BeautifulSoup(str(value or ""), "html.parser").get_text(" ", strip=True)
+
+
+def _normalize_publish_time_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _parse_publish_time_value(value: Any) -> datetime:
+    text = _normalize_publish_time_text(value)
+    if not text:
+        return datetime.now()
+    normalized = text.replace("/", "-")
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        "%m-%d %H:%M",
+    ):
+        try:
+            parsed = datetime.strptime(normalized, fmt)
+            if fmt == "%m-%d %H:%M":
+                return parsed.replace(year=datetime.now().year)
+            return parsed
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return datetime.now()
 
 
 class NewsAggregator:

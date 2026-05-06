@@ -8,11 +8,12 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from octts.config import Settings
 from octts.clients.llm_client import LLMClient
 from octts.prompts.report_prompt import (
+    build_focus_analysis_rewrite_prompt,
     build_today_screening_analysis_prompt,
     build_today_screening_format_prompt,
     build_today_screening_report_prompt,
@@ -20,6 +21,7 @@ from octts.prompts.report_prompt import (
 )
 from octts.services.news_aggregator import NewsCluster
 from octts.services.multi_dimensional_analyzer import MultiDimensionalAnalyzer
+from octts.models.screening_models import DatabaseManager, MarketStockBasic
 
 
 TECHNICAL_SIGNAL_LABELS = {
@@ -94,6 +96,7 @@ class IntelligentReportGenerator:
         self.settings = settings
         self.llm_client = llm_client or LLMClient(settings)
         self.analyzer = analyzer or MultiDimensionalAnalyzer(settings)
+        self._stock_name_cache: Optional[Dict[str, str]] = None
 
     async def generate_morning_report(
         self,
@@ -201,10 +204,15 @@ class IntelligentReportGenerator:
             news_clusters=news_clusters,
             screening_context=enriched_context,
         )
-        return await self._request_report_payload(
+        single_stage_payload = await self._request_report_payload(
             user_prompt=user_prompt,
             system_prompt=system_prompt,
             log_label="today structured screening report",
+        )
+        return await self._rewrite_focus_analyses_if_needed(
+            payload=single_stage_payload,
+            screening_context=enriched_context,
+            reasoning_payload={},
         )
 
     def _enrich_screening_context_for_report(self, screening_context: Dict[str, Any]) -> Dict[str, Any]:
@@ -248,11 +256,16 @@ class IntelligentReportGenerator:
             screening_context=screening_context,
             reasoning_payload=reasoning_payload,
         )
-        return await self._request_report_payload(
+        formatted_payload = await self._request_report_payload(
             user_prompt=format_user_prompt,
             system_prompt=format_system_prompt,
             log_label="today structured screening report formatter",
             model=self.settings.llm_report_formatter_model,
+        )
+        return await self._rewrite_focus_analyses_if_needed(
+            payload=formatted_payload,
+            screening_context=screening_context,
+            reasoning_payload=reasoning_payload,
         )
 
     def _build_stock_evidence_digest(self, item: Dict[str, Any]) -> Dict[str, Any]:
@@ -532,6 +545,55 @@ class IntelligentReportGenerator:
         overall_action.setdefault("theme_focuses", overall_action.get("theme_focuses") or [])
         return merged_focus, comparison, overall_action
 
+    async def _rewrite_focus_analyses_if_needed(
+        self,
+        *,
+        payload: Dict[str, Any],
+        screening_context: Dict[str, Any],
+        reasoning_payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        focus_items = list(payload.get("focus_stocks") or [])
+        if not focus_items:
+            return payload
+        context_map = {
+            item.get("ts_code"): item
+            for item in (screening_context.get("today_top3") or [])
+            if isinstance(item, dict) and item.get("ts_code")
+        }
+        reasoning_map = {
+            item.get("ts_code"): item
+            for item in (reasoning_payload.get("focus_reasoning") or [])
+            if isinstance(item, dict) and item.get("ts_code")
+        }
+        rewritten_items: List[Dict[str, Any]] = []
+        for item in focus_items:
+            if not isinstance(item, dict):
+                rewritten_items.append(item)
+                continue
+            code = item.get("ts_code")
+            context = context_map.get(code) or {}
+            merged = dict(context)
+            merged.update(item)
+            focus_analysis = self._clean_generated_text(merged.get("focus_analysis"))
+            overall_assessment = self._clean_generated_text(merged.get("overall_assessment"))
+            if not self._focus_analysis_needs_rewrite(focus_analysis, overall_assessment):
+                rewritten_items.append(item)
+                continue
+            rewritten_text = await self._rewrite_focus_analysis_item(
+                merged=merged,
+                reasoning_item=reasoning_map.get(code) or {},
+                existing_focus_analysis=focus_analysis,
+            )
+            if rewritten_text:
+                updated_item = dict(item)
+                updated_item["focus_analysis"] = rewritten_text
+                rewritten_items.append(updated_item)
+            else:
+                rewritten_items.append(item)
+        updated_payload = dict(payload)
+        updated_payload["focus_stocks"] = rewritten_items
+        return updated_payload
+
     @staticmethod
     def _build_cross_stock_synthesis_view(synthesis: Dict[str, Any], today_top3: List[Dict[str, Any]]) -> str:
         if not today_top3:
@@ -580,6 +642,13 @@ class IntelligentReportGenerator:
             return self._fallback_focus_stock_item(item)
         merged = dict(context)
         merged.update(item)
+        selection_components = dict(context.get("selection_reason_components") or {})
+        selection_components.update(item.get("selection_reason_components") or {})
+        merged["selection_reason_components"] = selection_components
+        if merged.get("fusion_70_30") in (None, ""):
+            merged["fusion_70_30"] = selection_components.get("fusion_70_30")
+        if merged.get("overall_score") in (None, ""):
+            merged["overall_score"] = selection_components.get("overall_score_norm")
         action_plan = dict(context.get("action_plan") or {})
         action_plan.update(item.get("action_plan") or {})
         merged["action_plan"] = {
@@ -642,10 +711,10 @@ class IntelligentReportGenerator:
             strength_change = ""
         merged["strength_change"] = strength_change or self._build_review_strength_change(merged)
         merged["market_context_view"] = str(merged.get("market_context_view") or self._build_review_market_context_view(merged))
-        review_analysis = str(merged.get("review_analysis") or "").strip()
+        review_analysis = self._clean_generated_text(merged.get("review_analysis") or merged.get("analysis"))
         if self._review_analysis_needs_fallback(review_analysis, merged.get("analysis") or merged.get("absence_reason") or ""):
-            review_analysis = ""
-        merged["review_analysis"] = review_analysis or self._build_review_analysis_fallback(merged)
+            review_analysis = self._clean_generated_text(merged.get("analysis") or merged.get("today_verdict") or merged.get("status"))
+        merged["review_analysis"] = review_analysis
         merged.setdefault("miss_reason_candidates", context.get("miss_reason_candidates") or [])
         merged.setdefault("missing_factor_candidates", context.get("missing_factor_candidates") or [])
         return merged
@@ -658,6 +727,7 @@ class IntelligentReportGenerator:
         funds_text = self._build_focus_risk_note(item)
         fallback = {
             **item,
+            "fusion_70_30": item.get("fusion_70_30") or (item.get("selection_reason_components") or {}).get("fusion_70_30"),
             "core_highlights": self._build_focus_core_highlights(item, funds_text),
             "risk_warnings": risk_warnings,
             "overall_assessment": str(item.get("summary") or item.get("recommendation_text") or "建议结合盘中信号跟踪。"),
@@ -911,26 +981,26 @@ class IntelligentReportGenerator:
 
         quality_text = "更偏交易性驱动"
         if overall_score >= 80:
-            quality_text = "综合质量与交易性都较完整"
+            quality_text = "基本面质量与交易性配合得还算完整"
         elif overall_score >= 65:
-            quality_text = "综合质量尚可，但仍要看盘中确认"
+            quality_text = "质量端没有明显短板，但还需要盘中承接继续确认"
 
         if recommendation_score >= overall_score + 3:
-            quality_text = "短线交易性强于中线质量"
+            quality_text = "短线交易热度明显强于中线质量验证"
         elif overall_score >= recommendation_score + 3:
-            quality_text = "质量端好于短线博弈端"
+            quality_text = "质量基础强于眼下的短线博弈强度"
 
-        risk_text = "更适合跟踪承接而不是直接追高"
+        risk_text = "更适合等承接确认后再决定是否提高参与度"
         if contradiction_penalty > 0:
-            risk_text = "执行层面存在分歧，追价容错率偏低"
+            risk_text = "执行难度偏高，追价后的回撤容忍度并不宽"
         elif moneyflow_3d_value not in (None, "") and float(moneyflow_3d_value or 0.0) < 0:
-            risk_text = "资金承接还不扎实，次日更容易走出高开分歧"
+            risk_text = "资金承接还不扎实，次日更容易演变成冲高后的分歧"
         elif profit_yoy not in (None, "") and float(profit_yoy or 0.0) < 0:
-            risk_text = "基本面暂时不支撑纯趋势外推，更像短线题材博弈"
+            risk_text = "基本面暂时还不足以支撑趋势外推，更像偏情绪驱动的交易机会"
         elif pct_change not in (None, "") and float(pct_change or 0.0) >= 7:
-            risk_text = "当日涨幅已经较大，次日重点看量价是否继续配合"
+            risk_text = "当日涨幅已经不小，次日要重点确认量价能否继续跟上"
 
-        return f"当前这只票{quality_text}，{risk_text}"
+        return f"整体看，这只票{quality_text}，但{risk_text}"
 
     def _localize_technical_signal(self, value: Any) -> str:
         text = str(value or "").strip()
@@ -943,6 +1013,8 @@ class IntelligentReportGenerator:
         if not text:
             return ""
         text = self._sanitize_structured_field_leaks(text)
+        text = text.replace("缺乏实时市场数据支持，主题关联性弱", "外部市场与主题证据有限，当前判断主要依赖个股价格、量能和资金结构")
+        text = text.replace("缺乏实时市场数据支持", "外部市场环境证据有限")
         if self._contains_internal_report_text(text):
             return ""
         for raw, label in TECHNICAL_SIGNAL_LABELS.items():
@@ -1153,7 +1225,7 @@ class IntelligentReportGenerator:
         if item.get("news_mentioned"):
             parts.append("个股同时具备新闻或主题催化，说明并非纯技术博弈。")
         if not parts:
-            parts.append("当前市场环境信息有限，需更多结合板块联动和盘面承接判断原逻辑是否顺风。")
+            parts.append("外部市场与主题证据有限，当前判断主要依赖个股价格、量能、资金承接和风险结构。")
         return "".join(parts)
 
     def _build_focus_trading_context_view(self, item: Dict[str, Any]) -> str:
@@ -1192,21 +1264,24 @@ class IntelligentReportGenerator:
         contradiction_penalty = float(item.get("short_term_contradiction_penalty") or 0.0)
 
         parts: List[str] = []
-        if market_view:
-            parts.append(market_view)
+        opening = self._build_focus_profile_opening(item)
+        opening_parts = [text for text in (opening, market_view) if text]
+        if opening_parts:
+            parts.append("".join(opening_parts))
 
-        ranking_reason = []
-        if recommendation_score not in (None, "") and overall_score_value not in (None, ""):
-            if abs(float(recommendation_score) - float(overall_score_value)) >= 0.5:
-                ranking_reason.append(
-                    f"它能进入今日重点名单，不只是因为综合质量不差，更因为短线交易排序分{float(recommendation_score):.1f}相对综合分{float(overall_score_value):.1f}更占优"
-                )
-            else:
-                ranking_reason.append("它能进入今日重点名单，更多说明综合质量与短线交易性同时过关")
+        ranking_reason = self._build_focus_ranking_reason(
+            item,
+            recommendation_score=recommendation_score,
+            overall_score_value=overall_score_value,
+        )
         if technical_view:
-            ranking_reason.append(f"从交易结构看，{technical_view.rstrip('。')}")
-        if ranking_reason:
-            parts.append("，".join(ranking_reason) + "。")
+            technical_sentence = technical_view.rstrip("。")
+            if ranking_reason:
+                parts.append(f"{ranking_reason}。交易结构上看，{technical_sentence}。")
+            else:
+                parts.append(f"交易结构上看，{technical_sentence}。")
+        elif ranking_reason:
+            parts.append(ranking_reason + "。")
 
         support_parts: List[str] = []
         if fundamental_view:
@@ -1220,14 +1295,65 @@ class IntelligentReportGenerator:
             if "暂未触发明显末端风险" in risk_note:
                 parts.append(f"风险侧看，{risk_note}，不能把低风险分简单理解成没有波动风险。")
             else:
-                parts.append(f"真正需要提防的不是普通波动，而是{risk_note}。")
+                parts.append(f"当前最该防的不是日内普通波动，而是{risk_note}。")
         if contradiction_penalty > 0:
-            parts.append("这类票当前更像有交易性、但执行难度也更高的机会，适合先看分歧是否收敛，再决定是否提高参与度。")
-        parts.append(f"综合来看，{overall_assessment}。")
-        parts.append(
-            f"操作上先看{str(action.get('entry_zone') or '更清晰触发区').strip()}附近能否继续获得承接；若后续向上推进，再参考{str(action.get('take_profit') or '分批处理').strip()}逐步兑现，若出现{str(action.get('invalid_condition') or '技术结构失真').strip()}，就按{str(action.get('stop_loss') or '跌破关键支撑').strip()}对应的风控思路处理。"
-        )
+            parts.append("这类机会更考验执行节奏，最好先等分歧收敛或承接回暖，再考虑是否提高参与强度。")
+        parts.append(overall_assessment.rstrip("。") + "。")
+        parts.append(self._build_focus_action_sentence(action))
         return "".join(part.rstrip("。") + "。" for part in parts if part)
+
+    def _build_focus_profile_opening(self, item: Dict[str, Any]) -> str:
+        pct_change = item.get("pct_change")
+        recent_runup_5d = item.get("recent_runup_5d")
+        moneyflow_value = item.get("moneyflow_3d_value")
+        business_summary = self._clean_generated_text(item.get("business_summary"))
+
+        if pct_change not in (None, "") and float(pct_change or 0.0) >= 9:
+            return "这是典型的强势辨识度票，盘面关注度已经被迅速拉高。"
+        if pct_change not in (None, "") and float(pct_change or 0.0) >= 5:
+            return "这更像一只正在走强的进攻型标的，短线资金愿意继续围绕它博弈。"
+        if recent_runup_5d not in (None, "") and float(recent_runup_5d or 0.0) >= 10:
+            return "这只票已经脱离普通跟涨阶段，开始进入加速后的分歧博弈区。"
+        if moneyflow_value not in (None, "") and float(moneyflow_value or 0.0) < 0:
+            return "这不是那种承接很顺的趋势票，更多是在强弱反复里寻找确认。"
+        if business_summary:
+            return "这只票并非纯情绪博弈，背后仍有一定产业或主营逻辑支撑。"
+        return "这只票当前更像盘面筛出来的重点观察对象，强弱判断要回到实际承接与节奏。"
+
+    def _build_focus_ranking_reason(
+        self,
+        item: Dict[str, Any],
+        *,
+        recommendation_score: Any,
+        overall_score_value: Any,
+    ) -> str:
+        if recommendation_score in (None, "") or overall_score_value in (None, ""):
+            return ""
+        recommendation_value = float(recommendation_score)
+        overall_value = float(overall_score_value)
+        diff = recommendation_value - overall_value
+        industry = str(item.get("industry") or "").strip()
+        if diff >= 3:
+            if industry:
+                return (
+                    f"它能排进前列，更主要是因为短线交易性和盘面辨识度更强，"
+                    f"而不是单纯依赖{industry}方向的质量标签"
+                )
+            return "它能排进前列，核心原因更偏向短线交易性和盘面辨识度，而不只是静态质量评分"
+        if diff <= -3:
+            return "它之所以还能留在重点观察名单里，更多靠的是质量基础和逻辑完整度，而不是纯粹的追涨动能"
+        return "它能留在重点名单里，说明质量、交易性和当下强弱至少没有明显失衡"
+
+    def _build_focus_action_sentence(self, action: Dict[str, Any]) -> str:
+        entry_zone = str(action.get("entry_zone") or "更清晰触发区").strip()
+        take_profit = str(action.get("take_profit") or "分批处理").strip()
+        invalid_condition = str(action.get("invalid_condition") or "技术结构失真").strip()
+        stop_loss = str(action.get("stop_loss") or "跌破关键支撑").strip()
+        return (
+            f"操作上更适合先观察{entry_zone}一带是否还有承接，"
+            f"若后续继续走强，再按{take_profit}附近分批兑现；"
+            f"一旦出现{invalid_condition}，就要按{stop_loss}对应的风控线及时处理。"
+        )
 
     def _looks_like_score_template_text(self, text: str) -> bool:
         text = str(text or "").strip()
@@ -1258,6 +1384,27 @@ class IntelligentReportGenerator:
             return True
         return False
 
+    def _focus_analysis_looks_canned(self, text: str) -> bool:
+        cleaned = self._clean_generated_text(text)
+        if not cleaned:
+            return False
+        canned_markers = (
+            "它能进入今日重点名单",
+            "真正需要提防的不是普通波动",
+            "综合来看，当前这只票",
+            "操作上先看",
+            "不只是因为综合质量不差",
+        )
+        return any(marker in cleaned for marker in canned_markers)
+
+    def _focus_analysis_needs_rewrite(self, text: str, overall_assessment: str) -> bool:
+        cleaned = self._clean_generated_text(text)
+        if not cleaned:
+            return True
+        if self._focus_analysis_looks_canned(cleaned):
+            return True
+        return self._focus_analysis_needs_fallback(cleaned, overall_assessment)
+
     def _focus_analysis_needs_fallback(self, text: str, overall_assessment: str) -> bool:
         cleaned_text = self._clean_generated_text(text)
         if not cleaned_text:
@@ -1275,9 +1422,61 @@ class IntelligentReportGenerator:
             return True
         return False
 
+    async def _rewrite_focus_analysis_item(
+        self,
+        *,
+        merged: Dict[str, Any],
+        reasoning_item: Dict[str, Any],
+        existing_focus_analysis: str,
+    ) -> str:
+        system_prompt, user_prompt = build_focus_analysis_rewrite_prompt(
+            stock_context={
+                "ts_code": merged.get("ts_code"),
+                "name": merged.get("name"),
+                "industry": merged.get("industry"),
+                "pct_change": merged.get("pct_change"),
+                "close": merged.get("close"),
+                "turnover_rate": merged.get("turnover_rate"),
+                "ma20": merged.get("ma20"),
+                "recommendation_score": merged.get("recommendation_score"),
+                "overall_score": merged.get("overall_score"),
+                "moneyflow_3d_value": merged.get("moneyflow_3d_value"),
+                "distribution_risk_flags": merged.get("distribution_risk_flags") or [],
+                "recent_runup_5d": merged.get("recent_runup_5d"),
+                "business_summary": merged.get("business_summary"),
+                "top_list_summary": merged.get("top_list_summary"),
+                "earnings_forecast_summary": merged.get("earnings_forecast_summary"),
+                "action_plan": merged.get("action_plan") or {},
+                "market_performance_view": merged.get("market_performance_view"),
+                "trading_context_view": merged.get("trading_context_view"),
+                "fundamental_view": merged.get("fundamental_view"),
+                "catalyst_and_capital_view": merged.get("catalyst_and_capital_view"),
+                "overall_assessment": merged.get("overall_assessment"),
+            },
+            reasoning_item=reasoning_item or None,
+            existing_focus_analysis=existing_focus_analysis,
+        )
+        rewrite_payload = await self._request_report_payload(
+            user_prompt=user_prompt,
+            system_prompt=system_prompt,
+            log_label="focus analysis targeted rewrite",
+            model=self.settings.llm_report_formatter_model,
+        )
+        rewritten_text = self._clean_generated_text(rewrite_payload.get("focus_analysis"))
+        if not rewritten_text:
+            return ""
+        cleaned_assessment = self._clean_generated_text(merged.get("overall_assessment"))
+        if self._focus_analysis_needs_fallback(rewritten_text, cleaned_assessment):
+            return ""
+        if self._focus_analysis_looks_canned(rewritten_text):
+            return ""
+        return rewritten_text
+
     def _review_analysis_needs_fallback(self, text: str, reference_text: str) -> bool:
         cleaned_text = self._clean_generated_text(text)
         if not cleaned_text:
+            return True
+        if self._contains_internal_report_text(cleaned_text):
             return True
         if self._looks_like_score_template_text(cleaned_text):
             return True
@@ -1332,7 +1531,7 @@ class IntelligentReportGenerator:
             parts.append("盘面上" + "，".join(dynamics))
 
         analysis = str(item.get("analysis") or item.get("absence_reason") or "").strip()
-        if analysis and not self._looks_like_score_template_text(analysis):
+        if analysis and not self._looks_like_score_template_text(analysis) and not self._contains_internal_report_text(analysis):
             parts.append(analysis)
         elif not dynamics:
             parts.append("重点看价格强弱、换手变化和板块承接是否还支持原判断")
@@ -1348,53 +1547,11 @@ class IntelligentReportGenerator:
         return "市场环境信息有限，重点看原先催化是否延续、板块资金是否还愿意承接。"
 
     def _build_review_analysis_fallback(self, item: Dict[str, Any]) -> str:
-        action = item.get("action_plan") or {}
-        yesterday_conclusion = str(item.get("yesterday_conclusion") or "昨日入选 Top3").strip()
-        today_verdict = str(item.get("today_verdict") or item.get("status") or "待复评").strip()
-        analysis = str(item.get("analysis") or item.get("absence_reason") or "今日表现需要结合缺席原因复盘。").strip()
-        if self._looks_like_score_template_text(analysis):
-            analysis = "今日盘面给出的反馈更多是强度回落还是延续承接，需要结合价格、量能与板块资金继续确认。"
-        miss_reason_candidates = [str(candidate).strip() for candidate in (item.get("miss_reason_candidates") or []) if str(candidate).strip()]
-        missing_factor_candidates = [str(candidate).strip() for candidate in (item.get("missing_factor_candidates") or []) if str(candidate).strip()]
-        next_watch = "、".join((miss_reason_candidates + missing_factor_candidates)[:3]) or str(action.get("invalid_condition") or "原有技术结构是否失真").strip()
-
-        pct_change = item.get("pct_change")
-        turnover_rate = item.get("turnover_rate")
-        amplitude = item.get("amplitude")
-        volume_ratio = item.get("volume_ratio")
-        recent_runup_5d = item.get("recent_runup_5d")
-        market_parts: List[str] = []
-        if pct_change not in (None, ""):
-            market_parts.append(f"当日涨跌幅{float(pct_change):+.2f}%")
-        if turnover_rate not in (None, ""):
-            market_parts.append(f"换手率约{float(turnover_rate):.2f}%")
-        if volume_ratio not in (None, ""):
-            ratio = float(volume_ratio)
-            if ratio >= 1:
-                market_parts.append(f"量能放大至均量的{ratio:.2f}倍")
-            else:
-                market_parts.append(f"量能回落至均量的{ratio:.2f}倍")
-        if amplitude not in (None, ""):
-            market_parts.append(f"振幅约{float(amplitude):.2f}%")
-        if recent_runup_5d not in (None, ""):
-            market_parts.append(f"近5日累计涨跌约{float(recent_runup_5d):+.1f}%")
-        market_text = "，".join(market_parts) if market_parts else "价格与量能变化仍需结合盘中承接继续确认"
-
-        if yesterday_conclusion == "昨日结论缺失":
-            yesterday_text = "昨日缺少清晰结论"
-        else:
-            yesterday_text = f"昨日逻辑是“{yesterday_conclusion}”"
-
-        return "".join(
-            [
-                f"{yesterday_text}，今天的复盘结论是“{today_verdict}”。",
-                f"从盘面反馈看，{market_text}。",
-                f"结合当日表现，{analysis}",
-                f"强弱变化方面，{self._build_review_strength_change(item)}。",
-                f"当前处理上更适合以{str(action.get('action_bias') or '观察').strip()}应对，关注{str(action.get('entry_zone') or '更清晰触发位').strip()}，止盈参考{str(action.get('take_profit') or '分批处理').strip()}，止损参考{str(action.get('stop_loss') or '跌破关键支撑离场').strip()}。",
-                f"下一步重点观察{next_watch}，若出现{str(action.get('invalid_condition') or '原先驱动失效').strip()}，就要把昨日逻辑按失效处理。",
-            ]
-        )
+        analysis = self._clean_generated_text(item.get("analysis") or item.get("today_verdict") or item.get("status"))
+        if analysis:
+            return analysis.rstrip("。") + "。"
+        status = str(item.get("status") or item.get("review_status") or "观察").strip()
+        return f"当前复盘状态为{status}，建议结合3日收益、承接和后续强弱继续跟踪。"
 
     def _build_fallback_report_blocks(
         self,
@@ -1423,7 +1580,7 @@ class IntelligentReportGenerator:
             "headline": "结构化报告暂使用本地回退结果",
             "market_view": str(market_data.get("trend") or "市场概览数据不可用"),
             "risk_summary": str(market_data.get("sentiment") or "市场风险概览数据不可用"),
-            "action_items": ["优先跟踪今日 Top3，昨日对象重点看是否延续。"],
+            "action_items": ["优先跟踪今日 Top3，3日前 Top3 复盘对象重点看是否触发弱票卖出规则。"],
         }
         theme_focus_items = self._build_theme_focus_items(news_clusters, overall_action)
         overall_action["theme_focuses"] = theme_focus_items
@@ -1458,13 +1615,13 @@ class IntelligentReportGenerator:
 
     def _format_review_section(self, items: List[Dict[str, Any]]) -> str:
         if not items:
-            return "暂无昨日 Top3 今日复评数据。"
+            return "暂无3日前 Top3 复盘数据。"
         lines: List[str] = []
         for item in items:
             lines.extend(
                 [
                     f"【{item.get('ts_code', '')} {item.get('name', '')}】{item.get('status', item.get('today_verdict', '待复评'))}",
-                    f"昨日结论：{item.get('yesterday_conclusion', '暂无')}",
+                    f"3日前结论：{item.get('yesterday_conclusion', '暂无')}",
                     f"今日判断：{item.get('today_verdict', item.get('status', '暂无'))}",
                     f"复盘说明：{item.get('analysis', '暂无')}",
                     *([f"失误候选：{'、'.join(item.get('miss_reason_candidates') or [])}"] if (item.get('miss_reason_candidates') or []) else []),
@@ -1523,9 +1680,7 @@ class IntelligentReportGenerator:
         for item in list(getattr(cluster, "news_items", []) or [])[:3]:
             title = str(getattr(item, "title", "") or "").strip()
             content = str(getattr(item, "content", "") or "").strip()
-            brief = title or content
-            if title and content and content != title:
-                brief = f"{title}：{content}"
+            brief = self._build_news_brief_text(title=title, content=content)
             if brief:
                 news_briefs.append(brief)
         return {
@@ -1536,18 +1691,47 @@ class IntelligentReportGenerator:
             "news_briefs": news_briefs,
         }
 
+    @staticmethod
+    def _build_news_brief_text(*, title: str, content: str, max_content_chars: int = 120) -> str:
+        title_text = " ".join(str(title or "").split()).strip()
+        content_text = " ".join(str(content or "").split()).strip()
+        if content_text == title_text:
+            content_text = ""
+        content_text = IntelligentReportGenerator._truncate_news_text(content_text, max_content_chars)
+        if title_text and content_text:
+            return f"{title_text}：{content_text}"
+        return title_text or content_text
+
+    @staticmethod
+    def _truncate_news_text(text: str, limit: int) -> str:
+        cleaned = " ".join(str(text or "").split()).strip()
+        if len(cleaned) <= limit:
+            return cleaned
+        candidate = cleaned[:limit].rstrip("，、；：,. ")
+        sentence_ends = [candidate.rfind(mark) for mark in ("。", "！", "？", ";", "；")]
+        cut = max(sentence_ends)
+        if cut >= max(24, int(limit * 0.45)):
+            candidate = candidate[: cut + 1].rstrip()
+        return candidate.rstrip("，、；：,. ") + "…"
+
     def _build_theme_focus_items(
         self,
         news_clusters: List[Dict[str, Any]],
         overall_action: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
+        cluster_by_theme = {
+            str(cluster.get("theme") or "").strip(): cluster
+            for cluster in news_clusters
+            if str(cluster.get("theme") or "").strip()
+        }
         for item in overall_action.get("theme_focuses") or []:
             if not isinstance(item, dict):
                 continue
             theme = str(item.get("theme") or "").strip()
             if not theme:
                 continue
+            matched_cluster = cluster_by_theme.get(theme) or {}
             summary = str(item.get("summary") or "").strip()
             continuity_view = str(item.get("continuity_view") or "").strip()
             tier = self._normalize_theme_tier(item.get("tier"), theme, summary, continuity_view)
@@ -1559,6 +1743,7 @@ class IntelligentReportGenerator:
                     "summary": summary or self._build_theme_summary_from_cluster({"theme": theme}),
                     "continuity_view": continuity_view or self._build_theme_continuity_view({"theme": theme, "summary": summary}),
                     "related_stocks": related_stocks,
+                    "news_briefs": list(item.get("news_briefs") or matched_cluster.get("news_briefs") or [])[:3],
                     "importance": self._safe_float_value(item.get("importance"), 0.0),
                 }
             )
@@ -1576,17 +1761,19 @@ class IntelligentReportGenerator:
                     "summary": summary,
                     "continuity_view": self._build_theme_continuity_view(cluster),
                     "related_stocks": [str(stock).strip() for stock in (cluster.get("key_stocks") or []) if str(stock).strip()],
+                    "news_briefs": list(cluster.get("news_briefs") or [])[:3],
                     "importance": self._safe_float_value(cluster.get("importance"), 0.0),
                 }
             )
 
-        items.sort(
+        merged_items = self._merge_similar_theme_items(items)
+        merged_items.sort(
             key=lambda item: (
                 self._theme_tier_priority(item.get("tier")),
                 -self._safe_float_value(item.get("importance"), 0.0),
             )
         )
-        return items[:6]
+        return merged_items[:6]
 
     def _split_theme_clusters(
         self,
@@ -1643,7 +1830,115 @@ class IntelligentReportGenerator:
             "summary": str(overall_action.get("market_view") or market_data.get("trend") or "市场概览数据不可用"),
             "continuity_view": "、".join(top_themes) if top_themes else str(market_data.get("sentiment") or overall_action.get("risk_summary") or "市场风险概览数据不可用"),
             "related_stocks": related_stocks[:5],
+            "news_briefs": self._dedupe_news_briefs(
+                [
+                    str(brief).strip()
+                    for cluster in news_clusters[:3]
+                    for brief in (cluster.get("news_briefs") or [])[:2]
+                    if str(brief).strip()
+                ]
+            )[:3],
         }
+
+    def _merge_similar_theme_items(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        merged_groups: List[Tuple[str, Dict[str, Any]]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            theme_key = self._theme_merge_key(item)
+            if not theme_key:
+                continue
+            matched_index = next((idx for idx, (key, _) in enumerate(merged_groups) if key == theme_key), None)
+            normalized_item = {
+                **item,
+                "related_stocks": self._dedupe_strings(item.get("related_stocks") or [])[:6],
+                "news_briefs": self._dedupe_news_briefs(item.get("news_briefs") or [])[:3],
+            }
+            if matched_index is None:
+                merged_groups.append((theme_key, normalized_item))
+                continue
+            _, existing = merged_groups[matched_index]
+            merged_groups[matched_index] = (theme_key, self._merge_theme_item_pair(existing, normalized_item))
+        return [item for _, item in merged_groups]
+
+    def _merge_theme_item_pair(self, primary: Dict[str, Any], secondary: Dict[str, Any]) -> Dict[str, Any]:
+        importance = max(self._safe_float_value(primary.get("importance"), 0.0), self._safe_float_value(secondary.get("importance"), 0.0))
+        tier = primary.get("tier")
+        if self._theme_tier_priority(secondary.get("tier")) < self._theme_tier_priority(primary.get("tier")):
+            tier = secondary.get("tier")
+        summary = str(primary.get("summary") or "").strip()
+        secondary_summary = str(secondary.get("summary") or "").strip()
+        if secondary_summary and (not summary or len(secondary_summary) > len(summary)):
+            summary = secondary_summary
+        continuity_view = str(primary.get("continuity_view") or "").strip() or str(secondary.get("continuity_view") or "").strip()
+        news_briefs = self._dedupe_news_briefs(list(primary.get("news_briefs") or []) + list(secondary.get("news_briefs") or []))[:3]
+        related_stocks = self._dedupe_strings(list(primary.get("related_stocks") or []) + list(secondary.get("related_stocks") or []))[:6]
+        theme = str(primary.get("theme") or secondary.get("theme") or "").strip()
+        if primary.get("theme") != secondary.get("theme"):
+            if "商品" in theme or "能源" in theme or "原油" in theme:
+                theme = "海外大宗商品与能源波动"
+            elif len(str(secondary.get("theme") or "")) > len(theme):
+                theme = str(secondary.get("theme") or "").strip()
+        return {
+            **primary,
+            "theme": theme,
+            "tier": tier,
+            "summary": summary,
+            "continuity_view": continuity_view,
+            "news_briefs": news_briefs,
+            "related_stocks": related_stocks,
+            "importance": importance,
+        }
+
+    def _theme_merge_key(self, item: Dict[str, Any]) -> str:
+        text = " ".join(
+            str(item.get(key) or "").strip()
+            for key in ("theme", "summary", "continuity_view")
+        )
+        if any(keyword in text for keyword in ("原油", "WTI", "布伦特", "天然气", "能源", "商品", "大宗", "铜", "金属")):
+            return "commodities_energy"
+        return str(item.get("theme") or "").strip().lower()
+
+    @staticmethod
+    def _dedupe_strings(values: List[Any]) -> List[str]:
+        result: List[str] = []
+        seen = set()
+        for value in values:
+            text = str(value or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+        return result
+
+    def _dedupe_news_briefs(self, briefs: List[Any]) -> List[str]:
+        result: List[str] = []
+        seen_signatures = set()
+        for brief in briefs:
+            text = " ".join(str(brief or "").split()).strip()
+            if not text or text == "暂无相关新闻摘要":
+                continue
+            signature = self._normalize_news_signature(text)
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            result.append(text)
+        return result
+
+    @staticmethod
+    def _normalize_news_signature(text: str) -> str:
+        normalized = re.sub(r"\d+(?:\.\d+)?", "#", str(text or "").lower())
+        keyword_groups = {
+            "oil": ["wti", "布伦特", "原油", "伊朗"],
+            "gas": ["天然气"],
+            "copper": ["伦铜", "铜"],
+            "semiconductor": ["半导体", "存储", "芯片"],
+            "metal": ["锂", "小金属", "稀土"],
+        }
+        for label, keywords in keyword_groups.items():
+            if any(keyword in normalized for keyword in keywords):
+                return label
+        return normalized[:80]
 
     def _build_risk_theme_cluster(self, overall_action: Dict[str, Any], market_data: Dict[str, Any]) -> Dict[str, Any]:
         return {
@@ -1714,20 +2009,51 @@ class IntelligentReportGenerator:
         ranked = IntelligentReportGenerator._rank_codes(items, key, reverse=reverse)
         return ranked[0] if ranked else ""
 
-    @staticmethod
-    def _attach_comparison_names(comparison: Dict[str, Any], items: List[Dict[str, Any]]) -> Dict[str, Any]:
-        name_map = {
-            item.get("ts_code"): item.get("name")
-            for item in items
-            if item.get("ts_code") and item.get("name")
-        }
+    def _load_stock_name_cache(self) -> Dict[str, str]:
+        if self._stock_name_cache is not None:
+            return self._stock_name_cache
+        db = DatabaseManager(self.settings.database_url)
+        session = db.get_session()
+        try:
+            rows = session.query(MarketStockBasic.ts_code, MarketStockBasic.name).all()
+            self._stock_name_cache = {
+                str(ts_code).strip().upper(): str(name).strip()
+                for ts_code, name in rows
+                if str(ts_code or "").strip() and str(name or "").strip()
+            }
+        except Exception:
+            logger.exception("Failed to load stock names for comparison display")
+            self._stock_name_cache = {}
+        finally:
+            session.close()
+        return self._stock_name_cache
+
+    def _attach_comparison_names(self, comparison: Dict[str, Any], items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        stock_name_cache = self._load_stock_name_cache()
+        name_map: Dict[str, str] = {}
+        for item in items:
+            code = str(item.get("ts_code") or "").strip().upper()
+            if not code:
+                continue
+            name_candidates = [
+                item.get("name"),
+                item.get("stock_name"),
+                item.get("display_name"),
+                item.get("short_name"),
+                stock_name_cache.get(code),
+            ]
+            for candidate in name_candidates:
+                name = str(candidate or "").strip()
+                if name and name.upper() != code:
+                    name_map[code] = name
+                    break
 
         def format_code(code: Any) -> str:
-            code_text = str(code or "").strip()
+            code_text = str(code or "").strip().upper()
             if not code_text:
                 return ""
-            name = str(name_map.get(code_text) or "").strip()
-            return f"{code_text}（{name}）" if name else code_text
+            name = str(name_map.get(code_text) or stock_name_cache.get(code_text) or "").strip()
+            return f"{code_text}（{name}）" if name and name.upper() != code_text else code_text
 
         result = dict(comparison)
         for key in ("basic_rank", "technical_rank", "risk_rank", "trading_rank"):
