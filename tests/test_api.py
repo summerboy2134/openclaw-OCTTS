@@ -503,6 +503,18 @@ def test_stock_detail_data_returns_symbol_payload(tmp_path, monkeypatch) -> None
             OPENCLAW_HOOKS_ENABLED=True,
         ),
     )
+    monkeypatch.setattr(
+        "octts.api_routes.dashboard_routes.get_settings",
+        lambda: Settings(
+            OCTTS_HISTORY_FILE_PATH=str(history_path),
+            OCTTS_POSITION_FILE_PATH=str(tmp_path / "positions.json"),
+            OCTTS_HISTORY_LIMIT_PER_SYMBOL=30,
+            OCTTS_MEMORY_BACKEND="file",
+            OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+            OPENCLAW_GATEWAY_URL="http://127.0.0.1:18789",
+            OPENCLAW_HOOKS_ENABLED=True,
+        ),
+    )
 
     client = TestClient(app)
     response = client.get("/stocks/600000.SH/data")
@@ -513,6 +525,71 @@ def test_stock_detail_data_returns_symbol_payload(tmp_path, monkeypatch) -> None
     assert payload["openclaw_status"]["connected"] is True
     assert payload["position_status"] == "holding"
     assert payload["intelligent_screening_insight"]["ts_code"] == "600000.SH"
+
+
+def test_stock_detail_data_includes_analysis_context_metrics(tmp_path, monkeypatch) -> None:
+    history_path = tmp_path / "history.json"
+    record = _build_record()
+    record.snapshot.close = 12.0
+    record.snapshot.high = 12.4
+    record.snapshot.low = 11.8
+    record.snapshot.vol_ratio = 1.35
+    record.snapshot.turnover_rate = 2.4
+    record.snapshot.moneyflow_summary = {
+        "net_mf_amount": 1200.0,
+        "buy_lg_amount": 900.0,
+        "sell_lg_amount": 500.0,
+        "buy_elg_amount": 700.0,
+        "sell_elg_amount": 250.0,
+    }
+    record.snapshot.daily_summary = [
+        {
+            "trade_date": (datetime(2026, 2, 18) + timedelta(days=offset)).strftime("%Y%m%d"),
+            "open": 10.0,
+            "high": 10.5 + offset * 0.01,
+            "low": 9.5 + offset * 0.01,
+            "close": 10.0,
+        }
+        for offset in range(19)
+    ]
+    store = FileHistoryStore(str(history_path))
+    store.append(record)
+
+    monkeypatch.setattr(
+        "octts.api.get_settings",
+        lambda: Settings(
+            OCTTS_HISTORY_FILE_PATH=str(history_path),
+            OCTTS_POSITION_FILE_PATH=str(tmp_path / "positions.json"),
+            OCTTS_HISTORY_LIMIT_PER_SYMBOL=30,
+            OCTTS_MEMORY_BACKEND="file",
+            OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+        ),
+    )
+    monkeypatch.setattr(
+        "octts.api_routes.dashboard_routes.get_settings",
+        lambda: Settings(
+            OCTTS_HISTORY_FILE_PATH=str(history_path),
+            OCTTS_POSITION_FILE_PATH=str(tmp_path / "positions.json"),
+            OCTTS_HISTORY_LIMIT_PER_SYMBOL=30,
+            OCTTS_MEMORY_BACKEND="file",
+            OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+        ),
+    )
+
+    client = TestClient(app)
+    response = client.get("/stocks/600000.SH/data")
+
+    assert response.status_code == 200
+    analysis_context = response.json()["symbol"]["analysis_context"]
+    assert analysis_context["technical"]["ma20"] == 10.1
+    assert round(analysis_context["technical"]["distance_to_ma20_pct"], 2) == 18.81
+    assert analysis_context["technical"]["vol_ratio"] == 1.35
+    assert analysis_context["technical"]["turnover_rate"] == 2.4
+    assert analysis_context["technical"]["recent_5d_low"] == 9.65
+    assert analysis_context["technical"]["recent_5d_high"] == 12.4
+    assert analysis_context["moneyflow"]["net_mf_amount"] == 1200.0
+    assert analysis_context["moneyflow"]["buy_lg_amount"] == 900.0
+    assert analysis_context["moneyflow"]["sell_elg_amount"] == 250.0
 
 
 def test_stock_detail_data_includes_intelligent_screening_insight(tmp_path, monkeypatch) -> None:
@@ -531,7 +608,51 @@ def test_stock_detail_data_includes_intelligent_screening_insight(tmp_path, monk
         ),
     )
     monkeypatch.setattr(
+        "octts.api_routes.dashboard_routes.get_settings",
+        lambda: Settings(
+            OCTTS_HISTORY_FILE_PATH=str(history_path),
+            OCTTS_POSITION_FILE_PATH=str(tmp_path / "positions.json"),
+            OCTTS_HISTORY_LIMIT_PER_SYMBOL=30,
+            OCTTS_MEMORY_BACKEND="file",
+            OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+            OCTTS_HISTORY_DIR=str(tmp_path / "historydir"),
+        ),
+    )
+    monkeypatch.setattr(
         "octts.api._load_intelligent_dashboard_payload",
+        lambda settings, trade_date=None: {
+            "recommendation_pool": {
+                "frontlist": [{"ts_code": "600000.SH", "source_tag": "今日Top3", "recommendation_score": 88, "priority_score": 77, "ai_confidence": 0.8}],
+                "today_top": [{"ts_code": "600000.SH", "action_plan": {"entry_zone": "10-10.2", "take_profit": "10.8", "stop_loss": "9.8", "holding_horizon": "3个交易日", "invalid_condition": "跌破支撑"}}],
+            },
+            "report_context": {
+                "today_top3": [{"ts_code": "600000.SH", "recommendation_score": 88, "overall_score": 77, "display_confidence": 0.8, "recommendation_text": "继续观察", "technical_signal": "量价共振", "action_plan": {"action_bias": "观察"}}],
+                "yesterday_top3_review": [{"ts_code": "600000.SH", "today_verdict": "延续", "previous_recommendation_score": 82}],
+                "today_top3_live_context": [{"ts_code": "600000.SH", "name": "浦发银行", "query": "浦发银行", "items": [{"title": "浦发银行披露一季报预告", "summary": "业绩边际改善", "source": "东方财富", "url": "https://example.com/live1", "publish_time": "2026-03-30 09:35", "category": "公告"}]}],
+                "yesterday_top3_live_context": [],
+            },
+            "intelligent_report": {
+                "blocks": {
+                    "focus_stocks": [{
+                        "ts_code": "600000.SH",
+                        "core_highlights": ["趋势延续"],
+                        "risk_warnings": ["量能待确认"],
+                        "overall_assessment": "适合继续跟踪",
+                        "focus_analysis": "这里是重点分析",
+                        "market_context_view": "市场环境向好",
+                        "market_performance_view": "股价表现稳定",
+                        "catalyst_and_capital_view": "资金承接改善",
+                        "fundamental_view": "基本面稳健",
+                        "trading_context_view": "节奏以观察低吸为主",
+                        "action_plan": {"entry_zone": "10-10.2", "take_profit": "10.8", "stop_loss": "9.8", "invalid_condition": "跌破支撑"},
+                    }],
+                    "yesterday_reviews": [{"ts_code": "600000.SH", "today_verdict": "延续", "status": "延续"}],
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "octts.api_routes.dashboard_routes.load_intelligent_dashboard_payload",
         lambda settings, trade_date=None: {
             "recommendation_pool": {
                 "frontlist": [{"ts_code": "600000.SH", "source_tag": "今日Top3", "recommendation_score": 88, "priority_score": 77, "ai_confidence": 0.8}],

@@ -76,25 +76,47 @@ class ReportExporter:
         buffer = BytesIO()
 
         with ZipFile(buffer, mode="w", compression=ZIP_DEFLATED) as archive:
-            archive.writestr(
-                "index.html",
-                render_dashboard_html(
-                    dashboard_payload,
-                    stock_detail_href_prefix="./stocks/",
-                    stock_detail_href_suffix=".html",
-                    interactive=False,
-                ),
+            self._write_dashboard_archive_files(
+                archive=archive,
+                latest_records=latest_records,
+                dashboard_payload=dashboard_payload,
+                index_path="index.html",
+                stock_dir="stocks",
+                stock_back_href="../index.html",
             )
-            for record in latest_records:
-                archive.writestr(
-                    f"stocks/{record.report.ts_code}.html",
-                    render_stock_detail_html(
-                        record.report.ts_code,
-                        self.build_stock_detail_payload(record.report.ts_code),
-                        back_href="../index.html",
-                        interactive=False,
-                    ),
-                )
+
+        return archive_name, buffer.getvalue()
+
+    def export_combined_latest_report_zip(self, ts_codes: Optional[list[str]] = None) -> tuple[str, bytes]:
+        latest_records = self._filter_latest_records(self._history_store.list_latest(), ts_codes)
+        if not latest_records:
+            raise ValueError("No analysis history available for export.")
+
+        dashboard_payload = self.build_dashboard_payload(ts_codes)
+        intelligent_payload = self.build_intelligent_screening_payload()
+        latest_generated_at = latest_records[0].generated_at.strftime("%Y%m%d-%H%M%S")
+        archive_name = f"octts-combined-report-{latest_generated_at}.zip"
+        buffer = BytesIO()
+
+        with ZipFile(buffer, mode="w", compression=ZIP_DEFLATED) as archive:
+            self._write_dashboard_archive_files(
+                archive=archive,
+                latest_records=latest_records,
+                dashboard_payload=dashboard_payload,
+                index_path="index.html",
+                stock_dir="stocks",
+                stock_back_href="../index.html",
+                intelligent_screening_href="./intelligent-screening/index.html",
+            )
+            self._write_intelligent_screening_archive_files(
+                archive=archive,
+                payload=intelligent_payload,
+                latest_records=latest_records,
+                base_dir="intelligent-screening",
+                dashboard_href="../index.html",
+                include_dashboard_page=False,
+                stock_dir="stocks",
+            )
 
         return archive_name, buffer.getvalue()
 
@@ -111,8 +133,70 @@ class ReportExporter:
         buffer = BytesIO()
 
         with ZipFile(buffer, mode="w", compression=ZIP_DEFLATED) as archive:
+            self._write_intelligent_screening_archive_files(
+                archive=archive,
+                payload=payload,
+                latest_records=self._history_store.list_latest(),
+                base_dir="",
+                dashboard_href="./dashboard.html",
+                include_dashboard_page=True,
+                stock_dir="stocks",
+            )
+
+        return archive_name, buffer.getvalue()
+
+    def _write_dashboard_archive_files(
+        self,
+        *,
+        archive: ZipFile,
+        latest_records: list[HistoricalAnalysisRecord],
+        dashboard_payload: dict[str, object],
+        index_path: str,
+        stock_dir: str,
+        stock_back_href: str,
+        intelligent_screening_href: Optional[str] = None,
+    ) -> None:
+        archive.writestr(
+            index_path,
+            render_dashboard_html(
+                dashboard_payload,
+                stock_detail_href_prefix=f"./{stock_dir}/",
+                stock_detail_href_suffix=".html",
+                interactive=False,
+                intelligent_screening_href=intelligent_screening_href,
+            ),
+        )
+        for record in latest_records:
             archive.writestr(
-                "index.html",
+                f"{stock_dir}/{record.report.ts_code}.html",
+                render_stock_detail_html(
+                    record.report.ts_code,
+                    self.build_stock_detail_payload(record.report.ts_code),
+                    back_href=stock_back_href,
+                    interactive=False,
+                ),
+            )
+
+    def _write_intelligent_screening_archive_files(
+        self,
+        *,
+        archive: ZipFile,
+        payload: dict[str, Any],
+        latest_records: list[HistoricalAnalysisRecord],
+        base_dir: str,
+        dashboard_href: str,
+        include_dashboard_page: bool,
+        stock_dir: str,
+    ) -> None:
+        base_prefix = f"{base_dir}/" if base_dir else ""
+        tab_href_map = {
+            "overview": "./index.html",
+            "report": "./news.html",
+            "focus": "./focus.html",
+        }
+        for active_tab, filename in (("overview", "index.html"), ("report", "news.html"), ("focus", "focus.html")):
+            archive.writestr(
+                f"{base_prefix}{filename}",
                 render_intelligent_screening_dashboard(
                     screening_results=payload.get("screening_results") or {},
                     recommendation_pool=payload.get("recommendation_pool") or {},
@@ -123,25 +207,29 @@ class ReportExporter:
                     recommendation_methodology=payload.get("recommendation_methodology") or {},
                     report_context=payload.get("report_context") or {},
                     generated_at=payload.get("generated_at"),
-                    dashboard_href="./dashboard.html",
+                    dashboard_href=dashboard_href,
                     backtest_href=None,
                     refresh_href="./index.html",
                     jobs_api_base="",
                     autorun_enabled=False,
+                    active_tab=active_tab,
+                    tab_href_map=tab_href_map,
                 ),
             )
+
+        if include_dashboard_page:
             archive.writestr(
-                "dashboard.html",
+                f"{base_prefix}dashboard.html",
                 render_dashboard_html(
                     self.build_dashboard_payload(),
-                    stock_detail_href_prefix="./stocks/",
+                    stock_detail_href_prefix=f"./{stock_dir}/",
                     stock_detail_href_suffix=".html",
                     interactive=False,
                 ),
             )
-            for record in self._history_store.list_latest():
+            for record in latest_records:
                 archive.writestr(
-                    f"stocks/{record.report.ts_code}.html",
+                    f"{base_prefix}{stock_dir}/{record.report.ts_code}.html",
                     render_stock_detail_html(
                         record.report.ts_code,
                         self.build_stock_detail_payload(record.report.ts_code),
@@ -149,8 +237,6 @@ class ReportExporter:
                         interactive=False,
                     ),
                 )
-
-        return archive_name, buffer.getvalue()
 
     def _filter_latest_records(
         self, records: list[HistoricalAnalysisRecord], ts_codes: Optional[list[str]]

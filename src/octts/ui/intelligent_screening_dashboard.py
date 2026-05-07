@@ -915,6 +915,7 @@ def render_intelligent_screening_dashboard(
     jobs_api_base: str = "/screen/intelligent/jobs",
     autorun_enabled: bool = True,
     active_tab: str = "overview",
+    tab_href_map: Optional[Dict[str, str]] = None,
 ) -> str:
     screening_results = screening_results or {}
     recommendation_pool = recommendation_pool or {}
@@ -1030,9 +1031,10 @@ def render_intelligent_screening_dashboard(
         "report": "今日新闻",
         "focus": "重点个股",
     }
+    tab_href_map = tab_href_map or {}
     tab_links = []
     for tab_key in ("overview", "report", "focus"):
-        href = f"{refresh_href}?{urlencode({'tab': tab_key})}"
+        href = tab_href_map.get(tab_key) or f"{refresh_href}?{urlencode({'tab': tab_key})}"
         active_class = " is-active" if tab_key == active_tab else ""
         tab_links.append(
             f'<a class="tab-link{active_class}" href="{escape(href)}">{escape(tab_labels[tab_key])}</a>'
@@ -1139,21 +1141,21 @@ def render_intelligent_screening_dashboard(
     * {{ box-sizing: border-box; }}
     body {{ margin: 0; background: linear-gradient(180deg, var(--bg-accent) 0%, var(--bg) 220px); color: var(--text); }}
     a {{ color: inherit; }}
-    .shell {{ max-width: 1480px; margin: 0 auto; padding: 28px 24px 48px; }}
-    .hero {{ display:flex; justify-content:space-between; align-items:flex-start; gap:24px; margin-bottom:24px; padding: 24px 28px; background: rgba(255,255,255,0.78); border: 1px solid rgba(217, 226, 239, 0.9); border-radius: 24px; box-shadow: var(--shadow); backdrop-filter: blur(10px); }}
-    .hero h1 {{ margin:0 0 10px; font-size:34px; font-weight:800; color: var(--text-strong); }}
-    .hero p {{ margin:0; color: var(--muted); line-height:1.7; max-width:880px; }}
+    .shell {{ max-width: 1180px; margin: 0 auto; padding: 22px 20px 40px; }}
+    .hero {{ display:flex; justify-content:space-between; align-items:flex-start; gap:18px; margin-bottom:18px; padding: 20px 22px; background: rgba(255,255,255,0.78); border: 1px solid rgba(217, 226, 239, 0.9); border-radius: 20px; box-shadow: var(--shadow); backdrop-filter: blur(10px); }}
+    .hero h1 {{ margin:0 0 8px; font-size:28px; font-weight:800; color: var(--text-strong); }}
+    .hero p {{ margin:0; color: var(--muted); line-height:1.6; max-width:760px; }}
     .hero-actions {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; }}
-    .summary-grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:14px; margin:18px 0; }}
+    .summary-grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:12px; margin:14px 0; }}
     .summary-card, .panel, .stock-item, .report-section, .metric-card {{ background: var(--panel); border:1px solid var(--panel-border); border-radius:20px; box-shadow: var(--shadow); }}
-    .summary-card {{ padding:18px; background: linear-gradient(180deg, #ffffff 0%, #fdfefe 100%); }}
+    .summary-card {{ padding:14px; background: linear-gradient(180deg, #ffffff 0%, #fdfefe 100%); }}
     .summary-label, .mini-label {{ color: var(--muted); font-size:12px; }}
     .detail-label {{ color: var(--text-soft); font-size:12px; }}
-    .summary-value {{ margin-top:8px; font-size:24px; font-weight:800; color: var(--text-strong); }}
+    .summary-value {{ margin-top:6px; font-size:21px; font-weight:800; color: var(--text-strong); }}
     .summary-note {{ margin-top:8px; color: var(--muted); font-size:12px; line-height:1.6; }}
-    .stack {{ display:grid; gap:18px; }}
-    .top-grid {{ display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:18px; }}
-    .panel {{ padding:18px; position: relative; overflow: hidden; background: linear-gradient(180deg, #ffffff 0%, #fbfdff 100%); }}
+    .stack {{ display:grid; gap:14px; }}
+    .top-grid {{ display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:14px; }}
+    .panel {{ padding:15px; position: relative; overflow: hidden; background: linear-gradient(180deg, #ffffff 0%, #fbfdff 100%); }}
     .panel::before {{ content:""; position:absolute; inset:0 auto 0 0; width:4px; border-radius:20px 0 0 20px; background: #d7e1ee; }}
     .panel-today {{ background: linear-gradient(180deg, var(--today-soft), #ffffff 42%); }}
     .panel-today::before {{ background: var(--today-accent); }}
@@ -1165,39 +1167,39 @@ def render_intelligent_screening_dashboard(
     .panel-report::before {{ background: var(--report-accent); }}
     .panel-list {{ background: linear-gradient(180deg, var(--list-soft), #ffffff 42%); }}
     .panel-list::before {{ background: var(--list-accent); }}
-    .section-title, .report-title {{ font-size:18px; font-weight:800; margin-bottom:12px; color: var(--text-strong); }}
-    .subtle {{ color: var(--muted); line-height:1.7; }}
-    .tab-bar {{ display:flex; gap:12px; flex-wrap:wrap; margin:18px 0 22px; padding:14px 16px; background: rgba(255, 255, 255, 0.9); border:1px solid var(--panel-border); border-radius:18px; box-shadow: var(--shadow); }}
-    .tab-link {{ display:inline-flex; align-items:center; justify-content:center; padding:10px 16px; border-radius:999px; text-decoration:none; font-weight:700; color: var(--text-soft); background: #f6f9fc; border:1px solid #d8e3f0; }}
+    .section-title, .report-title {{ font-size:16px; font-weight:800; margin-bottom:10px; color: var(--text-strong); }}
+    .subtle {{ color: var(--muted); line-height:1.6; }}
+    .tab-bar {{ display:flex; gap:10px; flex-wrap:wrap; margin:14px 0 18px; padding:12px 14px; background: rgba(255, 255, 255, 0.9); border:1px solid var(--panel-border); border-radius:16px; box-shadow: var(--shadow); }}
+    .tab-link {{ display:inline-flex; align-items:center; justify-content:center; padding:9px 14px; border-radius:999px; text-decoration:none; font-weight:700; color: var(--text-soft); background: #f6f9fc; border:1px solid #d8e3f0; }}
     .tab-link.is-active {{ color: #1d4ed8; background: #eaf2ff; border-color: #b9d1ff; box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.08); }}
-    .primary-button, .ghost-link {{ appearance:none; border:1px solid var(--accent-border); color: var(--text-strong); background: #f5f9ff; padding:12px 18px; border-radius:14px; font-weight:700; cursor:pointer; text-decoration:none; box-shadow: 0 6px 16px rgba(37, 99, 235, 0.08); }}
+    .primary-button, .ghost-link {{ appearance:none; border:1px solid var(--accent-border); color: var(--text-strong); background: #f5f9ff; padding:10px 15px; border-radius:13px; font-weight:700; cursor:pointer; text-decoration:none; box-shadow: 0 6px 16px rgba(37, 99, 235, 0.08); }}
     .primary-button {{ background: linear-gradient(135deg, #edf4ff, #dbeafe); color: #1d4ed8; border-color: #bfd5ff; }}
     .primary-button:hover, .ghost-link:hover {{ transform: translateY(-1px); box-shadow: 0 10px 20px rgba(37, 99, 235, 0.12); }}
     .ghost-link {{ background: #ffffff; border:1px solid var(--panel-border); color: var(--text); }}
-    .stock-item {{ padding:16px; margin-bottom:12px; cursor:pointer; background: linear-gradient(180deg, #ffffff 0%, #fcfdff 100%); transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease; }}
+    .stock-item {{ padding:13px; margin-bottom:10px; cursor:pointer; background: linear-gradient(180deg, #ffffff 0%, #fcfdff 100%); transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease; }}
     .stock-item:hover {{ transform: translateY(-1px); box-shadow: 0 14px 28px rgba(15, 23, 42, 0.1); border-color: #c8d7ea; }}
     .stock-header {{ display:flex; justify-content:space-between; gap:12px; align-items:center; }}
     .stock-code {{ font-weight:800; margin-right:8px; color: var(--text-strong); }}
     .stock-name {{ color: var(--text-soft); }}
     .score-badge, .tag {{ padding:6px 10px; border-radius:999px; background: var(--accent-soft); color:#1d4ed8; border: 1px solid var(--accent-border); font-size:12px; font-weight: 700; }}
-    .detail-grid {{ display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap:12px; }}
-    .analysis-grid {{ display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:12px; margin-top:12px; }}
-    .detail-panel {{ background: linear-gradient(180deg, var(--panel-softer), var(--panel-soft)); border-radius:14px; padding:12px; border:1px solid rgba(210, 186, 154, 0.28); }}
+    .detail-grid {{ display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap:10px; }}
+    .analysis-grid {{ display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:10px; margin-top:10px; }}
+    .detail-panel {{ background: linear-gradient(180deg, var(--panel-softer), var(--panel-soft)); border-radius:13px; padding:10px; border:1px solid rgba(210, 186, 154, 0.28); }}
     .detail-panel-news {{ grid-column: 1 / -1; }}
-    .detail-value {{ margin-top:6px; line-height:1.75; color: var(--text-strong); }}
+    .detail-value {{ margin-top:5px; line-height:1.65; color: var(--text-strong); }}
     .detail-value strong {{ color: var(--text-strong); }}
-    .report-section {{ padding:18px; margin-bottom:16px; background: linear-gradient(180deg, #ffffff 0%, #fbfdff 100%); }}
+    .report-section {{ padding:15px; margin-bottom:13px; background: linear-gradient(180deg, #ffffff 0%, #fbfdff 100%); }}
     .panel .report-section:last-child, .panel .stock-item:last-child {{ margin-bottom: 0; }}
-    .report-content {{ line-height:1.85; color: var(--text-strong); background: linear-gradient(180deg, var(--panel-softer), var(--panel-soft)); border:1px solid rgba(210, 186, 154, 0.28); border-radius:14px; padding:12px 14px; margin-top:12px; }}
+    .report-content {{ line-height:1.7; color: var(--text-strong); background: linear-gradient(180deg, var(--panel-softer), var(--panel-soft)); border:1px solid rgba(210, 186, 154, 0.28); border-radius:13px; padding:10px 12px; margin-top:10px; }}
     .progress-wrap {{ margin:12px 0 0; }}
     .progress-bar {{ height:8px; border-radius:999px; background:#e5edf6; overflow:hidden; border: 1px solid #d6e1ee; }}
     .progress-fill {{ width:0%; height:100%; background:linear-gradient(90deg,#3b82f6,#10b981); }}
-    .empty-state {{ color: var(--muted); padding:24px; text-align:center; background: var(--surface-soft); border: 1px dashed #cfdae8; border-radius: 16px; }}
-    .metrics-grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:14px; }}
-    .metric-card {{ padding:16px; background: linear-gradient(180deg, #ffffff 0%, #f9fbff 100%); }}
-    .bullet-list {{ margin:0; padding-left:20px; color: var(--text-strong); line-height:1.9; }}
-    .news-cluster-list {{ display:grid; gap:14px; margin-top:16px; }}
-    .news-cluster-card {{ background: linear-gradient(180deg, var(--panel-softer), var(--panel-soft)); border:1px solid rgba(210, 186, 154, 0.28); border-radius:16px; padding:14px 16px; }}
+    .empty-state {{ color: var(--muted); padding:18px; text-align:center; background: var(--surface-soft); border: 1px dashed #cfdae8; border-radius: 14px; }}
+    .metrics-grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:12px; }}
+    .metric-card {{ padding:13px; background: linear-gradient(180deg, #ffffff 0%, #f9fbff 100%); }}
+    .bullet-list {{ margin:0; padding-left:18px; color: var(--text-strong); line-height:1.75; }}
+    .news-cluster-list {{ display:grid; gap:12px; margin-top:13px; }}
+    .news-cluster-card {{ background: linear-gradient(180deg, var(--panel-softer), var(--panel-soft)); border:1px solid rgba(210, 186, 154, 0.28); border-radius:14px; padding:12px 14px; }}
     .news-cluster-head {{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap; }}
     .news-cluster-title {{ font-size:16px; font-weight:800; color: var(--text-strong); }}
     .news-cluster-meta {{ margin-top:10px; color: var(--text-soft); line-height:1.75; }}
@@ -1222,7 +1224,7 @@ def render_intelligent_screening_dashboard(
       </div>
     </section>
 
-    <section class="panel" style="margin-bottom:18px;">
+    <section class="panel" style="margin-bottom:14px;">
       <div class="section-title">任务状态</div>
       <div id="runIntelligentScreeningStatus" class="subtle">准备就绪</div>
       <div id="runIntelligentScreeningStep" class="subtle">等待任务开始</div>
@@ -1244,7 +1246,7 @@ def render_intelligent_screening_dashboard(
     </nav>
 
     <section class="stack">
-      <section class="panel" style="margin-bottom:18px;">
+      <section class="panel" style="margin-bottom:14px;">
         <div class="section-title">运行状态与口径说明</div>
         <div class="subtle">3日胜率和5日胜率都不是今日筛选的实时胜率，而是历史今日 Top3 样本的回看统计。若未开启数据库或暂无已验证样本，则显示 --。</div>
       </section>

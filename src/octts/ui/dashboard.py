@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from html import escape
 from typing import Optional
 
 
@@ -10,6 +11,7 @@ def render_dashboard_html(
     stock_detail_href_prefix: str = "/stocks/",
     stock_detail_href_suffix: str = "",
     interactive: bool = True,
+    intelligent_screening_href: Optional[str] = None,
 ) -> str:
     return _render_shell(
         title="OCTTS Dashboard",
@@ -19,7 +21,7 @@ def render_dashboard_html(
             if interactive
             else "离线报告包已内嵌当前快照数据，打开本地 HTML 后仍可继续点击卡片进入单股详情。"
         ),
-        content=_dashboard_content(interactive=interactive),
+        content=_dashboard_content(interactive=interactive, intelligent_screening_href=intelligent_screening_href),
         script=_overview_script(
             initial_payload=data_payload,
             stock_detail_href_prefix=stock_detail_href_prefix,
@@ -49,14 +51,26 @@ def render_stock_detail_html(
     )
 
 
-def _dashboard_content(*, interactive: bool) -> str:
+def _dashboard_content(*, interactive: bool, intelligent_screening_href: Optional[str] = None) -> str:
     if not interactive:
-        return """
+        intelligent_link = ""
+        if intelligent_screening_href:
+            intelligent_link = (
+                '<div class="offline-intelligent-callout">'
+                '<div>'
+                '<div class="callout-title">智能选股系统已合并在本压缩包内</div>'
+                '<div class="subtle">点击右侧按钮查看今日新闻、重点个股和推荐 Top3。</div>'
+                '</div>'
+                f'<a class="offline-primary-link" href="{escape(intelligent_screening_href)}">打开智能选股系统</a>'
+                '</div>'
+            )
+        return f"""
       <section class="layout" style="grid-template-columns:minmax(0, 1fr);">
         <div class="main-column">
           <section class="panel">
             <div class="section-title">离线报告</div>
             <div class="subtle">当前压缩包包含总览与每只股票的详情页，点击下方卡片即可在本地继续跳转浏览。</div>
+            {intelligent_link}
           </section>
           <section class="summary-grid" id="summaryGrid"></section>
           <section class="cards" id="cards"></section>
@@ -268,10 +282,6 @@ def _detail_content(*, back_href: str, interactive: bool) -> str:
             </section>
             <section class="metrics-grid" id="detailMetrics"></section>
             <section class="panel">
-              <div class="section-title">智能选股建议</div>
-              <div id="detailIntelligentInsight" class="stack"></div>
-            </section>
-            <section class="panel">
               <div class="section-title">History Replay</div>
               <div id="detailHistory" class="timeline"></div>
             </section>
@@ -342,16 +352,16 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
     }}
 
     .page {{
-      max-width: 1500px;
+      max-width: 1180px;
       margin: 0 auto;
-      padding: 28px 24px 48px;
+      padding: 24px 20px 42px;
     }}
 
     .hero {{
       display: grid;
-      gap: 16px;
-      padding: 28px;
-      margin-bottom: 18px;
+      gap: 12px;
+      padding: 22px;
+      margin-bottom: 16px;
       background: linear-gradient(145deg, rgba(10, 22, 43, 0.92), rgba(10, 18, 34, 0.82));
       border: 1px solid var(--panel-border);
       box-shadow: var(--shadow);
@@ -361,7 +371,7 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
 
     .hero h1 {{
       margin: 0;
-      font-size: 30px;
+      font-size: 26px;
       font-weight: 800;
       letter-spacing: -0.02em;
     }}
@@ -375,7 +385,7 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
     .layout {{
       display: grid;
       grid-template-columns: minmax(0, 1fr) 320px;
-      gap: 18px;
+      gap: 14px;
       align-items: start;
     }}
 
@@ -385,7 +395,7 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
 
     .main-column, .side-column {{
       display: grid;
-      gap: 18px;
+      gap: 14px;
     }}
 
     .panel, .summary, .card, .hero-card {{
@@ -397,7 +407,7 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
     }}
 
     .panel {{
-      padding: 20px;
+      padding: 16px;
     }}
 
     .field {{
@@ -511,7 +521,7 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
     .hero-card {{
       padding: 24px;
       display: grid;
-      gap: 18px;
+      gap: 14px;
       background: linear-gradient(145deg, rgba(9, 20, 38, 0.96), rgba(10, 18, 32, 0.88));
     }}
 
@@ -535,6 +545,50 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
       background: rgba(15, 23, 42, 0.38);
     }}
 
+    .offline-intelligent-callout {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 14px;
+      margin-top: 16px;
+      padding: 16px;
+      border-radius: 18px;
+      border: 1px solid rgba(96, 165, 250, 0.28);
+      background:
+        radial-gradient(circle at 12% 20%, rgba(96, 165, 250, 0.16), transparent 32%),
+        linear-gradient(135deg, rgba(15, 23, 42, 0.82), rgba(30, 41, 59, 0.62));
+      box-shadow: 0 12px 30px rgba(2, 6, 23, 0.24);
+    }}
+
+    .callout-title {{
+      margin-bottom: 6px;
+      font-size: 16px;
+      font-weight: 800;
+      color: #f8fbff;
+    }}
+
+    .offline-primary-link {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 190px;
+      padding: 12px 18px;
+      border-radius: 999px;
+      color: #dbeafe;
+      background: linear-gradient(135deg, rgba(30, 64, 175, 0.82), rgba(37, 99, 235, 0.66));
+      border: 1px solid rgba(147, 197, 253, 0.42);
+      box-shadow: 0 10px 24px rgba(37, 99, 235, 0.18);
+      font-weight: 800;
+      letter-spacing: 0.01em;
+    }}
+
+    .offline-primary-link:hover {{
+      transform: translateY(-1px);
+      border-color: rgba(191, 219, 254, 0.62);
+      box-shadow: 0 14px 28px rgba(37, 99, 235, 0.24);
+    }}
+
     .section-title {{
       font-size: 13px;
       letter-spacing: 0.08em;
@@ -545,8 +599,8 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
 
     .summary-grid {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-      gap: 14px;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 12px;
     }}
 
     .summary-grid.compact {{
@@ -554,7 +608,7 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
     }}
 
     .summary {{
-      padding: 18px;
+      padding: 14px;
     }}
 
     .summary .label, .mini-label {{
@@ -565,21 +619,21 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
     }}
 
     .summary .value {{
-      margin-top: 10px;
-      font-size: 28px;
+      margin-top: 8px;
+      font-size: 24px;
       font-weight: 800;
     }}
 
     .cards {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
-      gap: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 14px;
     }}
 
     .card {{
-      padding: 22px;
+      padding: 18px;
       display: grid;
-      gap: 16px;
+      gap: 14px;
       transition: transform 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
     }}
 
@@ -687,7 +741,7 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
     .chart-and-summary {{
       display: grid;
       grid-template-columns: minmax(0, 1.2fr) minmax(300px, 0.8fr);
-      gap: 18px;
+      gap: 14px;
     }}
 
     .sparkline {{
@@ -958,23 +1012,6 @@ def _render_shell(*, title: str, page_title: str, page_subtitle: str, content: s
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#39;");
-    }}
-
-    function sparkline(records) {{
-      const values = (records || [])
-        .map(item => Number(item.close ?? item.close_price ?? item.price))
-        .filter(value => Number.isFinite(value));
-      if (!values.length) return '<div class="empty">暂无分时样本</div>';
-      const max = Math.max(...values);
-      const min = Math.min(...values);
-      const points = values.map((value, index) => {{
-        const x = values.length === 1 ? 200 : (index / (values.length - 1)) * 200;
-        const y = max === min ? 40 : 72 - ((value - min) / (max - min)) * 58;
-        return `${{x}},${{y}}`;
-      }}).join(" ");
-      return `<svg class="sparkline" viewBox="0 0 200 90" preserveAspectRatio="none">
-        <polyline fill="none" stroke="#60a5fa" stroke-width="3" points="${{points}}" />
-      </svg>`;
     }}
 
     function renderSummaryCard(label, value) {{
@@ -1468,7 +1505,6 @@ def _overview_script(
             <div class="metric"><div class="label">入场区间</div><div class="value">${formatEntryZoneDisplay(item.decision.signal, zone)}</div></div>
             <div class="metric"><div class="label">目标位</div><div class="value">${(item.decision.take_profit || []).map(v => formatValue(v)).join(" / ") || "—"}</div></div>
           </div>
-          ${sparkline(item.snapshot.minute_summary)}
           <div class="metric">
             <div class="label">操作建议</div>
             <div class="value">${escapeHtml(item.operation_advice)}</div>
@@ -1989,7 +2025,6 @@ def _detail_script(
     const detailFullAnalysis = document.getElementById("detailFullAnalysis");
     const detailMetrics = document.getElementById("detailMetrics");
     const detailHistory = document.getElementById("detailHistory");
-    const detailIntelligentInsight = document.getElementById("detailIntelligentInsight");
     const detailEvidence = document.getElementById("detailEvidence");
     const detailRisks = document.getElementById("detailRisks");
     const detailOpenclawStatus = document.getElementById("detailOpenclawStatus");
@@ -2027,14 +2062,16 @@ def _detail_script(
       const numeric = Number(value);
       if (!Number.isFinite(numeric)) return "—";
       const sign = numeric > 0 ? "+" : "";
-      return `${{sign}}${{numeric.toFixed(2)}}万`;
+      const inYi = numeric / 10000;
+      return `${{sign}}${{inYi.toFixed(2)}}亿`;
     }}
 
     function formatPercentValue(value, digits = 2) {{
       if (value === null || value === undefined || value === "") return "—";
       const numeric = Number(value);
       if (!Number.isFinite(numeric)) return "—";
-      return `${{(numeric * 100).toFixed(digits)}}%`;
+      const sign = numeric > 0 ? "+" : "";
+      return `${{sign}}${{numeric.toFixed(digits)}}%`;
     }}
 
     function renderPredictionWindows(predictionWindows) {{
@@ -2093,38 +2130,6 @@ def _detail_script(
               ${{renderList(riskItems)}}
             </div>
           </div>
-        </div>
-      `;
-    }}
-
-    function renderIntelligentInsight(insight) {{
-      if (!insight || (!insight.in_today_top3 && !insight.in_yesterday_review && !insight.overall_assessment)) {{
-        return '<div class="empty">暂无当日智能选股建议，当前页以历史分析为主。</div>';
-      }}
-      const action = insight.action_plan || {{}};
-      const highlights = (insight.core_highlights || []).map(item => `<li>${{escapeHtml(item)}} </li>`).join("") || '<li>暂无</li>';
-      const risks = (insight.risk_warnings || []).map(item => `<li>${{escapeHtml(item)}} </li>`).join("") || '<li>暂无</li>';
-      const versus = insight.yesterday_vs_today || {{}};
-      return `
-        <div class="stack">
-          <div class="detail-grid compact">
-            <div class="detail-panel"><div class="detail-label">来源</div><div class="detail-value">${{escapeHtml(insight.source_tag || '—')}}</div></div>
-            <div class="detail-panel"><div class="detail-label">推荐分 / 综合分</div><div class="detail-value">${{formatValue(insight.recommendation_score)}} / ${{formatValue(insight.overall_score)}}<div class="mini-label">推荐分=执行优先级，综合分=AI基础判断</div></div></div>
-            <div class="detail-panel"><div class="detail-label">置信度</div><div class="detail-value">${{formatValue(insight.confidence)}}</div></div>
-          </div>
-          <div class="detail-grid compact">
-            <div class="detail-panel"><div class="detail-label">买入区间</div><div class="detail-value">${{escapeHtml(action.entry_zone || '待观察')}}</div></div>
-            <div class="detail-panel"><div class="detail-label">止损</div><div class="detail-value">${{escapeHtml(action.stop_loss || '待观察')}}</div></div>
-            <div class="detail-panel"><div class="detail-label">止盈</div><div class="detail-value">${{escapeHtml(action.take_profit || '待观察')}}</div></div>
-            <div class="detail-panel"><div class="detail-label">短期节奏</div><div class="detail-value">${{escapeHtml(action.holding_horizon || '1-5个交易日')}}</div></div>
-            <div class="detail-panel"><div class="detail-label">失效条件</div><div class="detail-value">${{escapeHtml(action.invalid_condition || '待观察')}}</div></div>
-            <div class="detail-panel"><div class="detail-label">今日结论 / 跟踪状态</div><div class="detail-value">${{escapeHtml(versus.today_verdict || '暂无')}} / ${{escapeHtml(versus.review_status || '暂无')}}</div></div>
-          </div>
-          <div><strong>核心亮点</strong><ul>${{highlights}}</ul></div>
-          <div><strong>风险提示</strong><ul>${{risks}}</ul></div>
-          <div><strong>技术信号</strong><div class="subtle">${{escapeHtml(insight.technical_signal || '暂无')}}</div></div>
-          <div><strong>综合评价</strong><div class="subtle">${{escapeHtml(insight.overall_assessment || insight.recommendation_text || '暂无')}}</div></div>
-          <div><strong>昨日 vs 今日</strong><div class="subtle">昨日推荐分 ${{formatValue(versus.previous_recommendation_score)}}，昨日综合分 ${{formatValue(versus.previous_overall_score)}}，结论：${{escapeHtml(versus.today_verdict || versus.review_status || '暂无')}}</div></div>
         </div>
       `;
     }}
@@ -2251,9 +2256,6 @@ def _detail_script(
       renderFullAnalysis(symbol);
       renderMetrics(symbol);
       detailHistory.innerHTML = renderHistoryTimeline(symbol.history);
-      if (detailIntelligentInsight) {{
-        detailIntelligentInsight.innerHTML = renderIntelligentInsight(payload.intelligent_screening_insight || {{}});
-      }}
       detailEvidence.innerHTML = renderList(symbol.decision.evidence || []);
       detailRisks.innerHTML = renderList(symbol.memory.key_risks || []);
       detailOpenclawStatus.innerHTML = renderAutomationStatus(payload.openclaw_status);
