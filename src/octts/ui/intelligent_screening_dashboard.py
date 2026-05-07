@@ -410,7 +410,7 @@ def _render_review_cards(
         html.append(
             f'''
             <div class="stock-item">
-                <div class="stock-header"><div><span class="stock-code">{code}</span><span class="stock-name">{name}</span></div><span class="score-badge">昨日延续</span></div>
+                <div class="stock-header"><div><span class="stock-code">{code}</span><span class="stock-name">{name}</span></div><span class="score-badge">持仓复盘</span></div>
                 <div class="detail-grid" style="margin-top:12px;">
                     <div class="detail-panel"><div class="detail-label">是否继续持有</div><div class="detail-value">{verdict}</div></div>
                     <div class="detail-panel"><div class="detail-label">跟踪状态</div><div class="detail-value">{status}</div></div>
@@ -423,7 +423,7 @@ def _render_review_cards(
                 <div class="detail-value"><strong>结论：</strong>{reason}</div>
                 <div class="detail-value"><strong>操作建议：</strong>{overview_action.replace('操作建议：', '')}</div>
                 <div class="detail-value"><strong>主要风险：</strong>{overview_risk}</div>
-                <div class="detail-value"><strong>昨日结论：</strong>{escape(_safe_text(item.get('yesterday_conclusion'), '昨日入选 Top3'))}</div>
+                <div class="detail-value"><strong>3日前结论：</strong>{escape(_safe_text(item.get('yesterday_conclusion'), '3日前入选 Top3'))}</div>
             </div>
             '''
         )
@@ -1050,9 +1050,9 @@ def render_intelligent_screening_dashboard(
         </section>
 
         <section class="panel panel-review">
-          <div class="section-title">昨日 Top3 今日复盘 / 昨日延续</div>
-          <div class="subtle" style="margin-bottom:12px;">展示上一个交易日重点标的的今日复盘结论，以及继续持有还是离场的触发条件。</div>
-          {_render_review_cards(continuations, '暂无昨日延续标的')}
+          <div class="section-title">3日前 Top3 持仓复盘</div>
+          <div class="subtle" style="margin-bottom:12px;">展示 3 个交易日前入选 Top3 标的的持仓复盘结论，以及继续持有还是离场的触发条件。</div>
+          {_render_review_cards(continuations, '暂无 3 日前 Top3 持仓复盘标的')}
         </section>
       </section>
 
@@ -1097,7 +1097,7 @@ def render_intelligent_screening_dashboard(
     focus_section = f"""
       <section class="panel panel-focus">
         <div class="section-title">重点个股</div>
-        <div class="subtle" style="margin-bottom:12px;">集中查看今日 Top3 深度分析、昨日 Top3 今日复盘与今日 Top3 横向比较。</div>
+        <div class="subtle" style="margin-bottom:12px;">集中查看今日 Top3 深度分析、3 日前 Top3 持仓复盘与今日 Top3 横向比较。</div>
         {render_report_tab(focus_report_payload, mode='focus')}
       </section>
     """

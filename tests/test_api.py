@@ -806,7 +806,7 @@ def test_intelligent_screening_page_restores_sections_and_data_mapping(monkeypat
 
     assert response.status_code == 200
     assert "今日 Top3" in response.text
-    assert "昨日 Top3 今日复盘 / 昨日延续" in response.text
+    assert "3日前 Top3 持仓复盘" in response.text
     assert "重点个股" in response.text
     assert "今日新闻" in response.text
     assert "买入区间" in response.text
@@ -1527,7 +1527,7 @@ def test_render_intelligent_screening_dashboard_invalid_recommendations_tab_fall
     html = render_intelligent_screening_dashboard(**payload, active_tab="recommendations")
 
     assert "今日 Top3" in html
-    assert "昨日 Top3 今日复盘 / 昨日延续" in html
+    assert "3日前 Top3 持仓复盘" in html
 
 
 def test_build_stock_intelligent_insight_marks_only_authoritative_today_top3_as_top3() -> None:

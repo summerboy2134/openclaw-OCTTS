@@ -1469,7 +1469,7 @@ def _overview_script(
         renderSummaryCard("执行策略数", intelligent.strategy_count || 0, "单只股票的策略数表示它被多少个筛选策略同时命中"),
         renderSummaryCard("候选股票数", intelligent.total_stocks || 0),
         renderSummaryCard("今日 Top3", intelligent.today_top_count || 0),
-        renderSummaryCard("昨日延续", intelligent.continuation_count || 0)
+        renderSummaryCard("持仓复盘", intelligent.continuation_count || 0)
       ].join("");
       intelligentRecommendations.innerHTML = renderIntelligentRecommendations(intelligent.today_top3 || []);
       intelligentReportSummary.innerHTML = `

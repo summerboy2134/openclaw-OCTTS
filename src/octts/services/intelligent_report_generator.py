@@ -439,7 +439,7 @@ class IntelligentReportGenerator:
                 data={"items": blocks.get("focus_stocks") or []},
             ),
             ReportSection(
-                title="昨日 Top3 今日复盘",
+                title="3日前 Top3 持仓复盘",
                 content=self._format_review_section(blocks.get("yesterday_reviews") or []),
                 priority=2,
                 data={"items": blocks.get("yesterday_reviews") or []},

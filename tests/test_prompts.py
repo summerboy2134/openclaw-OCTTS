@@ -54,3 +54,15 @@ def test_build_report_prompt_embeds_previous_memory() -> None:
     assert any("等待入场" in item and "entry_zone" in item for item in payload["analysis_instructions"])
     assert any("重点跟踪标的" in item for item in payload["analysis_instructions"])
     assert any("position_status 为 holding" in item for item in payload["analysis_instructions"])
+
+
+def test_build_report_prompt_warns_about_extreme_profit_growth_wording() -> None:
+    _, user_prompt = build_report_prompt(
+        phase="review",
+        snapshot=PriceSnapshot(ts_code="002466.SZ", close=80.03, pct_chg=5.97),
+        previous_memory=None,
+    )
+
+    payload = json.loads(user_prompt)
+    assert any("已披露口径" in item for item in payload["analysis_instructions"])
+    assert any("300%" in item and "低基数" in item for item in payload["analysis_instructions"])
