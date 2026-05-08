@@ -5,6 +5,9 @@ from octts.models.screening_models import (
     MarketAdjFactor,
     MarketDaily,
     MarketDailyBasic,
+    RecommendationItem,
+    RecommendationPerformance,
+    RecommendationRun,
 )
 from octts.schemas.screener import TrackedRecommendationState
 from octts.schemas.training import ShortTermTrainingSample
@@ -189,3 +192,61 @@ def test_market_raw_data_repository_reads_written_rows(tmp_path) -> None:
     assert repo.get_daily_basic(ts_code="000001.SZ", trade_date="20260402")["turnover_rate"] == 2.5
     assert repo.get_adj_factor(ts_code="000001.SZ", trade_date="20260402") == 1.12
     assert len(repo.get_daily_range(ts_code="000001.SZ", start_date="20260401", end_date="20260402")) == 2
+
+
+def test_get_recommendation_summary_includes_3d_stats(tmp_path) -> None:
+    db_path = tmp_path / "screening.db"
+    manager = DatabaseManager(f"sqlite:///{db_path}")
+    session = manager.get_session()
+    try:
+        run = RecommendationRun(
+            run_id="run-2026-04-08",
+            trade_date=date(2026, 4, 8),
+            candidate_count=2,
+            final_count=2,
+        )
+        session.add(run)
+        session.flush()
+
+        item_a = RecommendationItem(
+            run_id=run.id,
+            ts_code="000001.SZ",
+            trade_date=date(2026, 4, 8),
+            source_tag="今日Top3",
+        )
+        item_b = RecommendationItem(
+            run_id=run.id,
+            ts_code="000002.SZ",
+            trade_date=date(2026, 4, 8),
+            source_tag="今日Top3",
+        )
+        session.add_all([item_a, item_b])
+        session.flush()
+
+        session.add_all(
+            [
+                RecommendationPerformance(
+                    recommendation_item_id=item_a.id,
+                    return_3d=0.03,
+                    return_5d=0.05,
+                    vs_benchmark_5d=0.02,
+                ),
+                RecommendationPerformance(
+                    recommendation_item_id=item_b.id,
+                    return_3d=-0.01,
+                    return_5d=0.02,
+                    vs_benchmark_5d=-0.01,
+                ),
+            ]
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    stats = manager.get_recommendation_summary(lookback_days=30)["stats"]
+
+    assert stats["validated_count_3d"] == 2
+    assert stats["win_rate_3d"] == 0.5
+    assert round(stats["average_return_3d"], 6) == 0.01
+    assert stats["validated_count"] == 2
+    assert stats["win_rate_5d"] == 1.0

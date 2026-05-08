@@ -1530,6 +1530,25 @@ def test_render_intelligent_screening_dashboard_invalid_recommendations_tab_fall
     assert "3日前 Top3 持仓复盘" in html
 
 
+def test_render_intelligent_screening_dashboard_shows_3d_stats_independently() -> None:
+    payload = _build_dashboard_payload_for_order_tests()
+    payload["recommendation_summary"] = {
+        "stats": {
+            "validated_count_3d": 2,
+            "win_rate_3d": 0.5,
+            "average_return_3d": 0.0123,
+            "validated_count": 0,
+            "win_rate_5d": None,
+            "average_return_5d": None,
+        }
+    }
+
+    html = render_intelligent_screening_dashboard(**payload, active_tab="overview")
+
+    assert "50.0%" in html
+    assert "1.23%" in html
+
+
 def test_build_stock_intelligent_insight_marks_only_authoritative_today_top3_as_top3() -> None:
     insight = _build_stock_intelligent_insight(
         "002269.SZ",

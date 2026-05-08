@@ -1871,6 +1871,10 @@ class DatabaseManager:
             ).all()
 
             serialized_items = [self._serialize_recommendation_item(item) for item in recent_items]
+            validated_3d = [item for item in serialized_items if item.get('return_3d') is not None]
+            wins_3d = [item for item in validated_3d if item.get('return_3d', 0) > 0]
+            average_return_3d = sum(item.get('return_3d', 0.0) for item in validated_3d) / len(validated_3d) if validated_3d else 0.0
+            win_rate_3d = len(wins_3d) / len(validated_3d) if validated_3d else 0.0
             validated = [item for item in serialized_items if item.get('return_5d') is not None]
             wins = [item for item in validated if item.get('return_5d', 0) > 0]
             losses = [item for item in validated if item.get('return_5d', 0) <= 0]
@@ -1900,6 +1904,9 @@ class DatabaseManager:
                 'stats': {
                     'lookback_days': lookback_days,
                     'window_count': len(serialized_items),
+                    'validated_count_3d': len(validated_3d),
+                    'win_rate_3d': win_rate_3d,
+                    'average_return_3d': average_return_3d,
                     'validated_count': len(validated),
                     'win_rate_5d': win_rate_5d,
                     'average_return_5d': average_return_5d,

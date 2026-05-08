@@ -1019,7 +1019,7 @@ def render_intelligent_screening_dashboard(
             percent_decimals=2,
         )
     average_return_3d = "--"
-    if stats.get("average_return_3d") is not None and tracked_count:
+    if stats.get("average_return_3d") is not None and validated_count_3d:
         average_return_3d = _format_metric_value(
             stats.get("average_return_3d"),
             percent=True,

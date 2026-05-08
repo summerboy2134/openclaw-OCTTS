@@ -12,11 +12,20 @@ RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debia
   && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./
+
+# Install third-party dependencies before copying application code.
+# This layer is reused when only src/ or ops/ changes, avoiding repeated downloads
+# of large wheels such as xgboost's Linux dependencies.
+RUN mkdir -p src/octts \
+  && touch src/octts/__init__.py \
+  && pip install --no-cache-dir --upgrade pip -i https://mirrors.aliyun.com/pypi/simple/ \
+  && pip install --no-cache-dir . -i https://mirrors.aliyun.com/pypi/simple/ \
+  && rm -rf src
+
 COPY src ./src
 COPY ops ./ops
 
-RUN pip install --no-cache-dir --upgrade pip -i https://mirrors.aliyun.com/pypi/simple/ \
-  && pip install --no-cache-dir . -i https://mirrors.aliyun.com/pypi/simple/
+RUN pip install --no-cache-dir --no-deps . -i https://mirrors.aliyun.com/pypi/simple/
 
 RUN mkdir -p /app/memory
 
