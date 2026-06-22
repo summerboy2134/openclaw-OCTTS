@@ -87,7 +87,7 @@ class CailianNewsCollector(NewsCollector):
 
     def __init__(self):
         super().__init__(NewsSource.CAILIAN)
-        self.api_url = "https://www.cls.cn/nodeapi/updateTelegraphList"
+        self.api_url = "https://m.cls.cn/nodeapi/telegraphs"
 
     async def collect(self) -> List[NewsItem]:
         """采集财联社实时新闻"""
@@ -98,6 +98,7 @@ class CailianNewsCollector(NewsCollector):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Referer": "https://m.cls.cn/telegraph",
         }
 
         async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
@@ -105,9 +106,11 @@ class CailianNewsCollector(NewsCollector):
                 response = await client.get(
                     self.api_url,
                     params={
-                        "app": "CailianpressWeb",
+                        "app": "CailianpressWap",
                         "os": "web",
                         "sv": "8.4.6",
+                        "refresh_type": 1,
+                        "rn": 10,
                     },
                 )
                 response.raise_for_status()

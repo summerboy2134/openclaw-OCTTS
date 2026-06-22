@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 
 SHORT_TERM_FEATURE_SCHEMA_VERSION = "v1"
-RAW_MARKET_FEATURE_SCHEMA_VERSION = "raw_v1"
+RAW_MARKET_FEATURE_SCHEMA_VERSION = "raw_v2"
 
 
 class RawMarketTrainingSample(BaseModel):
@@ -43,6 +43,7 @@ class RawMarketTrainingSample(BaseModel):
     market_up_ratio_1d: Optional[float] = None
     market_up_ratio_3d_avg: Optional[float] = None
     market_up_days_5d: Optional[int] = None
+    weak_market_flag: Optional[bool] = None
     stock_vs_market_return_1d: Optional[float] = None
     stock_vs_market_return_2d: Optional[float] = None
     stock_vs_market_return_3d: Optional[float] = None
@@ -60,6 +61,42 @@ class RawMarketTrainingSample(BaseModel):
     amount_ratio_3d_10d: Optional[float] = None
     turnover_rate_change_1d: Optional[float] = None
     turnover_rate_change_5d: Optional[float] = None
+    recent_runup_5d: Optional[float] = None
+    turnover_spike_ratio: Optional[float] = None
+    high_position_flag: Optional[bool] = None
+    high_position_acceleration_flag: Optional[bool] = None
+    weak_market_high_position_flag: Optional[bool] = None
+    open_gap_pct: Optional[float] = None
+    open_gap_signed_pct: Optional[float] = None
+    intraday_return: Optional[float] = None
+    amplitude: Optional[float] = None
+    close_position_in_day: Optional[float] = None
+    upper_shadow_pct: Optional[float] = None
+    lower_shadow_pct: Optional[float] = None
+    close_to_high: Optional[float] = None
+    close_to_low: Optional[float] = None
+    missing_window_flag: Optional[bool] = None
+    missing_feature_count: Optional[int] = None
+    prev_day_limit_up: Optional[bool] = None
+    prev_day_limit_open_times: Optional[int] = None
+    prev_day_limit_first_time: Optional[float] = None
+    prev_day_limit_last_time: Optional[float] = None
+    prev_day_limit_amount: Optional[float] = None
+    prev_day_fd_amount: Optional[float] = None
+    prev_day_limit_times: Optional[float] = None
+    prev_day_up_stat_success: Optional[int] = None
+    prev_day_up_stat_total: Optional[int] = None
+    prev_day_up_stat_ratio: Optional[float] = None
+    prev_day_one_word_limit_flag: Optional[bool] = None
+    moneyflow_net_1d: Optional[float] = None
+    moneyflow_large_net_1d: Optional[float] = None
+    moneyflow_elarge_net_1d: Optional[float] = None
+    moneyflow_net_3d: Optional[float] = None
+    moneyflow_large_net_3d: Optional[float] = None
+    moneyflow_elarge_net_3d: Optional[float] = None
+    moneyflow_positive_flag: Optional[float] = None
+    limit_like_moneyflow_divergence_flag: Optional[bool] = None
+    limit_chase_failure_risk_score: Optional[float] = None
     return_1d: Optional[float] = None
     return_3d: Optional[float] = None
     return_5d: Optional[float] = None
@@ -74,6 +111,10 @@ class RawMarketTrainingSample(BaseModel):
     label_vs_market_3d: Optional[bool] = None
     label_vs_market_5d: Optional[bool] = None
     label_strong_1d: Optional[bool] = None
+    label_limit_relay_success_1d: Optional[bool] = None
+    label_limit_relay_strong_1d: Optional[bool] = None
+    label_limit_relay_success_3d: Optional[bool] = None
+    label_limit_relay_limit_up_1d: Optional[bool] = None
 
 
 class ShortTermTrainingSample(BaseModel):

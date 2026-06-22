@@ -20,7 +20,7 @@ def _today_screening_hard_constraints() -> list[str]:
         "focus_stocks 必须逐只覆盖 today_top3；comparison 只基于 today_top3。",
         "若 today_top3_live_context 中存在对应个股的实时资讯，focus_analysis 必须优先引用其中的新闻、公告与发布时间线索；若为空，再回退到 news_clusters 与个股自身字段。",
         "若无法联网补充外部信息，就严格基于输入里的价格、资金、财务、主营摘要、主题线索做推演，不要编造缺失数据。",
-        "comparison 必须包含 cross_stock_synthesis_view：横向比较三只股票谁更偏交易性、谁更偏基本面质量、谁风险更高、谁证据最完整。",
+        "comparison 必须包含 cross_stock_synthesis_view：横向比较三只股票谁更偏交易性、谁更偏基本面质量、谁风险更高、谁证据最完整。最终 basic_rank、technical_rank、risk_rank、trading_rank、best_short_term、most_robust、highest_risk 会由系统按结构化字段统一覆盖；你不得让 most_robust 与 highest_risk 使用相互矛盾的口径。",
     ]
 
 
@@ -79,6 +79,12 @@ def build_today_screening_report_prompt(
             "top_list": "龙虎榜明细，本轮只对今日Top3注入",
             "limit_list": "涨跌停/连板异动明细，本轮只对今日Top3注入",
             "earnings_forecast": "业绩预告摘要，来自Tushare forecast",
+            "close_auction_price": "收盘集合竞价成交价，用于判断尾盘最后定价承接",
+            "close_auction_vwap": "收盘集合竞价均价",
+            "close_auction_price_deviation_pct": "收盘竞价成交价相对日收盘价的偏离百分比，正值表示尾盘定价支撑更强，负值表示收盘竞价承接转弱",
+            "close_auction_amount_ratio": "收盘竞价成交额占全天成交额比例，比例越高表示尾盘定价信号越值得关注",
+            "stage3_close_auction_score": "系统对收盘竞价承接的Stage3修正分，正值增强次日延续证据，负值提示尾盘承接或假强风险",
+            "stage3_close_auction_veto": "是否因涨幅较大但收盘竞价明显走弱而触发Top3过滤",
             "evidence_digest": "系统预先整理的证据摘要，包含正向证据、风险/反证、缺失数据和操作前提",
             "cross_stock_synthesis": "Top3横向综合任务，要求比较交易性、质量、风险和证据完整度",
             "source_tag": "来源标签，如今日Top3/今日候选/昨日复盘",
@@ -88,6 +94,7 @@ def build_today_screening_report_prompt(
         "instructions": [
             "先满足 hard_constraints，再尽量满足 writing_style_guidelines。",
             "若输入存在 distribution_risk_score、distribution_risk_flags、moneyflow_3d_value、turnover_spike_ratio、recent_runup_5d、late_stage_momentum_flag、industry_flow_bias、industry_heat_score，必须写出加分、扣分与风险含义；其中 distribution_risk_score 只是分歧/派发风险子分，不代表全部风险。",
+            "若输入存在 close_auction_price_deviation_pct、close_auction_amount_ratio、stage3_close_auction_score、stage3_close_auction_risks 或 stage3_close_auction_veto，必须说明收盘集合竞价是增强尾盘承接、提示尾盘分歧，还是构成次日延续的反证；不要逐字段解释，要把它落到交易结构和次日执行前提。",
             "若输入中存在 close/open/high/low/pct_change/turnover_rate/amount/amplitude/recent_runup_5d 等市场表现字段，要明确写出冲高回落、高位震荡、放量分歧、强势延续、回踩整理等阶段判断，不要只写笼统的技术面偏强/偏弱。",
             "若输入中存在 business_summary、latest_revenue_yoy、latest_profit_yoy、pe_ttm、industry_pe_median 等基本面或估值字段，要明确判断基本面是否支持当前涨幅、是否存在估值透支或基本面与股价背离。",
             "若输入中存在 catalyst_summary、main_fund_flow_1d、main_fund_flow_3d、main_fund_flow_10d、margin_balance_change_10d 等催化或资金字段，要区分主催化与次催化，并写出资金承接还是资金分歧。",

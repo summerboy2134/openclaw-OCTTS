@@ -227,6 +227,56 @@ class MarketRawDataRepository:
         finally:
             session.close()
 
+    def get_limit_list_by_trade_dates(
+        self,
+        *,
+        ts_codes: Iterable[str],
+        trading_dates: Iterable[str],
+    ) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        ts_code_list = list(dict.fromkeys(ts_codes))
+        trade_date_list = [self._parse_date(value) for value in dict.fromkeys(trading_dates)]
+        if not ts_code_list or not trade_date_list:
+            return {}
+        session = self._db.get_session()
+        try:
+            result: Dict[str, Dict[str, Dict[str, Any]]] = {ts_code: {} for ts_code in ts_code_list}
+            for ts_code_chunk in self._chunked(ts_code_list, 800):
+                rows = (
+                    session.query(MarketLimitListDaily)
+                    .filter(MarketLimitListDaily.ts_code.in_(ts_code_chunk), MarketLimitListDaily.trade_date.in_(trade_date_list))
+                    .all()
+                )
+                for row in rows:
+                    result.setdefault(row.ts_code, {})[row.trade_date.strftime("%Y%m%d")] = self._serialize_market_limit_list_daily(row)
+            return result
+        finally:
+            session.close()
+
+    def get_moneyflow_by_trade_dates(
+        self,
+        *,
+        ts_codes: Iterable[str],
+        trading_dates: Iterable[str],
+    ) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        ts_code_list = list(dict.fromkeys(ts_codes))
+        trade_date_list = [self._parse_date(value) for value in dict.fromkeys(trading_dates)]
+        if not ts_code_list or not trade_date_list:
+            return {}
+        session = self._db.get_session()
+        try:
+            result: Dict[str, Dict[str, Dict[str, Any]]] = {ts_code: {} for ts_code in ts_code_list}
+            for ts_code_chunk in self._chunked(ts_code_list, 800):
+                rows = (
+                    session.query(MarketMoneyflowDaily)
+                    .filter(MarketMoneyflowDaily.ts_code.in_(ts_code_chunk), MarketMoneyflowDaily.trade_date.in_(trade_date_list))
+                    .all()
+                )
+                for row in rows:
+                    result.setdefault(row.ts_code, {})[row.trade_date.strftime("%Y%m%d")] = self._serialize_market_moneyflow_daily(row)
+            return result
+        finally:
+            session.close()
+
     def get_top_list_by_trade_date(self, *, ts_codes: Iterable[str], trade_date: str) -> Dict[str, List[Dict[str, Any]]]:
         ts_code_list = list(dict.fromkeys(ts_codes))
         if not ts_code_list:
@@ -433,15 +483,26 @@ class MarketRawDataRepository:
             for ts_code, items in grouped.items():
                 if not items:
                     continue
+                latest_trade_date = items[0].trade_date.strftime("%Y%m%d") if items[0].trade_date else None
                 recent_3d_net_inflow = sum(float(item.net_mf_amount or 0.0) for item in items)
                 recent_large_order_net_inflow = sum(float((item.buy_lg_amount or 0.0) - (item.sell_lg_amount or 0.0)) for item in items)
-                recent_super_large_order_net_inflow = sum(float((item.buy_elg_amount or 0.0) - (item.sell_elg_amount or 0.0)) for item in items)
+                super_large_order_net_inflows = [
+                    float((item.buy_elg_amount or 0.0) - (item.sell_elg_amount or 0.0))
+                    for item in items
+                ]
+                recent_super_large_order_net_inflow = sum(super_large_order_net_inflows)
+                super_large_order_net_inflow_negative_days_3d = sum(
+                    1 for value in super_large_order_net_inflows if value < 0
+                )
                 summaries[ts_code] = {
                     "recent_3d_net_inflow": round(recent_3d_net_inflow, 2),
                     "recent_large_order_net_inflow": round(recent_large_order_net_inflow, 2),
                     "recent_super_large_order_net_inflow": round(recent_super_large_order_net_inflow, 2),
+                    "super_large_order_net_inflow_negative_days_3d": super_large_order_net_inflow_negative_days_3d,
                     "positive_flag": 1.0 if recent_3d_net_inflow > 0 else 0.0,
                     "rows": len(items),
+                    "latest_trade_date": latest_trade_date,
+                    "stale_for_trade_date": bool(latest_trade_date and latest_trade_date < trade_date_value.strftime("%Y%m%d")),
                 }
             return summaries
         finally:
@@ -481,6 +542,11 @@ class MarketRawDataRepository:
         requested_dates = _calendar_day_strings(start_date, end_date)
         existing_dates = set(self.get_calendar_dates(start_date=start_date, end_date=end_date, exchange=exchange))
         return all(day in existing_dates for day in requested_dates)
+
+    @staticmethod
+    def _chunked(values: List[str], size: int) -> Iterable[List[str]]:
+        for start in range(0, len(values), max(1, int(size))):
+            yield values[start:start + size]
 
     @staticmethod
     def _parse_date(value: str) -> date:
@@ -572,6 +638,31 @@ class MarketRawDataRepository:
             "amount_rate": row.amount_rate,
             "float_values": row.float_values,
             "reason": row.reason,
+        }
+
+    @staticmethod
+    def _serialize_market_moneyflow_daily(row: MarketMoneyflowDaily) -> Dict[str, Any]:
+        return {
+            "trade_date": row.trade_date.strftime("%Y%m%d") if row.trade_date else None,
+            "ts_code": row.ts_code,
+            "buy_sm_vol": row.buy_sm_vol,
+            "buy_sm_amount": row.buy_sm_amount,
+            "sell_sm_vol": row.sell_sm_vol,
+            "sell_sm_amount": row.sell_sm_amount,
+            "buy_md_vol": row.buy_md_vol,
+            "buy_md_amount": row.buy_md_amount,
+            "sell_md_vol": row.sell_md_vol,
+            "sell_md_amount": row.sell_md_amount,
+            "buy_lg_vol": row.buy_lg_vol,
+            "buy_lg_amount": row.buy_lg_amount,
+            "sell_lg_vol": row.sell_lg_vol,
+            "sell_lg_amount": row.sell_lg_amount,
+            "buy_elg_vol": row.buy_elg_vol,
+            "buy_elg_amount": row.buy_elg_amount,
+            "sell_elg_vol": row.sell_elg_vol,
+            "sell_elg_amount": row.sell_elg_amount,
+            "net_mf_vol": row.net_mf_vol,
+            "net_mf_amount": row.net_mf_amount,
         }
 
     @staticmethod

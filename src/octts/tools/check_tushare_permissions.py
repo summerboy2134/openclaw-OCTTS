@@ -11,6 +11,7 @@ from octts.tools.common import print_json
 def main() -> None:
     parser = argparse.ArgumentParser(description="Verify Tushare permission coverage for relay, funds, news, and earnings endpoints.")
     parser.add_argument("--ts-code", default="600000.SH", help="Sample stock code for stock-level endpoints")
+    parser.add_argument("--event-ts-code", default="301360.SZ", help="Sample stock code for disclosure / abnormal-event probes")
     parser.add_argument("--news-src", default="sina", help="News source to test, e.g. sina")
     parser.add_argument("--news-start", default="2026-04-01 00:00:00", help="News query start time")
     parser.add_argument("--news-end", default="2026-04-13 23:59:59", help="News query end time")
@@ -20,10 +21,13 @@ def main() -> None:
     parser.add_argument("--start-date", default="20260301", help="Sample start date YYYYMMDD for range-based endpoints")
     parser.add_argument("--end-date", default="20260331", help="Sample end date YYYYMMDD for range-based endpoints")
     parser.add_argument("--hk-trade-date", default="20260331", help="Sample trade date YYYYMMDD for hk_hold")
+    parser.add_argument("--event-start", default="20260528", help="Sample disclosure/event start date YYYYMMDD")
+    parser.add_argument("--event-end", default="20260601", help="Sample disclosure/event end date YYYYMMDD")
     parser.add_argument("--suspend-seconds", type=float, default=1.2, help="Sleep between endpoint calls to avoid rate bursts")
     parser.add_argument("--skip-news", action="store_true", help="Skip news-related endpoints")
     parser.add_argument("--skip-finance", action="store_true", help="Skip finance-related endpoints")
     parser.add_argument("--skip-relay", action="store_true", help="Skip relay/funds-related endpoints")
+    parser.add_argument("--skip-events", action="store_true", help="Skip disclosure / abnormal-event endpoint probes")
     args = parser.parse_args()
 
     settings = get_settings()
@@ -37,7 +41,7 @@ def main() -> None:
 
     import tushare.pro.client as client
 
-    base_url = settings.tushare_base_url or "http://tsy.xiaodefa.cn"
+    base_url = settings.tushare_base_url or "https://tt.xiaodefa.cn"
     client.DataApi._DataApi__http_url = base_url
     pro = ts.pro_api(settings.tushare_token)
     try:
@@ -125,6 +129,59 @@ def main() -> None:
             ]
         )
 
+    if not args.skip_events:
+        event_params = {"ts_code": args.event_ts_code, "start_date": args.event_start, "end_date": args.event_end}
+        trade_event_params = {"ts_code": args.event_ts_code, "trade_date": args.event_end}
+        checks.extend(
+            [
+                (
+                    "anns_d",
+                    lambda: _call_endpoint(pro, "anns_d", **event_params),
+                    event_params,
+                ),
+                (
+                    "stk_special",
+                    lambda: _call_endpoint(pro, "stk_special", **trade_event_params),
+                    trade_event_params,
+                ),
+                (
+                    "stock_special",
+                    lambda: _call_endpoint(pro, "stock_special", **trade_event_params),
+                    trade_event_params,
+                ),
+                (
+                    "abnormal_change",
+                    lambda: _call_endpoint(pro, "abnormal_change", **trade_event_params),
+                    trade_event_params,
+                ),
+                (
+                    "disclosure_ann",
+                    lambda: _call_endpoint(pro, "disclosure_ann", **event_params),
+                    event_params,
+                ),
+                (
+                    "notice",
+                    lambda: _call_endpoint(pro, "notice", **event_params),
+                    event_params,
+                ),
+                (
+                    "stk_auction_c",
+                    lambda: _call_endpoint(pro, "stk_auction_c", trade_date=args.trade_date, ts_code=args.ts_code),
+                    {"trade_date": args.trade_date, "ts_code": args.ts_code},
+                ),
+                (
+                    "stk_auction_d",
+                    lambda: _call_endpoint(pro, "stk_auction_d", trade_date=args.trade_date, ts_code=args.ts_code),
+                    {"trade_date": args.trade_date, "ts_code": args.ts_code},
+                ),
+                (
+                    "auction", 
+                    lambda: _call_endpoint(pro, "auction", trade_date=args.trade_date, ts_code=args.ts_code),
+                    {"trade_date": args.trade_date, "ts_code": args.ts_code},
+                ),
+            ]
+        )
+
     results: List[Dict[str, Any]] = []
     for idx, (name, fetcher, params) in enumerate(checks):
         results.append(_run_check(name, fetcher, params))
@@ -144,6 +201,13 @@ def main() -> None:
             "results": results,
         }
     )
+
+
+def _call_endpoint(pro: Any, endpoint: str, **params: Any) -> Any:
+    method = getattr(pro, endpoint, None)
+    if method is not None:
+        return method(**params)
+    return pro.query(endpoint, **params)
 
 
 def _run_check(name: str, fetcher: Callable[[], Any], params: Dict[str, Any]) -> Dict[str, Any]:

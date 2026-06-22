@@ -14,6 +14,11 @@ def _recommendation_pool_sort_key(item: Dict[str, Any]) -> tuple:
     return (
         item.get("recommend_rank") is None,
         int(item.get("recommend_rank") or 9999),
+        item.get("frontlist_rank") is None,
+        int(item.get("frontlist_rank") or 9999),
+        item.get("structured_rank_position") is None,
+        int(item.get("structured_rank_position") or 9999),
+        -float(item.get("final_selection_score") or item.get("stage3_final_score") or item.get("structured_rank_score") or 0.0),
         item.get("rerank_pool_rank") is None,
         int(item.get("rerank_pool_rank") or 9999),
         -float(item.get("recommendation_score") or 0.0),
@@ -296,6 +301,23 @@ class ScreeningStore:
             generated_at=generated_at,
             items=items,
         )
+
+    def clear_intelligent_screening_results_for_trade_date(self, trade_date: date) -> Dict[str, int]:
+        if self.settings.use_database:
+            return self._get_db_manager().clear_intelligent_screening_results_for_trade_date(trade_date)
+
+        deleted_pool_states = 0
+        file_path = self.pool_base_path / f"{trade_date.strftime('%Y%m%d')}.json"
+        if file_path.exists():
+            file_path.unlink()
+            deleted_pool_states = 1
+        return {
+            "recommendation_pool_files": deleted_pool_states,
+            "recommendation_pool_states": 0,
+            "recommendation_performances": 0,
+            "recommendation_items": 0,
+            "recommendation_runs": 0,
+        }
 
     def load_recommendation_pool_state(self, trade_date: Optional[date] = None) -> List[Dict[str, Any]]:
         if self.settings.use_database:

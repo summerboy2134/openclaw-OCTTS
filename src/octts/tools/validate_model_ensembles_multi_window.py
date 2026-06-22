@@ -13,7 +13,7 @@ import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 from octts.config import Settings
-from octts.tools.train_tuned_models import FEATURE_COLUMNS, HYPERPARAM_CONFIGS, build_dataset, create_model
+from octts.tools.train_tuned_models import BEST35_FEATURE_COLUMNS, FEATURE_COLUMNS, HYPERPARAM_CONFIGS, build_dataset, create_model
 
 logger = logging.getLogger(__name__)
 DEFAULT_TARGET = "return_3d"
@@ -74,16 +74,41 @@ def parse_weight_grid(raw: str) -> list[float]:
     return vals
 
 
-def train_one(train_df: pd.DataFrame, target: str, model_name: str):
+def feature_columns_for_subset(subset: str) -> list[str]:
+    normalized = str(subset or "all").strip().lower()
+    if normalized == "all":
+        return list(FEATURE_COLUMNS)
+    if normalized == "best35":
+        return list(BEST35_FEATURE_COLUMNS)
+    raise ValueError(f"Unsupported feature subset: {subset}. Expected all or best35")
+
+
+def parse_feature_subsets(raw: str) -> list[str]:
+    subsets = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    for subset in subsets:
+        feature_columns_for_subset(subset)
+    return subsets or ["all"]
+
+
+def prediction_key(model_name: str, feature_subset: str) -> str:
+    return f"pred::{model_name}::{feature_subset}"
+
+
+def strategy_model_token(model_name: str, feature_subset: str) -> str:
+    return f"{model_name}[{feature_subset}]"
+
+
+def train_one(train_df: pd.DataFrame, target: str, model_name: str, feature_subset: str):
     cfg = HYPERPARAM_CONFIGS[model_name]
     model = create_model(cfg["model_class"], cfg["params"])
-    x = train_df[FEATURE_COLUMNS].fillna(0.0)
+    feature_columns = feature_columns_for_subset(feature_subset)
+    x = train_df[feature_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0)
     y = train_df[target].values
     mask = ~pd.isna(y)
     x = x[mask]
     y = y[mask]
     model.fit(x, y)
-    return model, int(len(y))
+    return model, int(len(y)), feature_columns
 
 
 def daily_rank(s: pd.Series) -> pd.Series:
@@ -130,18 +155,28 @@ def backtest(df: pd.DataFrame, pred_col: str) -> tuple[float | None, float | Non
     return float(np.mean(r1)) if r1 else None, float(np.mean(r3)) if r3 else None, float(np.mean(r5)) if r5 else None, float(correct / total) if total > 0 else None
 
 
-def build_specs(model_as: list[str], model_bs: list[str], methods: list[str], weight_grid: list[float]):
+def build_specs(
+    model_as: list[str],
+    model_bs: list[str],
+    methods: list[str],
+    weight_grid: list[float],
+    single_feature_subsets: list[str],
+    ensemble_feature_subsets: list[str],
+):
     specs = []
     for name in sorted(set(model_as + model_bs)):
-        specs.append((f"single::{name}", "single", name, None, "raw_mean", None))
-    for a, b in itertools.product(model_as, model_bs):
-        pair = f"{a}+{b}"
-        for method in methods:
-            if method == "rank_mean":
-                specs.append((f"ensemble::rank_mean::{pair}", "ensemble", a, b, method, None))
-            elif method == "weighted_rank":
-                for wa in weight_grid:
-                    specs.append((f"ensemble::weighted_rank::{wa:.2f}/{1-wa:.2f}::{pair}", "ensemble", a, b, method, wa))
+        for feature_subset in single_feature_subsets:
+            token = strategy_model_token(name, feature_subset)
+            specs.append((f"single::{token}", "single", name, None, "raw_mean", None, feature_subset, feature_subset))
+    for ensemble_feature_subset in ensemble_feature_subsets:
+        for a, b in itertools.product(model_as, model_bs):
+            pair = f"{strategy_model_token(a, ensemble_feature_subset)}+{strategy_model_token(b, ensemble_feature_subset)}"
+            for method in methods:
+                if method == "rank_mean":
+                    specs.append((f"ensemble::rank_mean::{pair}", "ensemble", a, b, method, None, ensemble_feature_subset, ensemble_feature_subset))
+                elif method == "weighted_rank":
+                    for wa in weight_grid:
+                        specs.append((f"ensemble::weighted_rank::{wa:.2f}/{1-wa:.2f}::{pair}", "ensemble", a, b, method, wa, ensemble_feature_subset, ensemble_feature_subset))
     return specs
 
 
@@ -173,6 +208,8 @@ def main() -> None:
     parser.add_argument("--weight-grid", type=str, default=",".join(str(x) for x in DEFAULT_WEIGHT_GRID))
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--output", type=str, default="tmp/ensemble_multi_window.json")
+    parser.add_argument("--single-feature-subsets", type=str, default="all", help="Comma-separated feature subsets for single-model baselines: all,best35")
+    parser.add_argument("--ensemble-feature-subsets", type=str, default="all", help="Comma-separated feature subsets used by ensemble members: all,best35")
     parser.add_argument("--no-training-features", action="store_true")
     parser.add_argument("--training-features-only", action="store_true")
     args = parser.parse_args()
@@ -183,12 +220,14 @@ def main() -> None:
     model_bs = parse_list(args.model_b_candidates)
     methods = parse_list(args.methods)
     weight_grid = parse_weight_grid(args.weight_grid)
+    single_feature_subsets = parse_feature_subsets(args.single_feature_subsets)
+    ensemble_feature_subsets = parse_feature_subsets(args.ensemble_feature_subsets)
     bad_models = [x for x in model_as + model_bs if x not in HYPERPARAM_CONFIGS]
     if bad_models: raise ValueError(f"Unknown model config(s): {sorted(set(bad_models))}")
     bad_methods = [x for x in methods if x not in {"rank_mean", "weighted_rank"}]
     if bad_methods: raise ValueError(f"Unknown method(s): {bad_methods}")
 
-    specs = build_specs(model_as, model_bs, methods, weight_grid)
+    specs = build_specs(model_as, model_bs, methods, weight_grid, single_feature_subsets, ensemble_feature_subsets)
     windows = [parse_window(raw, i + 1) for i, raw in enumerate(args.test_windows)]
     settings = Settings()
     prefer_training_features = not args.no_training_features
@@ -197,7 +236,8 @@ def main() -> None:
     train_start = datetime.strptime(args.train_start, "%Y-%m-%d").date()
     train_end = datetime.strptime(args.train_end, "%Y-%m-%d").date()
     train_df = build_dataset(settings, train_start, train_end, prefer_training_features=prefer_training_features, training_features_only=training_features_only)
-    trained = {name: train_one(train_df, args.target, name) for name in sorted(set(model_as + model_bs))}
+    required_trained_keys = sorted({(a, fa) for _, stype, a, _, _, _, fa, _ in specs} | {(b, fb) for _, stype, _, b, _, _, _, fb in specs if stype == "ensemble" and b is not None})
+    trained = {key: train_one(train_df, args.target, key[0], key[1]) for key in required_trained_keys}
     train_samples = min(v[1] for v in trained.values()) if trained else 0
 
     results: list[RunResult] = []
@@ -207,21 +247,22 @@ def main() -> None:
         base = build_dataset(settings, test_start, test_end, prefer_training_features=prefer_training_features, training_features_only=training_features_only)
         if base.empty: continue
         df = base.copy()
-        for name, (model, _) in trained.items(): df[f"pred::{name}"] = model.predict(df[FEATURE_COLUMNS].fillna(0.0))
-        for strategy, stype, a, b, method, wa in specs:
+        for (name, feature_subset), (model, _, feature_columns) in trained.items():
+            df[prediction_key(name, feature_subset)] = model.predict(df[feature_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0))
+        for strategy, stype, a, b, method, wa, feature_subset_a, feature_subset_b in specs:
             fused = f"fused::{strategy}"
             if stype == "single":
-                df[fused] = df[f"pred::{a}"]
+                df[fused] = df[prediction_key(a, feature_subset_a)]
                 mae, rmse, r2, test_samples = eval_preds(df, args.target, fused, True)
                 ret1, ret3, ret5, acc = backtest(df, fused)
-                results.append(RunResult(window.label, strategy, stype, a, None, method, None, None, train_samples, test_samples, mae, rmse, r2, ret1, ret3, ret5, acc))
+                results.append(RunResult(window.label, strategy, stype, strategy_model_token(a, feature_subset_a), None, method, None, None, train_samples, test_samples, mae, rmse, r2, ret1, ret3, ret5, acc))
             else:
-                df[fused] = fuse(df, f"pred::{a}", f"pred::{b}", method, wa)
+                df[fused] = fuse(df, prediction_key(a, feature_subset_a), prediction_key(b, feature_subset_b), method, wa)
                 mae, rmse, r2, test_samples = eval_preds(df, args.target, fused, False)
                 ret1, ret3, ret5, acc = backtest(df, fused)
-                results.append(RunResult(window.label, strategy, stype, a, b, method, wa, 1.0-wa if wa is not None else None, train_samples, test_samples, mae, rmse, r2, ret1, ret3, ret5, acc))
+                results.append(RunResult(window.label, strategy, stype, strategy_model_token(a, feature_subset_a), strategy_model_token(b, feature_subset_b), method, wa, 1.0-wa if wa is not None else None, train_samples, test_samples, mae, rmse, r2, ret1, ret3, ret5, acc))
 
-    output = {"target": args.target, "model_a_candidates": model_as, "model_b_candidates": model_bs, "methods": methods, "weight_grid": weight_grid, "test_windows": [asdict(w) for w in windows], "results": [asdict(r) for r in results], "summary": summarize(results)}
+    output = {"target": args.target, "model_a_candidates": model_as, "model_b_candidates": model_bs, "methods": methods, "weight_grid": weight_grid, "single_feature_subsets": single_feature_subsets, "ensemble_feature_subsets": ensemble_feature_subsets, "test_windows": [asdict(w) for w in windows], "results": [asdict(r) for r in results], "summary": summarize(results)}
     out = Path(args.output); out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w") as f: json.dump(output, f, indent=2, default=str)
 

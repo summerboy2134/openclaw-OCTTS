@@ -21,22 +21,12 @@ from octts.config import Settings
 from octts.schemas.training import RawMarketTrainingSample
 from octts.services.market_raw_data_repository import MarketRawDataRepository
 from octts.services.raw_market_training_dataset import RawMarketTrainingDatasetBuilder
+from octts.tools.train_raw_market_model import RAW_MARKET_FEATURE_COLUMNS
 
 logger = logging.getLogger(__name__)
 
-# 34个固定特征列
-FEATURE_COLUMNS = [
-    "close", "pct_change", "turnover_rate", "volume_ratio", "market_cap",
-    "pe_ttm", "pb", "amount", "vol", "volatility_5d", "volatility_10d",
-    "max_drawdown_10d_past", "close_to_ma5", "close_to_ma10",
-    "price_position_20d", "price_position_10d", "avg_turnover_rate_5d",
-    "avg_volume_ratio_5d", "market_return_1d", "market_return_3d",
-    "market_return_5d", "market_up_ratio_1d", "market_up_ratio_3d_avg",
-    "market_up_days_5d", "stock_vs_market_return_1d", "stock_vs_market_return_3d",
-    "stock_vs_market_return_10d", "pct_change_rank_pct", "turnover_rate_rank_pct",
-    "volume_ratio_rank_pct", "up_days_3d", "up_days_5d",
-    "new_high_gap_20d", "new_low_gap_20d",
-]
+# 与 train_raw_market_model.py 的默认训练特征保持一致，避免预计算表与训练/预测口径漂移。
+FEATURE_COLUMNS = list(RAW_MARKET_FEATURE_COLUMNS)
 
 # 目标列
 TARGET_COLUMNS = [
@@ -45,13 +35,15 @@ TARGET_COLUMNS = [
     "label_up_1d", "label_up_3d", "label_up_5d",
     "label_vs_market_1d", "label_vs_market_3d", "label_vs_market_5d",
     "label_strong_1d",
+    "label_limit_relay_success_1d", "label_limit_relay_strong_1d",
+    "label_limit_relay_success_3d", "label_limit_relay_limit_up_1d",
 ]
 
 ALL_COLUMNS = ["trade_date", "ts_code"] + FEATURE_COLUMNS + TARGET_COLUMNS
 
 
 def create_table_if_not_exists(repo: MarketRawDataRepository) -> None:
-    """创建特征表（如果不存在）。"""
+    """创建特征表（如果不存在），并为已有表补齐缺失列。"""
     create_sql = f"""
     CREATE TABLE IF NOT EXISTS training_features (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,6 +57,21 @@ def create_table_if_not_exists(repo: MarketRawDataRepository) -> None:
     """
     with repo._db.get_session() as session:
         session.execute(text(create_sql))
+        existing_columns = {
+            row[1]
+            for row in session.execute(text("PRAGMA table_info(training_features)")).fetchall()
+        }
+        required_feature_columns = {col: "FLOAT" for col in FEATURE_COLUMNS}
+        required_target_columns = {col: "FLOAT" for col in TARGET_COLUMNS}
+        required_columns = {
+            **required_feature_columns,
+            **required_target_columns,
+        }
+        for column_name, column_type in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            session.execute(text(f"ALTER TABLE training_features ADD COLUMN {column_name} {column_type}"))
+            logger.info("training_features 表新增缺失列: %s %s", column_name, column_type)
         session.commit()
     logger.info("特征表已就绪")
 

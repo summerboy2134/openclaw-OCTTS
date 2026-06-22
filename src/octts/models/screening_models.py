@@ -260,6 +260,16 @@ class RecommendationPoolState(Base):
     top3_risk_penalty = Column(Float)
     short_term_contradiction_penalty = Column(Float)
     final_display_recommendation_score = Column(Float)
+    close_auction_price = Column(Float)
+    close_auction_amount = Column(Float)
+    close_auction_vwap = Column(Float)
+    close_auction_price_deviation_pct = Column(Float)
+    close_auction_amount_ratio = Column(Float)
+    stage3_close_auction_score = Column(Float)
+    stage3_close_auction_flags = Column(JSON)
+    stage3_close_auction_risks = Column(JSON)
+    stage3_close_auction_veto = Column(Boolean, default=False)
+    stage3_close_auction_missing = Column(Boolean, default=False)
     top3_status = Column(String(20), default='normal')
     top3_reason = Column(Text)
     late_stage_momentum_flag = Column(Boolean, default=False)
@@ -288,6 +298,7 @@ class RecommendationPoolState(Base):
     selection_reason_components = Column(JSON)
     structured_rank_score = Column(Float)
     structured_rank_position = Column(Integer)
+    final_selection_score = Column(Float)
     previous_recommendation_score = Column(Float)
     previous_overall_score = Column(Float)
     previous_confidence = Column(Float)
@@ -751,6 +762,16 @@ class DatabaseManager:
                 'top3_risk_penalty': "ALTER TABLE recommendation_pool_states ADD COLUMN top3_risk_penalty FLOAT",
                 'short_term_contradiction_penalty': "ALTER TABLE recommendation_pool_states ADD COLUMN short_term_contradiction_penalty FLOAT",
                 'final_display_recommendation_score': "ALTER TABLE recommendation_pool_states ADD COLUMN final_display_recommendation_score FLOAT",
+                'close_auction_price': "ALTER TABLE recommendation_pool_states ADD COLUMN close_auction_price FLOAT",
+                'close_auction_amount': "ALTER TABLE recommendation_pool_states ADD COLUMN close_auction_amount FLOAT",
+                'close_auction_vwap': "ALTER TABLE recommendation_pool_states ADD COLUMN close_auction_vwap FLOAT",
+                'close_auction_price_deviation_pct': "ALTER TABLE recommendation_pool_states ADD COLUMN close_auction_price_deviation_pct FLOAT",
+                'close_auction_amount_ratio': "ALTER TABLE recommendation_pool_states ADD COLUMN close_auction_amount_ratio FLOAT",
+                'stage3_close_auction_score': "ALTER TABLE recommendation_pool_states ADD COLUMN stage3_close_auction_score FLOAT",
+                'stage3_close_auction_flags': "ALTER TABLE recommendation_pool_states ADD COLUMN stage3_close_auction_flags JSON",
+                'stage3_close_auction_risks': "ALTER TABLE recommendation_pool_states ADD COLUMN stage3_close_auction_risks JSON",
+                'stage3_close_auction_veto': "ALTER TABLE recommendation_pool_states ADD COLUMN stage3_close_auction_veto BOOLEAN DEFAULT 0",
+                'stage3_close_auction_missing': "ALTER TABLE recommendation_pool_states ADD COLUMN stage3_close_auction_missing BOOLEAN DEFAULT 0",
                 'top3_status': "ALTER TABLE recommendation_pool_states ADD COLUMN top3_status VARCHAR(20) DEFAULT 'normal'",
                 'top3_reason': "ALTER TABLE recommendation_pool_states ADD COLUMN top3_reason TEXT",
                 'late_stage_momentum_flag': "ALTER TABLE recommendation_pool_states ADD COLUMN late_stage_momentum_flag BOOLEAN DEFAULT 0",
@@ -779,6 +800,7 @@ class DatabaseManager:
                 'selection_reason_components': "ALTER TABLE recommendation_pool_states ADD COLUMN selection_reason_components JSON",
                 'structured_rank_score': "ALTER TABLE recommendation_pool_states ADD COLUMN structured_rank_score FLOAT",
                 'structured_rank_position': "ALTER TABLE recommendation_pool_states ADD COLUMN structured_rank_position INTEGER",
+                'final_selection_score': "ALTER TABLE recommendation_pool_states ADD COLUMN final_selection_score FLOAT",
                 'previous_recommendation_score': "ALTER TABLE recommendation_pool_states ADD COLUMN previous_recommendation_score FLOAT",
                 'previous_overall_score': "ALTER TABLE recommendation_pool_states ADD COLUMN previous_overall_score FLOAT",
                 'previous_confidence': "ALTER TABLE recommendation_pool_states ADD COLUMN previous_confidence FLOAT",
@@ -1636,6 +1658,16 @@ class DatabaseManager:
                 record.top3_risk_penalty = state.top3_risk_penalty
                 record.short_term_contradiction_penalty = state.short_term_contradiction_penalty
                 record.final_display_recommendation_score = state.final_display_recommendation_score
+                record.close_auction_price = getattr(state, 'close_auction_price', None)
+                record.close_auction_amount = getattr(state, 'close_auction_amount', None)
+                record.close_auction_vwap = getattr(state, 'close_auction_vwap', None)
+                record.close_auction_price_deviation_pct = getattr(state, 'close_auction_price_deviation_pct', None)
+                record.close_auction_amount_ratio = getattr(state, 'close_auction_amount_ratio', None)
+                record.stage3_close_auction_score = getattr(state, 'stage3_close_auction_score', None)
+                record.stage3_close_auction_flags = list(getattr(state, 'stage3_close_auction_flags', []) or [])
+                record.stage3_close_auction_risks = list(getattr(state, 'stage3_close_auction_risks', []) or [])
+                record.stage3_close_auction_veto = bool(getattr(state, 'stage3_close_auction_veto', False))
+                record.stage3_close_auction_missing = bool(getattr(state, 'stage3_close_auction_missing', False))
                 record.top3_status = getattr(state, 'top3_status', 'normal') or 'normal'
                 record.top3_reason = getattr(state, 'top3_reason', None)
                 record.late_stage_momentum_flag = bool(state.late_stage_momentum_flag)
@@ -1664,6 +1696,7 @@ class DatabaseManager:
                 record.selection_reason_components = dict(getattr(state, 'selection_reason_components', {}) or {})
                 record.structured_rank_score = getattr(state, 'structured_rank_score', None)
                 record.structured_rank_position = getattr(state, 'structured_rank_position', None)
+                record.final_selection_score = getattr(state, 'final_selection_score', None)
                 record.previous_recommendation_score = state.previous_recommendation_score
                 record.previous_overall_score = state.previous_overall_score
                 record.previous_confidence = state.previous_confidence
@@ -1687,6 +1720,59 @@ class DatabaseManager:
         finally:
             session.close()
 
+    def clear_intelligent_screening_results_for_trade_date(
+        self,
+        trade_date: date,
+        *,
+        clear_recommendation_pool: bool = True,
+        clear_recommendation_run: bool = True,
+    ) -> Dict[str, int]:
+        session = self.get_session()
+        try:
+            deleted_pool_states = 0
+            deleted_recommendation_items = 0
+            deleted_recommendation_performances = 0
+            deleted_recommendation_runs = 0
+
+            if clear_recommendation_pool:
+                deleted_pool_states = session.query(RecommendationPoolState).filter(
+                    RecommendationPoolState.trade_date == trade_date
+                ).delete(synchronize_session=False)
+
+            if clear_recommendation_run:
+                run_ids = [
+                    row.id
+                    for row in session.query(RecommendationRun.id).filter(
+                        RecommendationRun.trade_date == trade_date
+                    ).all()
+                ]
+                if run_ids:
+                    item_ids_query = session.query(RecommendationItem.id).filter(
+                        RecommendationItem.run_id.in_(run_ids)
+                    )
+                    deleted_recommendation_performances = session.query(RecommendationPerformance).filter(
+                        RecommendationPerformance.recommendation_item_id.in_(item_ids_query)
+                    ).delete(synchronize_session=False)
+                    deleted_recommendation_items = session.query(RecommendationItem).filter(
+                        RecommendationItem.run_id.in_(run_ids)
+                    ).delete(synchronize_session=False)
+                    deleted_recommendation_runs = session.query(RecommendationRun).filter(
+                        RecommendationRun.id.in_(run_ids)
+                    ).delete(synchronize_session=False)
+
+            session.commit()
+            return {
+                "recommendation_pool_states": int(deleted_pool_states or 0),
+                "recommendation_performances": int(deleted_recommendation_performances or 0),
+                "recommendation_items": int(deleted_recommendation_items or 0),
+                "recommendation_runs": int(deleted_recommendation_runs or 0),
+            }
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
     def load_recommendation_pool_state(self, trade_date: Optional[date] = None) -> List[Dict[str, Any]]:
         session = self.get_session()
         try:
@@ -1700,6 +1786,9 @@ class DatabaseManager:
                 RecommendationPoolState.trade_date == target_date
             ).order_by(
                 RecommendationPoolState.recommend_rank.asc().nullslast(),
+                RecommendationPoolState.frontlist_rank.asc().nullslast(),
+                RecommendationPoolState.structured_rank_position.asc().nullslast(),
+                RecommendationPoolState.final_selection_score.desc().nullslast(),
                 RecommendationPoolState.rerank_pool_rank.asc().nullslast(),
                 RecommendationPoolState.recommendation_score.desc(),
                 RecommendationPoolState.overall_score.desc().nullslast(),
@@ -1740,6 +1829,9 @@ class DatabaseManager:
                 query = query.filter(RecommendationPoolState.in_frontlist == front_only)
             query = query.order_by(
                 RecommendationPoolState.recommend_rank.asc().nullslast(),
+                RecommendationPoolState.frontlist_rank.asc().nullslast(),
+                RecommendationPoolState.structured_rank_position.asc().nullslast(),
+                RecommendationPoolState.final_selection_score.desc().nullslast(),
                 RecommendationPoolState.rerank_pool_rank.asc().nullslast(),
                 RecommendationPoolState.recommendation_score.desc(),
                 RecommendationPoolState.overall_score.desc().nullslast(),
@@ -2057,6 +2149,16 @@ class DatabaseManager:
             'top3_risk_penalty': item.top3_risk_penalty,
             'short_term_contradiction_penalty': item.short_term_contradiction_penalty,
             'final_display_recommendation_score': item.final_display_recommendation_score,
+            'close_auction_price': getattr(item, 'close_auction_price', None),
+            'close_auction_amount': getattr(item, 'close_auction_amount', None),
+            'close_auction_vwap': getattr(item, 'close_auction_vwap', None),
+            'close_auction_price_deviation_pct': getattr(item, 'close_auction_price_deviation_pct', None),
+            'close_auction_amount_ratio': getattr(item, 'close_auction_amount_ratio', None),
+            'stage3_close_auction_score': getattr(item, 'stage3_close_auction_score', None),
+            'stage3_close_auction_flags': list(getattr(item, 'stage3_close_auction_flags', []) or []),
+            'stage3_close_auction_risks': list(getattr(item, 'stage3_close_auction_risks', []) or []),
+            'stage3_close_auction_veto': bool(getattr(item, 'stage3_close_auction_veto', False)),
+            'stage3_close_auction_missing': bool(getattr(item, 'stage3_close_auction_missing', False)),
             'top3_status': item.top3_status,
             'top3_reason': item.top3_reason,
             'late_stage_momentum_flag': bool(item.late_stage_momentum_flag),
@@ -2085,6 +2187,7 @@ class DatabaseManager:
             'selection_reason_components': dict(getattr(item, 'selection_reason_components', {}) or {}),
             'structured_rank_score': getattr(item, 'structured_rank_score', None),
             'structured_rank_position': getattr(item, 'structured_rank_position', None),
+            'final_selection_score': getattr(item, 'final_selection_score', None),
             'previous_recommendation_score': item.previous_recommendation_score,
             'previous_overall_score': item.previous_overall_score,
             'previous_confidence': item.previous_confidence,

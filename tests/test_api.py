@@ -1493,6 +1493,41 @@ def test_render_intelligent_screening_dashboard_prefers_authoritative_top3_and_s
     assert focus_pos == sorted(focus_pos)
 
 
+def test_intelligent_payload_normalization_filters_st_excluded_snapshot_items() -> None:
+    from octts.api_legacy import _normalize_intelligent_payload
+
+    payload = _normalize_intelligent_payload({
+        "recommendation_pool": {
+            "today_top": [
+                {
+                    "ts_code": "600265.SH",
+                    "name": "*ST景谷",
+                    "source_tag": "今日Top3",
+                    "selection_stage": "model_top100_st_refill_excluded",
+                    "selection_reason_components": {"top3_st_excluded": True},
+                },
+                {"ts_code": "688498.SH", "name": "源杰科技", "source_tag": "今日Top3"},
+            ],
+            "frontlist": [
+                {"ts_code": "600265.SH", "name": "*ST景谷"},
+                {"ts_code": "688498.SH", "name": "源杰科技"},
+            ],
+        },
+        "report_context": {
+            "today_top3": [
+                {"ts_code": "600265.SH", "name": "*ST景谷"},
+                {"ts_code": "688498.SH", "name": "源杰科技"},
+            ],
+        },
+        "intelligent_report": {"blocks": {"focus_stocks": [{"ts_code": "600265.SH", "name": "*ST景谷"}]}},
+    })
+
+    assert [item["ts_code"] for item in payload["recommendation_pool"]["today_top"]] == ["688498.SH"]
+    assert [item["ts_code"] for item in payload["recommendation_pool"]["frontlist"]] == ["688498.SH"]
+    assert [item["ts_code"] for item in payload["report_context"]["today_top3"]] == ["688498.SH"]
+    assert payload["intelligent_report"]["blocks"]["focus_stocks"] == []
+
+
 def test_render_intelligent_screening_dashboard_preserves_report_focus_analysis_when_top10_has_candidates_first() -> None:
     payload = _build_dashboard_payload_for_order_tests()
     payload["report_context"]["today_top3"] = [
@@ -1528,6 +1563,21 @@ def test_render_intelligent_screening_dashboard_invalid_recommendations_tab_fall
 
     assert "今日 Top3" in html
     assert "3日前 Top3 持仓复盘" in html
+
+
+def test_render_intelligent_screening_dashboard_does_not_show_continuations_as_3day_review() -> None:
+    payload = _build_dashboard_payload_for_order_tests()
+    payload["recommendation_pool"]["yesterday_continuations"] = [
+        {"ts_code": "301511.SZ", "name": "德福科技", "source_tag": "昨日延续", "today_verdict": "仅保留在今日候选，未进入今日Top3"}
+    ]
+    payload["report_context"]["yesterday_top3_review"] = []
+    payload["intelligent_report"]["blocks"]["yesterday_reviews"] = []
+
+    html = render_intelligent_screening_dashboard(**payload, active_tab="overview")
+
+    assert "暂无 3 日前 Top3 持仓复盘标的" in html
+    assert "301511.SZ" not in html
+    assert "德福科技" not in html
 
 
 def test_render_intelligent_screening_dashboard_shows_3d_stats_independently() -> None:

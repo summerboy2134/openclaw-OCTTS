@@ -53,6 +53,35 @@ def test_upsert_recommendation_pool_states_persists_continuation_fields(tmp_path
     assert loaded[0]["top3_extreme_risk_reason"] == "candidate_risk_blocked"
 
 
+def test_clear_intelligent_screening_results_for_trade_date_removes_pool_and_run(tmp_path) -> None:
+    db_path = tmp_path / "screening.db"
+    manager = DatabaseManager(f"sqlite:///{db_path}")
+    trade_day = date(2026, 5, 27)
+
+    manager.upsert_recommendation_pool_states([
+        TrackedRecommendationState(ts_code="600265.SH", trade_date=trade_day, name="*ST景谷"),
+        TrackedRecommendationState(ts_code="688498.SH", trade_date=trade_day, name="源杰科技"),
+        TrackedRecommendationState(ts_code="000001.SZ", trade_date=date(2026, 5, 26), name="隔日保留"),
+    ])
+    manager.save_recommendation_run(
+        run_id="rec-20260527",
+        trade_date=trade_day,
+        candidate_count=2,
+        final_count=1,
+        report_id="report-1",
+        items=[{"ts_code": "600265.SH", "trade_date": trade_day, "source_tag": "今日Top3"}],
+    )
+
+    summary = manager.clear_intelligent_screening_results_for_trade_date(trade_day)
+
+    assert summary["recommendation_pool_states"] == 2
+    assert summary["recommendation_items"] == 1
+    assert summary["recommendation_runs"] == 1
+    assert manager.load_recommendation_pool_state(trade_date=trade_day) == []
+    assert [item["ts_code"] for item in manager.load_recommendation_pool_state(trade_date=date(2026, 5, 26))] == ["000001.SZ"]
+    assert manager.list_recommendation_run_items(trade_date=trade_day) == []
+
+
 def test_upsert_short_term_training_samples_persists_labels_and_features(tmp_path) -> None:
     db_path = tmp_path / "screening.db"
     manager = DatabaseManager(f"sqlite:///{db_path}")

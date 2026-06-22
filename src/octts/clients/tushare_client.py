@@ -18,6 +18,7 @@ PRO_BAR_EMPTY_RESULT_MESSAGES = (
     "single positional indexer is out-of-bounds",
     "out-of-bounds",
 )
+RAW_DAILY_FIELDS = "ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount"
 logger = logging.getLogger(__name__)
 SCREENING_SNAPSHOT_REQUIRED_BASIC_FIELDS = {"ts_code", "close", "total_mv", "turnover_rate", "volume_ratio"}
 SCREENING_SNAPSHOT_MIN_BASIC_FIELDS = 2
@@ -26,6 +27,10 @@ SCREENING_SNAPSHOT_HISTORY_LOOKBACK_DAYS = 120
 SCREENING_SNAPSHOT_MIN_HISTORY_ROWS = 20
 SCREENING_HISTORY_THROTTLE_MIN_BACKFILL_DATES = 20
 SCREENING_SNAPSHOT_CACHE_MODE = "slim_v1"
+SCREENING_LOCAL_COVERAGE_MIN_SYMBOLS = 1000
+SCREENING_LOCAL_COVERAGE_ACCEPT_RATIO = 0.995
+SCREENING_DAILY_BASIC_LOCAL_COVERAGE_ACCEPT_RATIO = 0.99
+SCREENING_HISTORY_LOCAL_COVERAGE_ACCEPT_RATIO = 0.985
 LATEST_TRADE_DATE_PROBE_CODE = "000001.SZ"
 LATEST_TRADE_DATE_PROBE_CACHE_SECONDS = 600
 LATEST_TRADE_DATE_PROBE_FAILURE_COOLDOWN_SECONDS = 180
@@ -358,6 +363,64 @@ class TushareClient:
             return []
         return df.to_dict(orient="records")
 
+    def fetch_close_auction_batch(self, *, ts_codes: List[str], trade_date: str) -> Dict[str, Dict[str, Any]]:
+        """Fetch close auction rows for a small candidate set.
+
+        Tushare-compatible wrappers may expose new endpoints either as direct
+        methods or via pro.query, so keep both paths.
+        """
+        normalized_trade_date = _normalize_trade_date_value(trade_date)
+        if not normalized_trade_date or not ts_codes:
+            return {}
+
+        normalized_codes = [str(code).strip().upper() for code in ts_codes if str(code).strip()]
+        if not normalized_codes:
+            return {}
+
+        rows: List[Dict[str, Any]] = []
+        for ts_code in normalized_codes:
+            rows.extend(self._fetch_close_auction_rows(trade_date=normalized_trade_date, ts_code=ts_code))
+
+        code_set = set(normalized_codes)
+        result: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            row_code = str(row.get("ts_code") or row.get("code") or "").strip().upper()
+            row_date = _normalize_trade_date_value(row.get("trade_date") or row.get("date"))
+            if row_code not in code_set:
+                continue
+            if row_date and row_date != normalized_trade_date:
+                continue
+            result[row_code] = row
+        return result
+
+    def _fetch_close_auction_rows(self, *, trade_date: str, ts_code: Optional[str] = None) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {"trade_date": trade_date}
+        if ts_code:
+            params["ts_code"] = ts_code
+
+        for endpoint in ("stk_auction_c", "stk_auction_d", "auction"):
+            fetch_method = getattr(self._pro, endpoint, None)
+            for fetcher in (
+                (lambda method=fetch_method: method(**params)) if fetch_method is not None else None,
+                lambda name=endpoint: self._pro.query(name, **params),
+            ):
+                if fetcher is None:
+                    continue
+                try:
+                    df = fetcher()
+                except Exception as exc:
+                    logger.debug(
+                        "Tushare auction fetch failed: endpoint=%s, trade_date=%s, ts_code=%s, error=%s",
+                        endpoint,
+                        trade_date,
+                        ts_code,
+                        exc,
+                    )
+                    continue
+                if df is not None and not getattr(df, "empty", True):
+                    return df.to_dict(orient="records")
+        return []
+
     def fetch_top_list(self, ts_code: str, *, trade_date: Optional[str]) -> List[Dict[str, Any]]:
         """Fetch Dragon Tiger list rows for one stock on one trade date."""
         normalized_trade_date = _normalize_trade_date_value(trade_date)
@@ -405,6 +468,101 @@ class TushareClient:
             if str(row.get("ts_code") or "").strip().upper() == normalized_code:
                 return row
         return None
+
+    def fetch_disclosure_announcements(
+        self,
+        *,
+        ts_code: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Fetch exchange disclosure announcements when the Tushare gateway exposes them."""
+        params: Dict[str, Any] = {}
+        normalized_code = str(ts_code or "").strip().upper()
+        if normalized_code:
+            params["ts_code"] = normalized_code
+        normalized_start = _normalize_trade_date_value(start_date)
+        normalized_end = _normalize_trade_date_value(end_date)
+        if normalized_start:
+            params["start_date"] = normalized_start
+        if normalized_end:
+            params["end_date"] = normalized_end
+
+        rows = self._fetch_optional_endpoint_rows(
+            endpoint="anns_d",
+            params=params,
+            fallback_endpoints=("announcements", "disclosure_ann", "notice"),
+        )
+        if normalized_code:
+            rows = [row for row in rows if str(row.get("ts_code") or row.get("code") or "").strip().upper() == normalized_code]
+        return rows[: max(0, int(limit))]
+
+    def fetch_special_treatment_rows(
+        self,
+        *,
+        ts_code: Optional[str] = None,
+        trade_date: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Fetch special stock event rows when supported by the gateway.
+
+        Different Tushare-compatible gateways expose abnormal move / special-list
+        data under different endpoint names. This helper intentionally probes a
+        small set and returns whichever is available.
+        """
+        params: Dict[str, Any] = {}
+        normalized_code = str(ts_code or "").strip().upper()
+        if normalized_code:
+            params["ts_code"] = normalized_code
+        normalized_trade_date = _normalize_trade_date_value(trade_date)
+        normalized_start = _normalize_trade_date_value(start_date)
+        normalized_end = _normalize_trade_date_value(end_date)
+        if normalized_trade_date:
+            params["trade_date"] = normalized_trade_date
+        if normalized_start:
+            params["start_date"] = normalized_start
+        if normalized_end:
+            params["end_date"] = normalized_end
+
+        rows = self._fetch_optional_endpoint_rows(
+            endpoint="stk_special",
+            params=params,
+            fallback_endpoints=("stock_special", "special_list", "abnormal_change"),
+        )
+        if normalized_code:
+            rows = [row for row in rows if str(row.get("ts_code") or row.get("code") or "").strip().upper() == normalized_code]
+        return rows[: max(0, int(limit))]
+
+    def _fetch_optional_endpoint_rows(
+        self,
+        *,
+        endpoint: str,
+        params: Dict[str, Any],
+        fallback_endpoints: Tuple[str, ...] = (),
+    ) -> List[Dict[str, Any]]:
+        for candidate_endpoint in (endpoint, *fallback_endpoints):
+            fetch_method = getattr(self._pro, candidate_endpoint, None)
+            fetchers = []
+            if fetch_method is not None:
+                fetchers.append(lambda method=fetch_method: method(**params))
+            fetchers.append(lambda name=candidate_endpoint: self._pro.query(name, **params))
+            for fetcher in fetchers:
+                try:
+                    df = fetcher()
+                except Exception as exc:
+                    logger.debug(
+                        "Tushare optional endpoint fetch failed: endpoint=%s, params=%s, error=%s",
+                        candidate_endpoint,
+                        params,
+                        exc,
+                    )
+                    continue
+                if df is not None and not getattr(df, "empty", True):
+                    return df.to_dict(orient="records")
+        return []
 
     def fetch_company_profile(self, ts_code: str) -> Dict[str, Any]:
         """Fetch company profile for business summary generation."""
@@ -741,9 +899,20 @@ class TushareClient:
                 snapshot_path,
                 "cache_miss",
             )
+        build_started_at = time.time()
+        logger.info("Screening snapshot step 1/3: fetch stock list")
         stocks = self.fetch_stock_list(list_status="L")
         ts_codes = [stock.get("ts_code") for stock in stocks if stock.get("ts_code")]
+        logger.info("Screening snapshot stock universe ready: trade_date=%s, symbols=%s", normalized_trade_date, len(ts_codes))
+        logger.info("Screening snapshot step 2/3: fetch daily_basic batch")
         daily_basic = self.fetch_daily_basic_batch(ts_codes=ts_codes, trade_date=normalized_trade_date)
+        logger.info(
+            "Screening snapshot daily_basic ready: trade_date=%s, matched_symbols=%s/%s",
+            normalized_trade_date,
+            len(daily_basic),
+            len(ts_codes),
+        )
+        logger.info("Screening snapshot step 3/3: build screening daily history batch")
         daily = self.fetch_screening_daily_history_batch(ts_codes=ts_codes, trade_date=normalized_trade_date)
         snapshot = {
             "snapshot_version": SCREENING_SNAPSHOT_VERSION,
@@ -776,11 +945,12 @@ class TushareClient:
                 len(snapshot["daily"]),
             )
         logger.info(
-            "Screening snapshot build complete: trade_date=%s, stocks=%s, basic=%s, cached_daily=%s",
+            "Screening snapshot build complete: trade_date=%s, stocks=%s, basic=%s, cached_daily=%s, elapsed_seconds=%.2f",
             normalized_trade_date,
             len(stocks),
             len(daily_basic),
             len(snapshot["daily"]),
+            time.time() - build_started_at,
         )
         return snapshot
 
@@ -989,9 +1159,12 @@ class TushareClient:
             股票列表
         """
         cached_rows = self._stock_list_cache.get(list_status)
-        if cached_rows is not None:
+        if cached_rows:
             logger.info("Tushare stock list cache hit: list_status=%s, rows=%s", list_status, len(cached_rows))
             return [dict(item) for item in cached_rows]
+        if cached_rows == []:
+            logger.warning("Ignoring empty stock list cache entry: list_status=%s", list_status)
+            self._stock_list_cache.pop(list_status, None)
 
         started_at = time.time()
         logger.info("Tushare fetch_stock_list start: list_status=%s", list_status)
@@ -1002,8 +1175,12 @@ class TushareClient:
                 fields="ts_code,symbol,name,area,industry,market,list_date"
             )
             if df is None or df.empty:
-                logger.info("Tushare fetch_stock_list complete: 0 rows in %.2fs", time.time() - started_at)
-                self._stock_list_cache[list_status] = []
+                logger.warning("Tushare fetch_stock_list returned empty result in %.2fs: list_status=%s", time.time() - started_at, list_status)
+                local_rows = self._load_local_stock_list(list_status=list_status)
+                if local_rows:
+                    self._stock_list_cache[list_status] = local_rows
+                    logger.info("Local stock list fallback accepted: list_status=%s, rows=%s", list_status, len(local_rows))
+                    return [dict(item) for item in local_rows]
                 return []
             rows = df.to_dict(orient="records")
             self._stock_list_cache[list_status] = rows
@@ -1011,7 +1188,37 @@ class TushareClient:
             return [dict(item) for item in rows]
         except Exception as exc:
             logger.error("Tushare fetch_stock_list failed after %.2fs: %s", time.time() - started_at, exc)
+            local_rows = self._load_local_stock_list(list_status=list_status)
+            if local_rows:
+                self._stock_list_cache[list_status] = local_rows
+                logger.info("Local stock list fallback accepted after remote failure: list_status=%s, rows=%s", list_status, len(local_rows))
+                return [dict(item) for item in local_rows]
             return []
+
+    def _load_local_stock_list(self, *, list_status: str) -> List[Dict[str, Any]]:
+        # Local DB does not preserve list_status, so only use it as a fallback for listed stocks.
+        if list_status != "L":
+            return []
+        session = self._raw_data_repo._db.get_session()
+        try:
+            from octts.models.screening_models import MarketStockBasic
+
+            rows = session.query(MarketStockBasic).all()
+            return [
+                {
+                    "ts_code": row.ts_code,
+                    "symbol": row.symbol,
+                    "name": row.name,
+                    "area": row.area,
+                    "industry": row.industry,
+                    "market": row.market,
+                    "list_date": row.list_date.strftime("%Y%m%d") if row.list_date else None,
+                }
+                for row in rows
+                if row.ts_code
+            ]
+        finally:
+            session.close()
 
     def _throttle_screening_history_fetch_loop(
         self,
@@ -1039,6 +1246,21 @@ class TushareClient:
         )
         time.sleep(batch_sleep_seconds)
 
+    @staticmethod
+    def _should_accept_local_screening_coverage(
+        *,
+        matched_count: int,
+        total_symbols: int,
+        accept_ratio: float = SCREENING_LOCAL_COVERAGE_ACCEPT_RATIO,
+    ) -> bool:
+        if total_symbols <= 0:
+            return True
+        if matched_count >= total_symbols:
+            return True
+        if total_symbols < SCREENING_LOCAL_COVERAGE_MIN_SYMBOLS:
+            return False
+        return (matched_count / total_symbols) >= accept_ratio
+
     def fetch_daily_basic_batch(
         self,
         *,
@@ -1063,12 +1285,17 @@ class TushareClient:
         )
         local_result = self._raw_data_repo.get_daily_basic_batch_for_trade_date(ts_codes=ts_codes, trade_date=trade_date)
         result = dict(local_result)
-        if len(result) == len(ts_codes):
+        if self._should_accept_local_screening_coverage(
+            matched_count=len(result),
+            total_symbols=len(ts_codes),
+            accept_ratio=SCREENING_DAILY_BASIC_LOCAL_COVERAGE_ACCEPT_RATIO,
+        ):
             logger.info(
-                "Local daily_basic batch hit: %s/%s symbols in %.2fs",
+                "Local daily_basic batch accepted: %s/%s symbols in %.2fs, accept_ratio=%.4f",
                 len(result),
                 len(ts_codes),
                 time.time() - started_at,
+                SCREENING_DAILY_BASIC_LOCAL_COVERAGE_ACCEPT_RATIO,
             )
             return result
 
@@ -1160,10 +1387,11 @@ class TushareClient:
         result = self._raw_data_repo.get_daily_batch_for_trade_date(ts_codes=ts_codes, trade_date=trade_date)
         if not ts_codes:
             return result
-        if sum(1 for items in result.values() if items) == len(ts_codes):
+        local_hit_count = sum(1 for items in result.values() if items)
+        if self._should_accept_local_screening_coverage(matched_count=local_hit_count, total_symbols=len(ts_codes)):
             logger.info(
-                "Local daily trade-date batch hit: %s/%s symbols in %.2fs",
-                len(ts_codes),
+                "Local daily trade-date batch accepted: %s/%s symbols in %.2fs",
+                local_hit_count,
                 len(ts_codes),
                 time.time() - started_at,
             )
@@ -1206,25 +1434,37 @@ class TushareClient:
     ) -> Dict[str, List[Dict[str, Any]]]:
         if not ts_codes:
             return {}
+        started_at = time.time()
         anchor_date = datetime.strptime(trade_date, "%Y%m%d")
         start_date = (anchor_date - timedelta(days=max(lookback_days, 1))).strftime("%Y%m%d")
         trading_dates = self.fetch_trading_dates(start_date=start_date, end_date=trade_date)
+        logger.info(
+            "Screening history build start: trade_date=%s, symbols=%s, lookback_days=%s, trading_dates=%s",
+            trade_date,
+            len(ts_codes),
+            lookback_days,
+            len(trading_dates),
+        )
         if not trading_dates:
             return {ts_code: [] for ts_code in ts_codes}
 
         target_codes = set(ts_codes)
+        logger.info("Screening history step 1/4: load raw daily rows from local DB / fallback by trade_date")
         raw_daily_rows = self._fetch_screening_daily_rows_by_trade_dates(
             ts_codes=target_codes,
             trading_dates=trading_dates,
         )
+        logger.info("Screening history step 2/4: load daily_basic rows from local DB / fallback by trade_date")
         raw_daily_basic_rows = self._fetch_screening_daily_basic_rows_by_trade_dates(
             ts_codes=target_codes,
             trading_dates=trading_dates,
         )
+        logger.info("Screening history step 3/4: load adj_factor rows from local DB / fallback by trade_date")
         adj_factor_rows = self._fetch_screening_adj_factor_rows_by_trade_dates(
             ts_codes=target_codes,
             trading_dates=trading_dates,
         )
+        logger.info("Screening history step 4/4: build qfq history in memory")
         history = self._build_screening_qfq_history(
             ts_codes=ts_codes,
             trading_dates=trading_dates,
@@ -1232,10 +1472,11 @@ class TushareClient:
             adj_factor_rows=adj_factor_rows,
         )
         logger.info(
-            "Screening qfq history coverage: retained_symbols=%s/%s, retained_rows=%s",
+            "Screening qfq history coverage: retained_symbols=%s/%s, retained_rows=%s, elapsed_seconds=%.2f",
             sum(1 for rows in history.values() if rows),
             len(ts_codes),
             sum(len(rows) for rows in history.values()),
+            time.time() - started_at,
         )
 
         enriched_history: Dict[str, List[Dict[str, Any]]] = {}
@@ -1277,7 +1518,11 @@ class TushareClient:
 
         missing_trade_dates = [
             trade_date for trade_date in trading_dates
-            if any(trade_date not in rows_by_code.get(ts_code, {}) for ts_code in ts_codes)
+            if not self._should_accept_local_screening_coverage(
+                matched_count=sum(1 for ts_code in ts_codes if trade_date in rows_by_code.get(ts_code, {})),
+                total_symbols=len(ts_codes),
+                accept_ratio=SCREENING_HISTORY_LOCAL_COVERAGE_ACCEPT_RATIO,
+            )
         ]
         matched_symbols_by_date: Dict[str, int] = {}
         total_rows_by_date: Dict[str, int] = {}
@@ -1332,10 +1577,11 @@ class TushareClient:
                 total_rows_by_date.get(latest_trade_date, 0),
             )
         logger.info(
-            "Screening daily_basic history aggregate coverage: trading_dates=%s, symbols_with_any_rows=%s/%s",
+            "Screening daily_basic history aggregate coverage: trading_dates=%s, symbols_with_any_rows=%s/%s, missing_trade_dates=%s",
             len(trading_dates),
             matched_symbols,
             len(ts_codes),
+            len(missing_trade_dates),
         )
         return rows_by_code
 
@@ -1353,7 +1599,11 @@ class TushareClient:
 
         missing_trade_dates = [
             trade_date for trade_date in trading_dates
-            if any(trade_date not in rows_by_code.get(ts_code, {}) for ts_code in ts_codes)
+            if not self._should_accept_local_screening_coverage(
+                matched_count=sum(1 for ts_code in ts_codes if trade_date in rows_by_code.get(ts_code, {})),
+                total_symbols=len(ts_codes),
+                accept_ratio=SCREENING_HISTORY_LOCAL_COVERAGE_ACCEPT_RATIO,
+            )
         ]
         matched_symbols_by_date: Dict[str, int] = {}
         total_rows_by_date: Dict[str, int] = {}
@@ -1405,10 +1655,11 @@ class TushareClient:
                 total_rows_by_date.get(latest_trade_date, 0),
             )
         logger.info(
-            "Screening daily batch aggregate coverage: trading_dates=%s, symbols_with_any_rows=%s/%s",
+            "Screening daily batch aggregate coverage: trading_dates=%s, symbols_with_any_rows=%s/%s, missing_trade_dates=%s",
             len(trading_dates),
             matched_symbols,
             len(ts_codes),
+            len(missing_trade_dates),
         )
         return rows_by_code
 
@@ -1426,7 +1677,11 @@ class TushareClient:
 
         missing_trade_dates = [
             trade_date for trade_date in trading_dates
-            if any(trade_date not in factor_by_code.get(ts_code, {}) for ts_code in ts_codes)
+            if not self._should_accept_local_screening_coverage(
+                matched_count=sum(1 for ts_code in ts_codes if trade_date in factor_by_code.get(ts_code, {})),
+                total_symbols=len(ts_codes),
+                accept_ratio=SCREENING_HISTORY_LOCAL_COVERAGE_ACCEPT_RATIO,
+            )
         ]
         matched_symbols_by_date: Dict[str, int] = {}
         total_rows_by_date: Dict[str, int] = {}
@@ -1481,10 +1736,11 @@ class TushareClient:
                 total_rows_by_date.get(latest_trade_date, 0),
             )
         logger.info(
-            "Screening adj_factor aggregate coverage: trading_dates=%s, symbols_with_any_rows=%s/%s",
+            "Screening adj_factor aggregate coverage: trading_dates=%s, symbols_with_any_rows=%s/%s, missing_trade_dates=%s",
             len(trading_dates),
             matched_symbols,
             len(ts_codes),
+            len(missing_trade_dates),
         )
         return factor_by_code
 
@@ -1576,13 +1832,15 @@ class TushareClient:
                     )
                     continue
                 if df is None or df.empty:
-                    logger.info(
-                        "Tushare fetch_daily_batch empty symbol: ts_code=%s, start_date=%s, end_date=%s",
-                        ts_code,
-                        start_date,
-                        end_date,
-                    )
-                    continue
+                    df = self._fetch_daily_batch_fallback(ts_code=ts_code, start_date=start_date, end_date=end_date)
+                    if df is None or df.empty:
+                        logger.info(
+                            "Tushare fetch_daily_batch empty symbol: ts_code=%s, start_date=%s, end_date=%s",
+                            ts_code,
+                            start_date,
+                            end_date,
+                        )
+                        continue
                 daily_rows = _sort_frame_by_trade_date_desc(df).to_dict(orient="records")
                 raw_rows = [_build_raw_daily_row_from_qfq_row(row) for row in daily_rows]
                 if raw_rows:
@@ -1604,6 +1862,40 @@ class TushareClient:
             time.time() - started_at,
         )
         return result
+
+    def _fetch_daily_batch_fallback(self, *, ts_code: str, start_date: str, end_date: str):
+        try:
+            df = self._pro.daily(
+                ts_code=ts_code,
+                start_date=start_date,
+                end_date=end_date,
+                fields=RAW_DAILY_FIELDS,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Tushare fetch_daily_batch daily fallback failed: ts_code=%s, start_date=%s, end_date=%s, error=%s",
+                ts_code,
+                start_date,
+                end_date,
+                exc,
+            )
+            return None
+        if df is None or df.empty:
+            logger.info(
+                "Tushare fetch_daily_batch daily fallback empty: ts_code=%s, start_date=%s, end_date=%s",
+                ts_code,
+                start_date,
+                end_date,
+            )
+            return None
+        logger.info(
+            "Tushare fetch_daily_batch daily fallback returned rows: ts_code=%s, start_date=%s, end_date=%s, rows=%s",
+            ts_code,
+            start_date,
+            end_date,
+            len(df),
+        )
+        return df
 
 
 def _build_raw_daily_row_from_qfq_row(row: dict[str, Any]) -> dict[str, Any]:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -12,6 +12,12 @@ from octts.config import Settings
 from octts.schemas.screener import ScreenResult
 from octts.services.market_raw_data_repository import MarketRawDataRepository
 from octts.services.raw_market_training_dataset import RawMarketTrainingDatasetBuilder
+from octts.services.enhanced_screening_constants import (
+    RULE_RANK_NEAR_LIMIT_UP_PCT_CHANGE_MIN,
+    RULE_RANK_NEAR_LIMIT_UP_PENALTY,
+    RULE_RANK_STRONG_MOVE_PCT_CHANGE_MIN,
+    RULE_RANK_STRONG_MOVE_PENALTY,
+)
 from octts.tools.modeling import load_model_artifact
 
 logger = logging.getLogger(__name__)
@@ -25,10 +31,18 @@ class RegressionRerankResult:
     artifact_path: Optional[str]
     fallback_reason: Optional[str] = None
     error_message: Optional[str] = None
+    ranking_trade_date: Optional[date] = None
 
 
 class RegressionRerankService:
-    DEFAULT_MODEL_SPECS = [
+    PREFERRED_MODEL_SPECS = [
+        (
+            "lgbm_relay_v2_luw05",
+            "raw_market_202508_202606_return_3d_lgbm_relay_v2_luw05.lightgbm.pkl",
+            1.00,
+        ),
+    ]
+    LEGACY_FALLBACK_MODEL_SPECS = [
         ("lgbm_more_trees", "raw_market_202509_202602_return_3d_lgbm_more_trees.lightgbm.pkl", 0.60),
         ("xgb_slow", "raw_market_202509_202602_return_3d_xgb_slow.xgboost.pkl", 0.40),
     ]
@@ -128,12 +142,34 @@ class RegressionRerankService:
                 fallback_reason="missing_model_artifact",
             )
 
+        ranking_trade_date = trade_date
+        fallback_reason = None
         try:
             samples = self.dataset_builder.build_samples(
-                start_date=trade_date,
-                end_date=trade_date,
+                start_date=ranking_trade_date,
+                end_date=ranking_trade_date,
                 exclude_bj=exclude_bj,
+                include_stock_moneyflow_in_limit_chase_risk=False,
             )
+            if not samples:
+                fallback_trade_date = self._resolve_recent_sample_trade_date(
+                    trade_date=trade_date,
+                    exclude_bj=exclude_bj,
+                )
+                if fallback_trade_date is not None and fallback_trade_date != trade_date:
+                    logger.warning(
+                        "Market universe rank has no samples for %s; fallback to recent trade date %s",
+                        trade_date.isoformat(),
+                        fallback_trade_date.isoformat(),
+                    )
+                    ranking_trade_date = fallback_trade_date
+                    fallback_reason = "empty_universe_samples_trade_date_fallback"
+                    samples = self.dataset_builder.build_samples(
+                        start_date=ranking_trade_date,
+                        end_date=ranking_trade_date,
+                        exclude_bj=exclude_bj,
+                        include_stock_moneyflow_in_limit_chase_risk=False,
+                    )
             sample_map = {
                 sample.ts_code.strip().upper(): sample.model_dump(mode="python")
                 for sample in samples
@@ -142,7 +178,7 @@ class RegressionRerankService:
             artifacts = self._load_default_artifacts(artifact_paths)
             enriched_candidates = self._apply_model_scores(
                 candidates,
-                trade_date=trade_date,
+                trade_date=ranking_trade_date,
                 artifacts=artifacts,
                 rule_weight=0.0,
                 sample_map=sample_map,
@@ -165,19 +201,60 @@ class RegressionRerankService:
             item["recommendation_score"] = round(float(item.get("blend_score") or 0.0) * 100.0, 4)
             item["score_mode"] = "model_universe_rank"
         logger.info(
-            "Market universe rank complete: samples=%s, ranked=%s, candidate_limit=%s, feature_model=%s",
+            "Market universe rank complete: samples=%s, ranked=%s, candidate_limit=%s, feature_model=%s, ranking_trade_date=%s",
             len(samples),
             len(enriched_candidates),
             candidate_limit,
             ",".join(str(path.name) for _, path, _ in artifact_paths),
+            ranking_trade_date.isoformat(),
         )
         return RegressionRerankResult(
             candidate_codes=ordered_codes,
             analysis_codes=ordered_codes[:analysis_limit],
             metadata_by_code={item["ts_code"]: item for item in top_candidates},
             artifact_path=",".join(str(path) for _, path, _ in artifact_paths),
-            fallback_reason=None,
+            fallback_reason=fallback_reason,
+            ranking_trade_date=ranking_trade_date,
         )
+
+    def _resolve_recent_sample_trade_date(
+        self,
+        *,
+        trade_date: date,
+        exclude_bj: bool,
+    ) -> Optional[date]:
+        start_date = (trade_date - timedelta(days=10)).strftime("%Y%m%d")
+        end_date = trade_date.strftime("%Y%m%d")
+        try:
+            trade_dates = self.market_raw_data_repo.list_trading_dates(
+                start_date=start_date,
+                end_date=end_date,
+            )
+        except Exception:
+            logger.exception("Failed to resolve recent sample trade date: trade_date=%s", trade_date.isoformat())
+            return None
+        for trade_date_text in reversed(trade_dates):
+            try:
+                candidate_date = date.fromisoformat(
+                    f"{trade_date_text[:4]}-{trade_date_text[4:6]}-{trade_date_text[6:8]}"
+                )
+            except (TypeError, ValueError):
+                continue
+            if candidate_date >= trade_date:
+                continue
+            try:
+                samples = self.dataset_builder.build_samples(
+                    start_date=candidate_date,
+                    end_date=candidate_date,
+                    exclude_bj=exclude_bj,
+                    include_stock_moneyflow_in_limit_chase_risk=False,
+                )
+            except Exception:
+                logger.exception("Failed to test fallback sample date: %s", candidate_date.isoformat())
+                continue
+            if samples:
+                return candidate_date
+        return None
 
     @staticmethod
     def _build_universe_candidates(sample_map: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -305,15 +382,22 @@ class RegressionRerankService:
                 0.0,
                 float(item["technical_score_max"] or 0.0) - float(item["technical_score_min"] or 0.0),
             )
+            pct_change_value = float(item["pct_change"] or 0.0)
+            near_limit_penalty = 0.0
+            if pct_change_value >= RULE_RANK_NEAR_LIMIT_UP_PCT_CHANGE_MIN:
+                near_limit_penalty = RULE_RANK_NEAR_LIMIT_UP_PENALTY
+            elif pct_change_value >= RULE_RANK_STRONG_MOVE_PCT_CHANGE_MIN:
+                near_limit_penalty = RULE_RANK_STRONG_MOVE_PENALTY
             rule_score = (
                 float(item["count"] or 0.0) * 100.0
                 + float(item["technical_score"] or 0.0) * 1.2
                 + float(item["recommendation_score"] or 0.0)
                 + float(item["volume_ratio"] or 0.0) * 6.0
                 + float(item["turnover_rate"] or 0.0) * 0.8
-                + float(item["pct_change"] or 0.0) * 1.5
+                + pct_change_value * 1.5
                 - divergence_score * 0.25
                 - float(item["best_rank"] or 0.0) * 1.5
+                - near_limit_penalty
             )
             filtered.append(
                 {
@@ -327,6 +411,7 @@ class RegressionRerankService:
                     "moneyflow_signal_score": None,
                     "moneyflow_model_combo_bucket": None,
                     "divergence_score": round(divergence_score, 4),
+                    "near_limit_penalty": round(near_limit_penalty, 6),
                     "rule_score": round(rule_score, 6),
                     "score_mode": "rule_only",
                     "rule_weight": None,
@@ -352,10 +437,10 @@ class RegressionRerankService:
 
         filtered.sort(
             key=lambda item: (
+                -float(item.get("rule_score") or 0.0),
                 -float(item["count"] or 0.0),
                 -float(item["technical_score"] or 0.0),
                 -float(item["volume_ratio"] or 0.0),
-                -float(item["pct_change"] or 0.0),
                 item["ts_code"],
             )
         )
@@ -374,10 +459,19 @@ class RegressionRerankService:
             return []
         candidate_codes = [item["ts_code"] for item in candidates]
         if sample_map is None:
-            samples = self.dataset_builder.build_samples_for_codes(
-                candidate_codes, start_date=trade_date, end_date=trade_date
-            )
-            sample_map = {sample.ts_code.strip().upper(): sample.model_dump(mode="python") for sample in samples}
+            sample_map = self._load_precomputed_feature_samples(candidate_codes, trade_date=trade_date)
+            missing_codes = [code for code in candidate_codes if code not in sample_map]
+            if missing_codes:
+                logger.warning(
+                    "Precomputed training_features missing for rerank samples: trade_date=%s missing=%s/%s, fallback building on the fly",
+                    trade_date.isoformat(),
+                    len(missing_codes),
+                    len(candidate_codes),
+                )
+                samples = self.dataset_builder.build_samples_for_codes(
+                    missing_codes, start_date=trade_date, end_date=trade_date
+                )
+                sample_map.update({sample.ts_code.strip().upper(): sample.model_dump(mode="python") for sample in samples})
 
         prediction_maps: Dict[str, Dict[str, float]] = {}
         for artifact_spec in artifacts:
@@ -395,12 +489,13 @@ class RegressionRerankService:
                 sample = sample_map.get(ts_code)
                 if not sample:
                     continue
-                rows.append({column: sample.get(column, 0.0) for column in feature_columns})
+                rows.append({column: sample.get(column) for column in feature_columns})
                 predicted_codes.append(ts_code)
 
             prediction_map: Dict[str, float] = {}
             if rows:
-                frame = pd.DataFrame(rows).apply(pd.to_numeric, errors="coerce").fillna(0.0)
+                frame = pd.DataFrame(rows).apply(pd.to_numeric, errors="coerce")
+                frame = self._impute_prediction_features(frame, artifact=artifact, model_name=model_name)
                 predictions = model.predict(frame)
                 prediction_map = {code: float(score) for code, score in zip(predicted_codes, predictions)}
             prediction_maps[model_name] = prediction_map
@@ -440,6 +535,23 @@ class RegressionRerankService:
         model_weight = 1.0 - bounded_rule_weight
         target_names = [str(spec["artifact"].get("target") or "return_3d") for spec in artifacts]
         for item in enriched:
+            sample = sample_map.get(item["ts_code"], {}) if sample_map else {}
+            for sample_key in (
+                "price_position_20d",
+                "recent_runup_5d",
+                "turnover_spike_ratio",
+                "weak_market_flag",
+                "high_position_flag",
+                "high_position_acceleration_flag",
+                "weak_market_high_position_flag",
+                "market_return_1d",
+                "market_return_3d",
+                "market_up_ratio_1d",
+                "market_up_ratio_3d_avg",
+                "market_up_days_5d",
+            ):
+                if item.get(sample_key) is None and sample.get(sample_key) is not None:
+                    item[sample_key] = sample.get(sample_key)
             item["model_target"] = "+".join(target_names)
             item["model_score"] = ensemble_rank_score_map.get(item["ts_code"])
             item["model_score_norm"] = item["model_score"]
@@ -454,10 +566,18 @@ class RegressionRerankService:
             item["blend_score"] = round(float(blend_score), 6)
             item["score_mode"] = "model_rule_blend"
             item["rule_weight"] = bounded_rule_weight
+            item["model_signal_positive"] = item.get("model_score") is not None and float(item.get("model_score") or 0.0) >= 0.0
+            item["moneyflow_signal_score"] = self._compute_moneyflow_signal_score(item)
+            item["moneyflow_model_combo_bucket"] = self._build_moneyflow_model_combo_bucket(item)
+            soft_filter_penalty, soft_filter_reasons = self._compute_soft_filter_penalty_with_reasons(item)
+            item["soft_filter_penalty"] = soft_filter_penalty
+            item["soft_filter_reasons"] = soft_filter_reasons
+            item["soft_filter_score"] = round(float(item.get("blend_score") or 0.0) + soft_filter_penalty, 6)
 
         enriched.sort(
             key=lambda item: (
                 -float(item["blend_score"] or 0.0),
+                -float(item.get("soft_filter_score") or 0.0),
                 -float(item.get("model_score_norm") or 0.0),
                 -float(item.get("rule_score_norm") or 0.0),
                 item["ts_code"],
@@ -469,12 +589,6 @@ class RegressionRerankService:
             item["moneyflow_vetoed_for_top3"] = False
             item["model_score_vetoed_for_top3"] = False
             item["veto_reason_for_top3"] = None
-            item["model_signal_positive"] = item.get("model_score") is not None and float(item.get("model_score") or 0.0) >= 0.0
-            item["moneyflow_signal_score"] = self._compute_moneyflow_signal_score(item)
-            item["moneyflow_model_combo_bucket"] = self._build_moneyflow_model_combo_bucket(item)
-            soft_filter_penalty = self._compute_soft_filter_penalty(item)
-            item["soft_filter_penalty"] = soft_filter_penalty
-            item["soft_filter_score"] = round(float(item.get("blend_score") or 0.0) + soft_filter_penalty, 6)
         return enriched
 
     def _build_analysis_codes_with_moneyflow_veto(self, candidates: List[Dict[str, Any]], *, analysis_limit: int) -> List[str]:
@@ -543,6 +657,50 @@ class RegressionRerankService:
         )
         return selected[:analysis_limit]
 
+    def _load_precomputed_feature_samples(
+        self,
+        ts_codes: List[str],
+        *,
+        trade_date: date,
+    ) -> Dict[str, Dict[str, Any]]:
+        if not ts_codes:
+            return {}
+        try:
+            from sqlalchemy import text
+
+            trade_date_text = trade_date.isoformat()
+            with self.market_raw_data_repo._db.engine.connect() as conn:
+                placeholders = ", ".join(f":code_{index}" for index, _ in enumerate(ts_codes))
+                params = {"trade_date": trade_date_text}
+                params.update({f"code_{index}": code for index, code in enumerate(ts_codes)})
+                rows = conn.execute(
+                    text(
+                        "SELECT * FROM training_features "
+                        f"WHERE trade_date = :trade_date AND ts_code IN ({placeholders})"
+                    ),
+                    params,
+                ).mappings().all()
+            sample_map: Dict[str, Dict[str, Any]] = {}
+            for row in rows:
+                sample = dict(row)
+                code = str(sample.get("ts_code") or "").strip().upper()
+                if not code:
+                    continue
+                sample.pop("id", None)
+                sample.pop("created_at", None)
+                sample_map[code] = sample
+            if sample_map:
+                logger.info(
+                    "Loaded precomputed training_features for rerank: trade_date=%s rows=%s requested=%s",
+                    trade_date_text,
+                    len(sample_map),
+                    len(ts_codes),
+                )
+            return sample_map
+        except Exception:
+            logger.exception("Failed to load precomputed training_features, fallback to on-the-fly sample build")
+            return {}
+
     @staticmethod
     def _compute_moneyflow_signal_score(item: Dict[str, Any]) -> Optional[float]:
         rows = int(item.get("moneyflow_summary_rows") or 0)
@@ -587,6 +745,11 @@ class RegressionRerankService:
 
     @staticmethod
     def _compute_soft_filter_penalty(item: Dict[str, Any]) -> float:
+        penalty, _ = RegressionRerankService._compute_soft_filter_penalty_with_reasons(item)
+        return penalty
+
+    @staticmethod
+    def _compute_soft_filter_penalty_with_reasons(item: Dict[str, Any]) -> tuple[float, List[str]]:
         combo_bucket = RegressionRerankService._build_moneyflow_model_combo_bucket(item)
         adjustments = {
             "moneyflow_good__model_good": 0.04,
@@ -599,7 +762,9 @@ class RegressionRerankService:
             "moneyflow_unknown__model_weak": -0.12,
             "moneyflow_unknown__model_unknown": -0.06,
         }
-        return float(adjustments.get(combo_bucket, 0.0))
+        penalty = float(adjustments.get(combo_bucket, 0.0))
+        reasons = [combo_bucket]
+        return round(float(penalty), 6), reasons
 
     @staticmethod
     def _normalize_in_place(items: List[Dict[str, Any]], source_key: str, target_key: str) -> None:
@@ -620,6 +785,38 @@ class RegressionRerankService:
             else:
                 item[target_key] = round((float(raw_value) - min_value) / scale, 6)
 
+    @staticmethod
+    def _impute_prediction_features(frame: pd.DataFrame, *, artifact: Dict[str, Any], model_name: str) -> pd.DataFrame:
+        feature_medians = artifact.get("feature_medians") or {}
+        if not feature_medians:
+            logger.warning(
+                "Model artifact %s has no feature_medians; falling back to per-batch medians for prediction",
+                model_name,
+            )
+            imputed = frame.copy()
+            batch_medians = imputed.median(numeric_only=True)
+            imputed = imputed.fillna(batch_medians)
+            return imputed.fillna(0.0)
+
+        imputed = frame.copy()
+        missing_counts = imputed.isna().sum()
+        missing_features = {
+            column: int(count)
+            for column, count in missing_counts.items()
+            if int(count) > 0
+        }
+        if missing_features:
+            logger.info("Prediction feature missing values imputed by training medians: model=%s missing=%s", model_name, missing_features)
+        for column in imputed.columns:
+            if not imputed[column].isna().any():
+                continue
+            median_value = feature_medians.get(column)
+            if median_value is None:
+                logger.warning("Feature %s missing in model %s but no training median exists; using 0 only as last-resort fallback", column, model_name)
+                median_value = 0.0
+            imputed[column] = imputed[column].fillna(float(median_value))
+        return imputed
+
     def _load_default_artifacts(self, artifact_paths: List[tuple[str, Path, float]]) -> List[Dict[str, Any]]:
         artifacts: List[Dict[str, Any]] = []
         for model_name, path, weight in artifact_paths:
@@ -634,8 +831,14 @@ class RegressionRerankService:
         return artifacts
 
     def _resolve_default_artifact_paths(self) -> List[tuple[str, Path, float]]:
+        preferred = self._resolve_artifact_specs(self.PREFERRED_MODEL_SPECS)
+        if preferred:
+            return preferred
+        return self._resolve_artifact_specs(self.LEGACY_FALLBACK_MODEL_SPECS)
+
+    def _resolve_artifact_specs(self, specs: List[tuple[str, str, float]]) -> List[tuple[str, Path, float]]:
         resolved: List[tuple[str, Path, float]] = []
-        for model_name, filename, weight in self.DEFAULT_MODEL_SPECS:
+        for model_name, filename, weight in specs:
             candidate = Path(self.settings.history_dir_path) / "short_term_models" / filename
             if not candidate.exists():
                 return []

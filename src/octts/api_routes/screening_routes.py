@@ -9,6 +9,7 @@ from octts.api_legacy import _get_intelligent_screening_job_manager
 from octts.config import get_settings
 from octts.schemas.screener import ScreenCriteria, ScreenPreset, ScreenResult
 from octts.services.enhanced_screening_scheduler import EnhancedScreeningScheduler
+from octts.services.execution_confirmation_service import ExecutionConfirmationService
 from octts.services.intelligent_dashboard_payload import build_recommendation_dashboard_payload
 from octts.services.screening_store import ScreeningStore
 from octts.services.stock_screener import StockScreener
@@ -79,6 +80,22 @@ def register_screening_routes(app: FastAPI) -> None:
     @app.post("/screen/intelligent", status_code=202)
     async def run_intelligent_screening(request: Request) -> Dict[str, Any]:
         return await create_intelligent_screening_job(request)
+
+    @app.post("/screen/intelligent/candidates", status_code=202)
+    async def run_candidate_screening(request: Request) -> Dict[str, Any]:
+        """Run post-close candidate generation workflow."""
+        return await create_intelligent_screening_job(request)
+
+    @app.post("/screen/intelligent/execution-confirmation")
+    async def run_execution_confirmation(
+        source_trade_date: Optional[str] = None,
+        force: bool = Query(default=False),
+    ) -> Dict[str, Any]:
+        try:
+            service = ExecutionConfirmationService(get_settings())
+            return await service.run_pre_open_confirmation(source_trade_date=source_trade_date, force=force)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Execution confirmation failed: {exc}") from exc
 
     @app.post("/screen/intelligent/jobs", status_code=202)
     async def create_intelligent_screening_job(request: Request) -> Dict[str, Any]:

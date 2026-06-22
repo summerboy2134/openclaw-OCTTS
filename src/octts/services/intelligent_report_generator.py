@@ -524,13 +524,16 @@ class IntelligentReportGenerator:
         comparison = dict(payload.get("comparison") or {})
         comparison_candidates = authoritative_today_top3
         today_top3 = authoritative_today_top3
-        comparison.setdefault("basic_rank", self._rank_codes(comparison_candidates, "fundamental_score"))
-        comparison.setdefault("technical_rank", self._rank_codes(comparison_candidates, "technical_score"))
-        comparison.setdefault("risk_rank", self._rank_codes(comparison_candidates, "risk_score", reverse=False))
-        comparison.setdefault("trading_rank", self._rank_codes(comparison_candidates, "recommendation_score"))
-        comparison.setdefault("best_short_term", self._pick_code(today_top3))
-        comparison.setdefault("most_robust", self._pick_code(comparison_candidates, key="overall_score"))
-        comparison.setdefault("highest_risk", self._pick_code(comparison_candidates, key="risk_score", reverse=True))
+        comparison["basic_rank"] = self._rank_codes(comparison_candidates, "fundamental_score")
+        comparison["technical_rank"] = self._rank_codes(comparison_candidates, "technical_score")
+        comparison["trading_rank"] = self._rank_codes(comparison_candidates, "recommendation_score")
+        comparison["best_short_term"] = self._pick_code(today_top3, key="recommendation_score")
+        comparison["most_robust"] = self._pick_most_robust_code(comparison_candidates)
+        comparison["risk_rank"] = self._rank_risk_codes(comparison_candidates, avoid_code=comparison.get("most_robust"))
+        comparison["highest_risk"] = self._pick_highest_risk_code(
+            comparison_candidates,
+            avoid_code=comparison.get("most_robust"),
+        )
         comparison.setdefault(
             "cross_stock_synthesis_view",
             self._build_cross_stock_synthesis_view(screening_context.get("cross_stock_synthesis") or {}, today_top3),
@@ -1569,12 +1572,18 @@ class IntelligentReportGenerator:
         comparison = {
             "basic_rank": self._rank_codes(comparison_candidates, "fundamental_score"),
             "technical_rank": self._rank_codes(comparison_candidates, "technical_score"),
-            "risk_rank": self._rank_codes(comparison_candidates, "risk_score", reverse=False),
             "trading_rank": self._rank_codes(comparison_candidates, "recommendation_score"),
             "best_short_term": self._pick_code(today_top3) or (stock_pool[0] if stock_pool else ""),
-            "most_robust": self._pick_code(comparison_candidates, key="overall_score"),
-            "highest_risk": self._pick_code(comparison_candidates, key="risk_score", reverse=True),
+            "most_robust": self._pick_most_robust_code(comparison_candidates),
         }
+        comparison["risk_rank"] = self._rank_risk_codes(
+            comparison_candidates,
+            avoid_code=comparison.get("most_robust"),
+        )
+        comparison["highest_risk"] = self._pick_highest_risk_code(
+            comparison_candidates,
+            avoid_code=comparison.get("most_robust"),
+        )
         comparison = self._attach_comparison_names(comparison, comparison_candidates + today_top3)
         overall_action = {
             "headline": "结构化报告暂使用本地回退结果",
@@ -2008,6 +2017,71 @@ class IntelligentReportGenerator:
     def _pick_code(items: List[Dict[str, Any]], key: str = "recommendation_score", reverse: bool = True) -> str:
         ranked = IntelligentReportGenerator._rank_codes(items, key, reverse=reverse)
         return ranked[0] if ranked else ""
+
+    @staticmethod
+    def _risk_score_value(item: Dict[str, Any]) -> float:
+        return IntelligentReportGenerator._safe_float_value(
+            item.get("risk_score", item.get("distribution_risk_score")),
+            0.0,
+        )
+
+    @staticmethod
+    def _normalize_code(value: Any) -> str:
+        return str(value or "").strip().upper()
+
+    @staticmethod
+    def _rank_risk_codes(items: List[Dict[str, Any]], *, avoid_code: Any = "") -> List[str]:
+        avoid = IntelligentReportGenerator._normalize_code(avoid_code)
+        candidates = [item for item in items if item.get("ts_code")]
+        ranked = sorted(
+            candidates,
+            key=lambda item: (
+                -IntelligentReportGenerator._risk_score_value(item),
+                1 if avoid and IntelligentReportGenerator._normalize_code(item.get("ts_code")) == avoid else 0,
+                IntelligentReportGenerator._safe_float_value(item.get("overall_score"), 0.0),
+                IntelligentReportGenerator._safe_float_value(item.get("recommendation_score"), 0.0),
+                IntelligentReportGenerator._normalize_code(item.get("ts_code")),
+            ),
+        )
+        return [item.get("ts_code") for item in ranked]
+
+    @staticmethod
+    def _pick_highest_risk_code(items: List[Dict[str, Any]], *, avoid_code: Any = "") -> str:
+        avoid = IntelligentReportGenerator._normalize_code(avoid_code)
+        ranked_codes = IntelligentReportGenerator._rank_risk_codes(items, avoid_code=avoid)
+        if not ranked_codes:
+            return ""
+        top_code = IntelligentReportGenerator._normalize_code(ranked_codes[0])
+        if not avoid or top_code != avoid or len(ranked_codes) <= 1:
+            return ranked_codes[0]
+
+        item_by_code = {
+            IntelligentReportGenerator._normalize_code(item.get("ts_code")): item
+            for item in items
+            if item.get("ts_code")
+        }
+        top_risk = IntelligentReportGenerator._risk_score_value(item_by_code.get(top_code, {}))
+        for code in ranked_codes[1:]:
+            candidate_code = IntelligentReportGenerator._normalize_code(code)
+            candidate_risk = IntelligentReportGenerator._risk_score_value(item_by_code.get(candidate_code, {}))
+            if candidate_risk == top_risk:
+                return code
+        return ranked_codes[0]
+
+    @staticmethod
+    def _pick_most_robust_code(items: List[Dict[str, Any]]) -> str:
+        candidates = [item for item in items if item.get("ts_code")]
+        if not candidates:
+            return ""
+        ranked = sorted(
+            candidates,
+            key=lambda item: (
+                IntelligentReportGenerator._safe_float_value(item.get("risk_score", item.get("distribution_risk_score")), 0.0),
+                -IntelligentReportGenerator._safe_float_value(item.get("overall_score"), 0.0),
+                -IntelligentReportGenerator._safe_float_value(item.get("recommendation_score"), 0.0),
+            ),
+        )
+        return ranked[0].get("ts_code") or ""
 
     def _load_stock_name_cache(self) -> Dict[str, str]:
         if self._stock_name_cache is not None:

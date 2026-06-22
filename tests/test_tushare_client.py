@@ -8,6 +8,19 @@ from octts.config import Settings
 from octts.clients.tushare_client import TushareClient
 
 
+class EmptyRawDataRepo:
+    def __init__(self) -> None:
+        self.saved_daily: List[List[Dict[str, Any]]] = []
+
+    def get_daily_range(self, *, ts_code: str, start_date: str, end_date: str) -> List[Dict[str, Any]]:
+        del ts_code, start_date, end_date
+        return []
+
+    def save_daily(self, rows: List[Dict[str, Any]]) -> int:
+        self.saved_daily.append(rows)
+        return len(rows)
+
+
 class RecordingTushareClient(TushareClient):
     def __init__(self) -> None:
         self._settings = Settings(TUSHARE_TOKEN="token", OCTTS_MEMORY_BACKEND="file", OCTTS_MEMORY_FILE_PATH="memory.json")
@@ -68,6 +81,37 @@ def test_build_snapshot_aligns_related_data_to_resolved_trade_date(monkeypatch) 
     assert ("daily_summary", "20260316") in client.calls
     assert ("weekly_summary", "20260316") in client.calls
     assert ("moneyflow_summary", "20260316") in client.calls
+
+
+def test_fetch_close_auction_batch_uses_query_fallback_and_filters_codes() -> None:
+    class FakePro:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def query(self, endpoint: str, **kwargs):
+            assert endpoint == "stk_auction_c"
+            self.calls.append(kwargs)
+            return pd.DataFrame(
+                [
+                    {"ts_code": kwargs["ts_code"], "trade_date": "20260316", "price": 10.1, "amount": 1200},
+                ]
+            )
+
+    client = RecordingTushareClient()
+    fake_pro = FakePro()
+    client._pro = fake_pro
+
+    rows = client.fetch_close_auction_batch(
+        ts_codes=["000001.SZ", "000002.SZ"],
+        trade_date="20260316",
+    )
+
+    assert set(rows) == {"000001.SZ", "000002.SZ"}
+    assert rows["000001.SZ"]["price"] == 10.1
+    assert fake_pro.calls == [
+        {"trade_date": "20260316", "ts_code": "000001.SZ"},
+        {"trade_date": "20260316", "ts_code": "000002.SZ"},
+    ]
 
 
 def test_fetch_minute_summary_skips_non_current_trade_date(monkeypatch) -> None:
@@ -219,6 +263,7 @@ def test_call_pro_bar_returns_none_for_out_of_bounds_error(monkeypatch) -> None:
 def test_fetch_daily_batch_returns_empty_list_for_out_of_bounds_errors() -> None:
     client = object.__new__(TushareClient)
     client._settings = Settings(TUSHARE_TOKEN="token", OCTTS_MEMORY_BACKEND="file", OCTTS_MEMORY_FILE_PATH="memory.json")
+    client._raw_data_repo = EmptyRawDataRepo()
     calls: list[str] = []
 
     def fake_call_pro_bar(**kwargs):
@@ -237,6 +282,7 @@ def test_fetch_daily_batch_returns_empty_list_for_out_of_bounds_errors() -> None
         )
 
     client._call_pro_bar = fake_call_pro_bar
+    client._fetch_daily_batch_fallback = lambda **kwargs: None
 
     result = client.fetch_daily_batch(
         ts_codes=["000001.SZ", "600000.SH"],
@@ -257,6 +303,7 @@ def test_fetch_daily_batch_returns_empty_list_for_out_of_bounds_errors() -> None
 def test_fetch_daily_batch_logs_warning_when_all_symbols_return_empty(monkeypatch) -> None:
     client = object.__new__(TushareClient)
     client._settings = Settings(TUSHARE_TOKEN="token", OCTTS_MEMORY_BACKEND="file", OCTTS_MEMORY_FILE_PATH="memory.json")
+    client._raw_data_repo = EmptyRawDataRepo()
     warning_calls: list[tuple[str, object, object, object]] = []
 
     def fake_call_pro_bar(**kwargs):
@@ -264,6 +311,7 @@ def test_fetch_daily_batch_logs_warning_when_all_symbols_return_empty(monkeypatc
         return None
 
     client._call_pro_bar = fake_call_pro_bar
+    client._fetch_daily_batch_fallback = lambda **kwargs: None
     monkeypatch.setattr(
         "octts.clients.tushare_client.logger.warning",
         lambda message, symbols, start_date, end_date: warning_calls.append(
@@ -288,6 +336,73 @@ def test_fetch_daily_batch_logs_warning_when_all_symbols_return_empty(monkeypatc
             "20260301",
             "20260318",
         )
+    ]
+
+
+def test_fetch_daily_batch_uses_daily_fallback_when_pro_bar_is_empty() -> None:
+    client = object.__new__(TushareClient)
+    client._settings = Settings(TUSHARE_TOKEN="token", OCTTS_MEMORY_BACKEND="file", OCTTS_MEMORY_FILE_PATH="memory.json")
+    client._raw_data_repo = EmptyRawDataRepo()
+
+    class DailyFallback:
+        def daily(self, **kwargs):
+            assert kwargs == {
+                "ts_code": "000001.SZ",
+                "start_date": "20260301",
+                "end_date": "20260318",
+                "fields": "ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount",
+            }
+            return pd.DataFrame(
+                [
+                    {"ts_code": "000001.SZ", "trade_date": "20260317", "close": 10.1},
+                    {"ts_code": "000001.SZ", "trade_date": "20260318", "close": 10.2},
+                ]
+            )
+
+    client._pro = DailyFallback()
+    client._call_pro_bar = lambda **kwargs: None
+
+    result = client.fetch_daily_batch(
+        ts_codes=["000001.SZ"],
+        start_date="20260301",
+        end_date="20260318",
+    )
+
+    assert result == {
+        "000001.SZ": [
+            {"ts_code": "000001.SZ", "trade_date": "20260318", "close": 10.2},
+            {"ts_code": "000001.SZ", "trade_date": "20260317", "close": 10.1},
+        ],
+    }
+    assert client._raw_data_repo.saved_daily == [
+        [
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": "20260318",
+                "open": None,
+                "high": None,
+                "low": None,
+                "close": 10.2,
+                "pre_close": None,
+                "change": None,
+                "pct_chg": None,
+                "vol": None,
+                "amount": None,
+            },
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": "20260317",
+                "open": None,
+                "high": None,
+                "low": None,
+                "close": 10.1,
+                "pre_close": None,
+                "change": None,
+                "pct_chg": None,
+                "vol": None,
+                "amount": None,
+            },
+        ]
     ]
 
 

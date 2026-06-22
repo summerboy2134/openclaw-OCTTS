@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, List, Optional, Tuple
 
 from octts.config import get_settings
-from octts.services.enhanced_screening_scheduler import BACKFILL_TRAINING_CANDIDATE_LIMIT, TODAY_TOP_LIMIT, TOP_RECOMMENDATION_LIMIT
+from octts.services.enhanced_screening_scheduler import BACKFILL_TRAINING_CANDIDATE_LIMIT, MODEL_CANDIDATE_POOL_LIMIT, TODAY_TOP_LIMIT, TOP_RECOMMENDATION_LIMIT
 from octts.services.market_raw_data_repository import MarketRawDataRepository
 from octts.services.short_term_feature_engineering import ShortTermFeatureEngineer
 from octts.tools.common import configure_tool_logging, print_json
@@ -15,7 +17,12 @@ from octts.tools.common import configure_tool_logging, print_json
 HORIZONS = [1, 3, 5]
 
 
-COMPARISON_KEYS = ["current_flow_top3", "current_flow_top3_soft_score", "stage2_top3_without_moneyflow"]
+COMPARISON_KEYS = [
+    "current_flow_top3",
+    "current_flow_top3_soft_score",
+    "stage2_top3_without_moneyflow",
+    "stage3_final_top3",
+]
 SCORE_BINS: List[Tuple[float, float]] = [
     (0.0, 0.2),
     (0.2, 0.4),
@@ -28,6 +35,7 @@ SCORE_BINS: List[Tuple[float, float]] = [
 _SCREENING_RESULTS_CACHE: Dict[str, Dict[str, Any]] = {}
 _RERANK_RESULT_CACHE: Dict[str, Any] = {}
 _STAGE_PIPELINE_CACHE: Dict[str, Dict[str, Any]] = {}
+_MONEYFLOW_BACKFILL_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 def main() -> None:
@@ -41,6 +49,14 @@ def main() -> None:
     parser.add_argument("--batch-sleep-seconds", type=float, default=2.0)
     parser.add_argument("--force-refresh", action="store_true")
     parser.add_argument("--skip-moneyflow-backfill", action="store_true", help="Do not fetch candidate moneyflow during evaluation")
+    parser.add_argument("--fusion-model-weight", type=float, default=0.7, help="Stage2 fusion model score weight for a single run")
+    parser.add_argument("--fusion-overall-weight", type=float, default=0.3, help="Stage2 fusion structured score weight for a single run")
+    parser.add_argument("--fusion-risk-penalty-scale", type=float, default=1.0, help="Stage2 risk penalty multiplier for a single run")
+    parser.add_argument("--fusion-grid-search", action="store_true", help="Search Stage2 fusion parameters over the supplied grids")
+    parser.add_argument("--fusion-model-weights", default="0.5,0.6,0.7,0.8,0.9", help="Comma-separated model weights for grid search")
+    parser.add_argument("--fusion-overall-weights", default="", help="Comma-separated overall weights for grid search; empty means 1-model_weight")
+    parser.add_argument("--fusion-risk-penalty-scales", default="0.5,0.75,1.0,1.25,1.5", help="Comma-separated risk penalty multipliers for grid search")
+    parser.add_argument("--fusion-search-key", default="stage3_final_top3", choices=COMPARISON_KEYS, help="Comparison key used to select the best grid-search config")
     parser.add_argument("--output-file", help="Optional path to save full JSON payload")
     parser.add_argument("--compact", action="store_true", help="Print compact summary payload only")
     args = parser.parse_args()
@@ -51,6 +67,72 @@ def main() -> None:
     repo = MarketRawDataRepository(settings.database_url)
     trade_dates = _parse_trade_dates(args.trade_dates)
 
+    if args.fusion_grid_search:
+        payload = _run_parameter_search(
+            trade_dates=trade_dates,
+            engineer=engineer,
+            repo=repo,
+            candidate_limit=max(1, int(args.candidate_limit)),
+            exclude_bj=bool(args.exclude_bj),
+            rule_weight=float(args.rule_weight),
+            sleep_seconds=max(0.0, float(args.sleep_seconds)),
+            sleep_every=max(0, int(args.sleep_every)),
+            batch_sleep_seconds=max(0.0, float(args.batch_sleep_seconds)),
+            force_refresh=bool(args.force_refresh),
+            skip_moneyflow_backfill=bool(args.skip_moneyflow_backfill),
+            parameter_configs=_build_fusion_parameter_configs(args),
+            search_key=str(args.fusion_search_key),
+            output_file=args.output_file,
+            compact=bool(args.compact),
+            logger=logger,
+        )
+        logger.info("Evaluation grid search complete: %s", payload.get("parameter_search", {}).get("best"))
+        print_json(_build_compact_payload(payload) if args.compact else payload, output_file=args.output_file)
+        return
+
+    payload = _run_evaluation_for_config(
+        trade_dates=trade_dates,
+        engineer=engineer,
+        repo=repo,
+        candidate_limit=max(1, int(args.candidate_limit)),
+        exclude_bj=bool(args.exclude_bj),
+        rule_weight=float(args.rule_weight),
+        sleep_seconds=max(0.0, float(args.sleep_seconds)),
+        sleep_every=max(0, int(args.sleep_every)),
+        batch_sleep_seconds=max(0.0, float(args.batch_sleep_seconds)),
+        force_refresh=bool(args.force_refresh),
+        skip_moneyflow_backfill=bool(args.skip_moneyflow_backfill),
+        fusion_model_weight=float(args.fusion_model_weight),
+        fusion_overall_weight=float(args.fusion_overall_weight),
+        fusion_risk_penalty_scale=float(args.fusion_risk_penalty_scale),
+        output_file=args.output_file,
+        compact=bool(args.compact),
+        logger=logger,
+    )
+    logger.info("Evaluation complete: %s", payload["summary"])
+    print_json(_build_compact_payload(payload) if args.compact else payload, output_file=args.output_file)
+
+
+def _run_evaluation_for_config(
+    *,
+    trade_dates: List[date],
+    engineer: ShortTermFeatureEngineer,
+    repo: MarketRawDataRepository,
+    candidate_limit: int,
+    exclude_bj: bool,
+    rule_weight: float,
+    sleep_seconds: float,
+    sleep_every: int,
+    batch_sleep_seconds: float,
+    force_refresh: bool,
+    skip_moneyflow_backfill: bool,
+    fusion_model_weight: float,
+    fusion_overall_weight: float,
+    fusion_risk_penalty_scale: float,
+    logger,
+    output_file: Optional[str] = None,
+    compact: bool = False,
+) -> Dict[str, Any]:
     results = []
     total_days = len(trade_dates)
     for index, trade_day in enumerate(trade_dates, start=1):
@@ -61,14 +143,17 @@ def main() -> None:
                 trade_day=trade_day,
                 engineer=engineer,
                 repo=repo,
-                candidate_limit=max(1, int(args.candidate_limit)),
-                exclude_bj=bool(args.exclude_bj),
-                rule_weight=float(args.rule_weight),
-                sleep_seconds=max(0.0, float(args.sleep_seconds)),
-                sleep_every=max(0, int(args.sleep_every)),
-                batch_sleep_seconds=max(0.0, float(args.batch_sleep_seconds)),
-                force_refresh=bool(args.force_refresh),
-                skip_moneyflow_backfill=bool(args.skip_moneyflow_backfill),
+                candidate_limit=candidate_limit,
+                exclude_bj=exclude_bj,
+                rule_weight=rule_weight,
+                sleep_seconds=sleep_seconds,
+                sleep_every=sleep_every,
+                batch_sleep_seconds=batch_sleep_seconds,
+                force_refresh=force_refresh,
+                skip_moneyflow_backfill=skip_moneyflow_backfill,
+                fusion_model_weight=fusion_model_weight,
+                fusion_overall_weight=fusion_overall_weight,
+                fusion_risk_penalty_scale=fusion_risk_penalty_scale,
                 logger=logger,
             )
             result["elapsed_seconds"] = round(time.time() - day_started_at, 3)
@@ -91,19 +176,304 @@ def main() -> None:
                 "error": str(exc),
                 "elapsed_seconds": round(time.time() - day_started_at, 3),
             })
+        checkpoint_payload = _build_evaluation_payload(
+            results=results,
+            trade_dates=trade_dates,
+            fusion_model_weight=fusion_model_weight,
+            fusion_overall_weight=fusion_overall_weight,
+            fusion_risk_penalty_scale=fusion_risk_penalty_scale,
+            checkpoint={
+                "complete": len(results) == total_days,
+                "completed_days": len(results),
+                "total_days": total_days,
+                "latest_trade_date": trade_day.isoformat(),
+            },
+        )
+        _write_checkpoint(checkpoint_payload, output_file=output_file, compact=compact, logger=logger)
 
+    return _build_evaluation_payload(
+        results=results,
+        trade_dates=trade_dates,
+        fusion_model_weight=fusion_model_weight,
+        fusion_overall_weight=fusion_overall_weight,
+        fusion_risk_penalty_scale=fusion_risk_penalty_scale,
+        checkpoint={
+            "complete": True,
+            "completed_days": len(results),
+            "total_days": total_days,
+        },
+    )
+
+
+def _build_evaluation_payload(
+    *,
+    results: List[Dict[str, Any]],
+    trade_dates: List[date],
+    fusion_model_weight: float,
+    fusion_overall_weight: float,
+    fusion_risk_penalty_scale: float,
+    checkpoint: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     payload = {
         "evaluated": any(item.get("evaluated") for item in results),
         "trade_dates": [item.isoformat() for item in trade_dates],
+        "fusion_parameters": {
+            "model_weight": round(float(fusion_model_weight), 6),
+            "overall_weight": round(float(fusion_overall_weight), 6),
+            "risk_penalty_scale": round(float(fusion_risk_penalty_scale), 6),
+        },
         "summary": _build_summary(results),
         "results": results,
     }
-    compact_payload = _build_compact_payload(payload)
-    logger.info("Evaluation complete: %s", payload["summary"])
-    print_json(compact_payload if args.compact else payload, output_file=args.output_file)
+    if checkpoint is not None:
+        payload["checkpoint"] = checkpoint
+    return payload
 
 
-def _run_one_day(*, trade_day: date, engineer: ShortTermFeatureEngineer, repo: MarketRawDataRepository, candidate_limit: int, exclude_bj: bool, rule_weight: float, sleep_seconds: float, sleep_every: int, batch_sleep_seconds: float, force_refresh: bool, skip_moneyflow_backfill: bool, logger) -> Dict[str, Any]:
+def _run_parameter_search(
+    *,
+    trade_dates: List[date],
+    engineer: ShortTermFeatureEngineer,
+    repo: MarketRawDataRepository,
+    candidate_limit: int,
+    exclude_bj: bool,
+    rule_weight: float,
+    sleep_seconds: float,
+    sleep_every: int,
+    batch_sleep_seconds: float,
+    force_refresh: bool,
+    skip_moneyflow_backfill: bool,
+    parameter_configs: List[Dict[str, float]],
+    search_key: str,
+    logger,
+    output_file: Optional[str] = None,
+    compact: bool = False,
+) -> Dict[str, Any]:
+    search_results: List[Dict[str, Any]] = []
+    best_payload: Optional[Dict[str, Any]] = None
+    best_search_score: Optional[float] = None
+    for index, config in enumerate(parameter_configs, start=1):
+        logger.info(
+            "Fusion parameter search start: %s/%s, model_weight=%.4f, overall_weight=%.4f, risk_penalty_scale=%.4f",
+            index,
+            len(parameter_configs),
+            config["model_weight"],
+            config["overall_weight"],
+            config["risk_penalty_scale"],
+        )
+        payload = _run_evaluation_for_config(
+            trade_dates=trade_dates,
+            engineer=engineer,
+            repo=repo,
+            candidate_limit=candidate_limit,
+            exclude_bj=exclude_bj,
+            rule_weight=rule_weight,
+            sleep_seconds=sleep_seconds,
+            sleep_every=sleep_every,
+            batch_sleep_seconds=batch_sleep_seconds,
+            force_refresh=force_refresh,
+            skip_moneyflow_backfill=skip_moneyflow_backfill,
+            fusion_model_weight=config["model_weight"],
+            fusion_overall_weight=config["overall_weight"],
+            fusion_risk_penalty_scale=config["risk_penalty_scale"],
+            output_file=output_file,
+            compact=compact,
+            logger=logger,
+        )
+        score_payload = _score_parameter_summary(payload.get("summary") or {}, search_key)
+        row = {
+            "fusion_parameters": payload.get("fusion_parameters"),
+            "selection_score": score_payload.get("selection_score"),
+            "score_breakdown": score_payload,
+            "summary": payload.get("summary"),
+        }
+        search_results.append(row)
+        selection_score = score_payload.get("selection_score")
+        if selection_score is not None and (best_search_score is None or float(selection_score) > best_search_score):
+            best_search_score = float(selection_score)
+            best_payload = payload
+        partial_results = sorted(
+            search_results,
+            key=lambda item: (
+                item.get("selection_score") is None,
+                -(float(item.get("selection_score") or 0.0)),
+            ),
+        )
+        checkpoint_base = best_payload or payload
+        checkpoint_payload = {
+            **checkpoint_base,
+            "checkpoint": {
+                "complete": index == len(parameter_configs),
+                "completed_configs": index,
+                "total_configs": len(parameter_configs),
+                "latest_fusion_parameters": config,
+            },
+            "parameter_search": {
+                "search_key": search_key,
+                "config_count": len(parameter_configs),
+                "best": partial_results[0] if partial_results else None,
+                "results": partial_results,
+            },
+        }
+        _write_checkpoint(checkpoint_payload, output_file=output_file, compact=compact, logger=logger)
+
+    search_results.sort(
+        key=lambda item: (
+            item.get("selection_score") is None,
+            -(float(item.get("selection_score") or 0.0)),
+        )
+    )
+    if best_payload is None and search_results:
+        best_params = search_results[0].get("fusion_parameters") or parameter_configs[0]
+        best_payload = _run_evaluation_for_config(
+            trade_dates=trade_dates,
+            engineer=engineer,
+            repo=repo,
+            candidate_limit=candidate_limit,
+            exclude_bj=exclude_bj,
+            rule_weight=rule_weight,
+            sleep_seconds=sleep_seconds,
+            sleep_every=sleep_every,
+            batch_sleep_seconds=batch_sleep_seconds,
+            force_refresh=force_refresh,
+            skip_moneyflow_backfill=skip_moneyflow_backfill,
+            fusion_model_weight=float(best_params.get("model_weight", 0.7)),
+            fusion_overall_weight=float(best_params.get("overall_weight", 0.3)),
+            fusion_risk_penalty_scale=float(best_params.get("risk_penalty_scale", 1.0)),
+            output_file=output_file,
+            compact=compact,
+            logger=logger,
+        )
+    if best_payload is None:
+        best_payload = {
+            "evaluated": False,
+            "trade_dates": [item.isoformat() for item in trade_dates],
+            "summary": {"evaluated_days": 0, "failed_days": len(trade_dates)},
+            "results": [],
+        }
+    return {
+        **best_payload,
+        "checkpoint": {
+            "complete": True,
+            "completed_configs": len(parameter_configs),
+            "total_configs": len(parameter_configs),
+        },
+        "parameter_search": {
+            "search_key": search_key,
+            "config_count": len(parameter_configs),
+            "best": search_results[0] if search_results else None,
+            "results": search_results,
+        },
+    }
+
+
+def _score_parameter_summary(summary: Dict[str, Any], search_key: str) -> Dict[str, Any]:
+    comparisons = summary.get("comparisons") or {}
+    accuracy = summary.get("accuracy") or {}
+    returns = comparisons.get(search_key) or {}
+    acc = accuracy.get(search_key) or {}
+    ret_1d = _to_float(returns.get("1"))
+    ret_3d = _to_float(returns.get("3"))
+    ret_5d = _to_float(returns.get("5"))
+    win_3d = _to_float((acc.get("3") or {}).get(">0"))
+    if ret_3d is None:
+        selection_score = None
+    else:
+        selection_score = ret_3d
+        if ret_1d is not None:
+            selection_score += ret_1d * 0.35
+        if ret_5d is not None:
+            selection_score += ret_5d * 0.2
+        if win_3d is not None:
+            selection_score += win_3d * 0.02
+    return {
+        "selection_score": round(selection_score, 6) if selection_score is not None else None,
+        "return_1d": ret_1d,
+        "return_3d": ret_3d,
+        "return_5d": ret_5d,
+        "win_rate_3d": win_3d,
+    }
+
+
+def _build_fusion_parameter_configs(args: argparse.Namespace) -> List[Dict[str, float]]:
+    model_weights = _parse_float_list(args.fusion_model_weights, [0.7])
+    risk_scales = _parse_float_list(args.fusion_risk_penalty_scales, [1.0])
+    explicit_overall_weights = _parse_float_list(args.fusion_overall_weights, [])
+    configs: List[Dict[str, float]] = []
+    seen = set()
+    for model_weight in model_weights:
+        overall_weights = explicit_overall_weights or [max(0.0, 1.0 - float(model_weight))]
+        for overall_weight in overall_weights:
+            for risk_scale in risk_scales:
+                key = (
+                    round(float(model_weight), 6),
+                    round(float(overall_weight), 6),
+                    round(float(risk_scale), 6),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                configs.append(
+                    {
+                        "model_weight": key[0],
+                        "overall_weight": key[1],
+                        "risk_penalty_scale": key[2],
+                    }
+                )
+    return configs
+
+
+def _parse_float_list(raw: str, default: List[float]) -> List[float]:
+    values: List[float] = []
+    for item in str(raw or "").split(","):
+        text = item.strip()
+        if not text:
+            continue
+        values.append(float(text))
+    return values or list(default)
+
+
+def _write_checkpoint(
+    payload: Dict[str, Any],
+    *,
+    output_file: Optional[str],
+    compact: bool,
+    logger,
+) -> None:
+    if not output_file:
+        return
+    rendered_payload = _build_compact_payload(payload) if compact else payload
+    path = Path(output_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(rendered_payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    checkpoint = payload.get("checkpoint") or {}
+    logger.info(
+        "Evaluation checkpoint written: path=%s, complete=%s, completed_days=%s, completed_configs=%s",
+        path,
+        checkpoint.get("complete"),
+        checkpoint.get("completed_days"),
+        checkpoint.get("completed_configs"),
+    )
+
+
+def _run_one_day(
+    *,
+    trade_day: date,
+    engineer: ShortTermFeatureEngineer,
+    repo: MarketRawDataRepository,
+    candidate_limit: int,
+    exclude_bj: bool,
+    rule_weight: float,
+    sleep_seconds: float,
+    sleep_every: int,
+    batch_sleep_seconds: float,
+    force_refresh: bool,
+    skip_moneyflow_backfill: bool,
+    fusion_model_weight: float,
+    fusion_overall_weight: float,
+    fusion_risk_penalty_scale: float,
+    logger,
+) -> Dict[str, Any]:
     scheduler = engineer.scheduler
     trade_date_text = trade_day.strftime("%Y%m%d")
 
@@ -132,61 +502,111 @@ def _run_one_day(*, trade_day: date, engineer: ShortTermFeatureEngineer, repo: M
         snapshot_coverage.get("ge_60", 0),
     )
 
+    rerank_started_at = time.time()
+    rerank_cache_key = f"model_universe|{trade_date_text}|{candidate_limit}|{exclude_bj}"
+    cached_rerank_result = _RERANK_RESULT_CACHE.get(rerank_cache_key)
+    if cached_rerank_result is not None:
+        rerank_result = cached_rerank_result
+        logger.info(
+            "Trade date %s model universe rank cache hit: candidate_codes=%s, analysis_codes=%s, fallback_reason=%s, elapsed_seconds=%.3f",
+            trade_day.isoformat(),
+            len(rerank_result.candidate_codes or []),
+            len(rerank_result.analysis_codes or []),
+            rerank_result.fallback_reason,
+            time.time() - rerank_started_at,
+        )
+    else:
+        logger.info("Trade date %s model universe rank start", trade_day.isoformat())
+        rerank_result = scheduler.regression_rerank_service.rank_market_universe(
+            trade_date=trade_day,
+            candidate_limit=max(candidate_limit, BACKFILL_TRAINING_CANDIDATE_LIMIT, MODEL_CANDIDATE_POOL_LIMIT),
+            analysis_limit=TOP_RECOMMENDATION_LIMIT,
+            exclude_bj=exclude_bj,
+        )
+        _RERANK_RESULT_CACHE[rerank_cache_key] = rerank_result
+        logger.info(
+            "Trade date %s model universe rank complete: candidate_codes=%s, analysis_codes=%s, fallback_reason=%s, elapsed_seconds=%.3f",
+            trade_day.isoformat(),
+            len(rerank_result.candidate_codes or []),
+            len(rerank_result.analysis_codes or []),
+            rerank_result.fallback_reason,
+            time.time() - rerank_started_at,
+        )
+
     screening_started_at = time.time()
-    screening_cache_key = trade_date_text
+    screening_cache_key = f"model_top100|{rerank_cache_key}"
     cached_screening_results = _SCREENING_RESULTS_CACHE.get(screening_cache_key)
     if cached_screening_results is not None:
         screening_results = cached_screening_results
         logger.info(
-            "Trade date %s screening cache hit: strategies=%s, elapsed_seconds=%.3f",
+            "Trade date %s model screening cache hit: strategies=%s, elapsed_seconds=%.3f",
             trade_day.isoformat(),
             len(screening_results),
             time.time() - screening_started_at,
         )
     else:
-        logger.info("Trade date %s screening start", trade_day.isoformat())
-        screening_results = scheduler._run_screening_strategies_sync_for_backfill(trade_date_text, market_snapshot=market_snapshot)
+        screening_results = scheduler._build_model_candidate_screening_results(
+            trade_date=trade_day,
+            rerank_result=rerank_result,
+            market_snapshot=market_snapshot,
+        )
         _SCREENING_RESULTS_CACHE[screening_cache_key] = screening_results
         logger.info(
-            "Trade date %s screening complete: strategies=%s, elapsed_seconds=%.3f",
+            "Trade date %s model screening complete: strategies=%s, model_candidates=%s, elapsed_seconds=%.3f",
             trade_day.isoformat(),
             len(screening_results),
+            len(rerank_result.candidate_codes or []),
             time.time() - screening_started_at,
         )
 
     candidate_started_at = time.time()
-    candidate_codes = scheduler._get_top_stocks(screening_results, limit=max(candidate_limit, int(engineer.settings.screening_top_n or 20)))
+    candidate_codes = list(rerank_result.candidate_codes or [])
     eligible_candidate_codes = scheduler._filter_out_tracked_and_holding_codes(candidate_codes)
     logger.info(
-        "Trade date %s candidate pool prepared: raw=%s, eligible=%s, elapsed_seconds=%.3f",
+        "Trade date %s candidate pool prepared from model universe: raw=%s, eligible=%s, elapsed_seconds=%.3f",
         trade_day.isoformat(),
         len(candidate_codes),
         len(eligible_candidate_codes),
         time.time() - candidate_started_at,
     )
 
-    stage1_candidate_codes = eligible_candidate_codes[:candidate_limit]
-    if skip_moneyflow_backfill:
-        backfill = {
-            "candidate_codes": len(stage1_candidate_codes),
-            "hit_codes": 0,
-            "missing_codes": 0,
-            "missing_code_samples": [],
-            "fetched_rows": 0,
-            "inserted_rows": 0,
-            "force_refresh": force_refresh,
-            "skipped": True,
-        }
+    def backfill_stage2_moneyflow(stage2_codes: List[str]) -> Dict[str, Any]:
+        target_codes = list(dict.fromkeys(str(code).strip().upper() for code in stage2_codes if str(code).strip()))
+        if skip_moneyflow_backfill:
+            logger.info(
+                "Trade date %s stage2 moneyflow backfill skipped: candidate_codes=%s",
+                trade_day.isoformat(),
+                len(target_codes),
+            )
+            return {
+                "candidate_codes": len(target_codes),
+                "hit_codes": 0,
+                "missing_codes": 0,
+                "missing_code_samples": [],
+                "fetched_rows": 0,
+                "inserted_rows": 0,
+                "force_refresh": force_refresh,
+                "skipped": True,
+                "scope": "stage2_top50",
+            }
+        moneyflow_cache_key = f"{trade_date_text}|stage2_top50|{','.join(target_codes)}|force_refresh={int(force_refresh)}"
+        cached_backfill = _MONEYFLOW_BACKFILL_CACHE.get(moneyflow_cache_key)
+        if cached_backfill is not None:
+            logger.info(
+                "Trade date %s stage2 moneyflow backfill cache hit: candidate_codes=%s, hit_codes=%s",
+                trade_day.isoformat(),
+                cached_backfill.get("candidate_codes"),
+                cached_backfill.get("hit_codes"),
+            )
+            return cached_backfill
         logger.info(
-            "Trade date %s moneyflow backfill skipped: candidate_codes=%s",
+            "Trade date %s stage2 moneyflow backfill start: candidate_codes=%s",
             trade_day.isoformat(),
-            len(stage1_candidate_codes),
+            len(target_codes),
         )
-    else:
-        logger.info("Trade date %s moneyflow backfill start: candidate_codes=%s", trade_day.isoformat(), len(stage1_candidate_codes))
-        backfill = _backfill_moneyflow(
+        payload = _backfill_moneyflow(
             trade_day=trade_day,
-            ts_codes=stage1_candidate_codes,
+            ts_codes=target_codes,
             engineer=engineer,
             repo=repo,
             sleep_seconds=sleep_seconds,
@@ -195,49 +615,23 @@ def _run_one_day(*, trade_day: date, engineer: ShortTermFeatureEngineer, repo: M
             force_refresh=force_refresh,
             logger=logger,
         )
+        payload["scope"] = "stage2_top50"
+        _MONEYFLOW_BACKFILL_CACHE[moneyflow_cache_key] = payload
         logger.info(
-            "Trade date %s moneyflow backfill complete: hit_codes=%s, fetched_rows=%s, inserted_rows=%s",
+            "Trade date %s stage2 moneyflow backfill complete: candidate_codes=%s, hit_codes=%s, fetched_rows=%s, inserted_rows=%s",
             trade_day.isoformat(),
-            backfill.get("hit_codes"),
-            backfill.get("fetched_rows"),
-            backfill.get("inserted_rows"),
+            payload.get("candidate_codes"),
+            payload.get("hit_codes"),
+            payload.get("fetched_rows"),
+            payload.get("inserted_rows"),
         )
-
-    rerank_started_at = time.time()
-    rerank_cache_key = f"{trade_date_text}|{candidate_limit}|{exclude_bj}|{rule_weight:.6f}|skip_backfill={int(skip_moneyflow_backfill)}|force_refresh={int(force_refresh)}"
-    cached_rerank_result = _RERANK_RESULT_CACHE.get(rerank_cache_key)
-    if cached_rerank_result is not None:
-        rerank_result = cached_rerank_result
-        logger.info(
-            "Trade date %s rerank cache hit: candidate_codes=%s, analysis_codes=%s, fallback_reason=%s, elapsed_seconds=%.3f",
-            trade_day.isoformat(),
-            len(rerank_result.candidate_codes or []),
-            len(rerank_result.analysis_codes or []),
-            rerank_result.fallback_reason,
-            time.time() - rerank_started_at,
-        )
-    else:
-        logger.info("Trade date %s rerank start", trade_day.isoformat())
-        rerank_result = scheduler.regression_rerank_service.rank_candidates(
-            screening_results,
-            trade_date=trade_day,
-            coarse_limit=max(candidate_limit, BACKFILL_TRAINING_CANDIDATE_LIMIT),
-            analysis_limit=TOP_RECOMMENDATION_LIMIT,
-            exclude_bj=exclude_bj,
-            rule_weight=rule_weight,
-        )
-        _RERANK_RESULT_CACHE[rerank_cache_key] = rerank_result
-        logger.info(
-            "Trade date %s rerank complete: candidate_codes=%s, analysis_codes=%s, fallback_reason=%s, elapsed_seconds=%.3f",
-            trade_day.isoformat(),
-            len(rerank_result.candidate_codes or []),
-            len(rerank_result.analysis_codes or []),
-            rerank_result.fallback_reason,
-            time.time() - rerank_started_at,
-        )
+        return payload
 
     pipeline_started_at = time.time()
-    pipeline_cache_key = rerank_cache_key
+    pipeline_cache_key = (
+        f"{rerank_cache_key}|fusion="
+        f"{float(fusion_model_weight):.6f}:{float(fusion_overall_weight):.6f}:{float(fusion_risk_penalty_scale):.6f}"
+    )
     cached_stage_pipeline = _STAGE_PIPELINE_CACHE.get(pipeline_cache_key)
     if cached_stage_pipeline is not None:
         stage_pipeline = cached_stage_pipeline
@@ -257,6 +651,10 @@ def _run_one_day(*, trade_day: date, engineer: ShortTermFeatureEngineer, repo: M
             market_snapshot=market_snapshot,
             rerank_result=rerank_result,
             baseline_candidate_codes=eligible_candidate_codes,
+            fusion_model_weight=fusion_model_weight,
+            fusion_overall_weight=fusion_overall_weight,
+            fusion_risk_penalty_scale=fusion_risk_penalty_scale,
+            stage2_moneyflow_backfill_callback=backfill_stage2_moneyflow,
         )
         _STAGE_PIPELINE_CACHE[pipeline_cache_key] = stage_pipeline
         logger.info(
@@ -268,7 +666,23 @@ def _run_one_day(*, trade_day: date, engineer: ShortTermFeatureEngineer, repo: M
             time.time() - pipeline_started_at,
         )
 
+    backfill = stage_pipeline.get("stage2_moneyflow_backfill")
+    if backfill is None:
+        backfill = {
+            "candidate_codes": len(stage_pipeline.get("stage2_top20_codes") or []),
+            "hit_codes": 0,
+            "missing_codes": 0,
+            "missing_code_samples": [],
+            "fetched_rows": 0,
+            "inserted_rows": 0,
+            "force_refresh": force_refresh,
+            "skipped": True,
+            "scope": "stage2_top50",
+            "cache_hit": True,
+        }
+
     stage2_top3_codes = list((stage_pipeline.get("stage2_top20_codes") or [])[:TODAY_TOP_LIMIT])
+    stage3_top3_codes = list(stage_pipeline.get("stage3_top3_codes") or [])
     soft_score_top3_codes = _select_soft_score_top3_codes(
         rerank_result.metadata_by_code,
         limit=TODAY_TOP_LIMIT,
@@ -293,11 +707,19 @@ def _run_one_day(*, trade_day: date, engineer: ShortTermFeatureEngineer, repo: M
             names,
             rerank_payloads=rerank_result.metadata_by_code,
         ),
+        "stage3_final_top3": _pick_details(
+            stage3_top3_codes,
+            stage_pipeline.get("final_recommendations") or {},
+            names,
+            rerank_payloads=rerank_result.metadata_by_code,
+        ),
     }
     rerank_veto_summary = _build_rerank_veto_summary(
         rerank_result.metadata_by_code,
         names,
         analysis_limit=TODAY_TOP_LIMIT,
+        analysis_codes=rerank_result.analysis_codes,
+        backfill=backfill,
     )
     evaluate_started_at = time.time()
     perf = {key: _evaluate_group(repo, trade_day, value) for key, value in compare.items()}
@@ -316,6 +738,7 @@ def _run_one_day(*, trade_day: date, engineer: ShortTermFeatureEngineer, repo: M
             "stage1_candidate_count": len(stage_pipeline.get("stage1_candidate_codes") or []),
             "stage2_top20_count": len(stage_pipeline.get("stage2_top20_codes") or []),
             "stage2_top3_count": len(stage2_top3_codes),
+            "stage3_top3_count": len(stage3_top3_codes),
         },
         "snapshot_status": {
             "state": snapshot_state,
@@ -334,6 +757,12 @@ def _run_one_day(*, trade_day: date, engineer: ShortTermFeatureEngineer, repo: M
         },
         "moneyflow_backfill": backfill,
         "rerank_veto_summary": rerank_veto_summary,
+        "fusion_parameters": stage_pipeline.get("fusion_parameters") or {
+            "model_weight": round(float(fusion_model_weight), 6),
+            "overall_weight": round(float(fusion_overall_weight), 6),
+            "risk_penalty_scale": round(float(fusion_risk_penalty_scale), 6),
+        },
+        "stage3_top3_veto_diagnostics": stage_pipeline.get("stage3_top3_veto_diagnostics") or [],
         "top3_compare": compare,
         "top3_performance": perf,
     }
@@ -404,6 +833,11 @@ def _pick_details(codes: List[str], payloads: Dict[str, Dict[str, Any]], names: 
             "moneyflow_3d_value": _first_number(rerank_payload, payload, ["recent_3d_net_inflow", "moneyflow_3d_value"]),
             "recent_large_order_net_inflow": _first_number(rerank_payload, payload, ["recent_large_order_net_inflow"]),
             "recent_super_large_order_net_inflow": _first_number(rerank_payload, payload, ["recent_super_large_order_net_inflow"]),
+            "super_large_order_net_inflow_negative_days_3d": _first_number(
+                rerank_payload,
+                payload,
+                ["super_large_order_net_inflow_negative_days_3d"],
+            ),
             "moneyflow_summary_rows": rerank_payload.get("moneyflow_summary_rows"),
             "moneyflow_missing_for_top3": rerank_payload.get("moneyflow_missing_for_top3"),
             "moneyflow_signal_score": rerank_payload.get("moneyflow_signal_score"),
@@ -439,7 +873,14 @@ def _select_soft_score_top3_codes(metadata_by_code: Dict[str, Dict[str, Any]], *
     return selected
 
 
-def _build_rerank_veto_summary(metadata_by_code: Dict[str, Dict[str, Any]], names: Dict[str, str], *, analysis_limit: int) -> Dict[str, Any]:
+def _build_rerank_veto_summary(
+    metadata_by_code: Dict[str, Dict[str, Any]],
+    names: Dict[str, str],
+    *,
+    analysis_limit: int,
+    analysis_codes: Optional[List[str]] = None,
+    backfill: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     ordered_items = sorted(
         (metadata_by_code or {}).values(),
         key=lambda item: (
@@ -447,6 +888,10 @@ def _build_rerank_veto_summary(metadata_by_code: Dict[str, Dict[str, Any]], name
             str(item.get("ts_code") or ""),
         ),
     )
+    selected_code_set = {str(code).strip().upper() for code in (analysis_codes or []) if code}
+    backfill = backfill or {}
+    backfilled_count = int(backfill.get("hit_codes") or 0)
+    skipped_backfill = bool(backfill.get("skipped", False))
     counts = {
         "candidate_total": len(ordered_items),
         "selected_for_analysis": 0,
@@ -457,8 +902,9 @@ def _build_rerank_veto_summary(metadata_by_code: Dict[str, Dict[str, Any]], name
     }
     blocked_candidates: List[Dict[str, Any]] = []
     for item in ordered_items:
+        ts_code = str(item.get("ts_code") or "").strip().upper()
         veto_reason = item.get("veto_reason_for_top3")
-        if item.get("selected_for_analysis"):
+        if item.get("selected_for_analysis") or ts_code in selected_code_set:
             counts["selected_for_analysis"] += 1
         elif veto_reason == "moneyflow":
             counts["moneyflow"] += 1
@@ -466,7 +912,7 @@ def _build_rerank_veto_summary(metadata_by_code: Dict[str, Dict[str, Any]], name
             counts["model_score"] += 1
         elif veto_reason:
             counts["other"] += 1
-        elif item.get("moneyflow_missing_for_top3"):
+        elif item.get("moneyflow_missing_for_top3") and (skipped_backfill or backfilled_count <= 0):
             counts["moneyflow_missing"] += 1
         if veto_reason:
             blocked_candidates.append(
@@ -489,8 +935,12 @@ def _build_rerank_veto_summary(metadata_by_code: Dict[str, Dict[str, Any]], name
                     "veto_reason_for_top3": veto_reason,
                 }
             )
+    if not skipped_backfill and backfilled_count > 0:
+        counts["moneyflow_missing"] = max(0, counts["candidate_total"] - backfilled_count)
     return {
         "analysis_limit": analysis_limit,
+        "backfill_hit_codes": backfilled_count,
+        "backfill_skipped": skipped_backfill,
         "counts": counts,
         "blocked_candidates": blocked_candidates,
     }
@@ -549,18 +999,17 @@ def _forward_return(repo: MarketRawDataRepository, ts_code: Optional[str], trade
     dates = repo.list_trading_dates(start_date=start, end_date=(trade_day + timedelta(days=max(20, horizon * 4))).strftime("%Y%m%d"))
     if len(dates) <= horizon:
         return None
-    entry = repo.get_daily(ts_code=ts_code, trade_date=start)
-    exit_row = repo.get_daily(ts_code=ts_code, trade_date=dates[horizon])
-    if not entry or not exit_row:
-        return None
-    try:
-        entry_close = float(entry.get("close") or 0.0)
-        exit_close = float(exit_row.get("close") or 0.0)
-    except (TypeError, ValueError):
-        return None
-    if entry_close <= 0:
-        return None
-    return round(exit_close / entry_close - 1.0, 6)
+    compounded = 1.0
+    for trade_date_text in dates[1:horizon + 1]:
+        row = repo.get_daily(ts_code=ts_code, trade_date=trade_date_text)
+        if not row:
+            return None
+        try:
+            pct_chg = float(row.get("pct_chg"))
+        except (TypeError, ValueError):
+            return None
+        compounded *= 1.0 + pct_chg / 100.0
+    return round(compounded - 1.0, 6)
 
 
 def _build_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -623,6 +1072,10 @@ def _build_compact_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
                     "score": pick.get("score"),
                     "blend_score": pick.get("blend_score"),
                     "model_score_norm": pick.get("model_score_norm"),
+                    "overall_score_norm": (pick.get("selection_reason_components") or {}).get("overall_score_norm"),
+                    "fusion_score": (pick.get("selection_reason_components") or {}).get("fusion_score"),
+                    "risk_adjusted_fusion_score": (pick.get("selection_reason_components") or {}).get("risk_adjusted_fusion_score"),
+                    "stage1_fusion_risk_penalty": (pick.get("selection_reason_components") or {}).get("stage1_fusion_risk_penalty"),
                     "rule_score_norm": pick.get("rule_score_norm"),
                     "stable_score": pick.get("stable_score"),
                 }
@@ -641,19 +1094,32 @@ def _build_compact_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             "snapshot_status": item.get("snapshot_status"),
             "cache_hits": item.get("cache_hits"),
             "moneyflow_backfill": item.get("moneyflow_backfill"),
+            "fusion_parameters": item.get("fusion_parameters"),
             "rerank_veto_summary": {
                 "counts": (item.get("rerank_veto_summary") or {}).get("counts"),
+                "backfill_hit_codes": (item.get("rerank_veto_summary") or {}).get("backfill_hit_codes"),
+                "backfill_skipped": (item.get("rerank_veto_summary") or {}).get("backfill_skipped"),
                 "blocked_candidates": ((item.get("rerank_veto_summary") or {}).get("blocked_candidates") or [])[:10],
             },
             "top3_compare": compact_compare,
             "performance_summary": compact_perf,
         })
-    return {
+    compact_payload = {
         "evaluated": payload.get("evaluated"),
         "trade_dates": payload.get("trade_dates"),
+        "fusion_parameters": payload.get("fusion_parameters"),
         "summary": payload.get("summary"),
         "results": compact_results,
     }
+    if payload.get("parameter_search"):
+        search = payload.get("parameter_search") or {}
+        compact_payload["parameter_search"] = {
+            "search_key": search.get("search_key"),
+            "config_count": search.get("config_count"),
+            "best": search.get("best"),
+            "top_results": (search.get("results") or [])[:10],
+        }
+    return compact_payload
 
 
 def _build_draggers(per_stock: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:

@@ -89,10 +89,40 @@ class Settings(BaseSettings):
     # 选股相关配置
     screening_enabled: bool = Field(default=False, alias="OCTTS_SCREENING_ENABLED")
     screening_time: str = Field(default="15:35", alias="OCTTS_SCREENING_TIME")
+    screening_candidate_time: str = Field(default="15:35", alias="OCTTS_SCREENING_CANDIDATE_TIME")
+    screening_execution_confirmation_enabled: bool = Field(
+        default=True,
+        alias="OCTTS_SCREENING_EXECUTION_CONFIRMATION_ENABLED",
+    )
+    screening_execution_confirmation_time: str = Field(
+        default="09:15",
+        alias="OCTTS_SCREENING_EXECUTION_CONFIRMATION_TIME",
+    )
+    screening_execution_confirmation_window_start: str = Field(
+        default="09:10",
+        alias="OCTTS_SCREENING_EXECUTION_CONFIRMATION_WINDOW_START",
+    )
+    screening_execution_confirmation_window_end: str = Field(
+        default="09:28",
+        alias="OCTTS_SCREENING_EXECUTION_CONFIRMATION_WINDOW_END",
+    )
+    screening_execution_confirmation_notify: bool = Field(
+        default=True,
+        alias="OCTTS_SCREENING_EXECUTION_CONFIRMATION_NOTIFY",
+    )
+    screening_execution_confirmation_allow_non_window: bool = Field(
+        default=False,
+        alias="OCTTS_SCREENING_EXECUTION_CONFIRMATION_ALLOW_NON_WINDOW",
+    )
     screening_strategies_raw: str = Field(default="", alias="OCTTS_SCREENING_STRATEGIES")
     screening_notify: bool = Field(default=True, alias="OCTTS_SCREENING_NOTIFY")
     screening_top_n: int = Field(default=20, alias="OCTTS_SCREENING_TOP_N")
     screening_llm_enabled: bool = Field(default=True, alias="OCTTS_SCREENING_LLM_ENABLED")
+    intelligent_screening_overwrite_same_trade_date: bool = Field(
+        default=False,
+        alias="OCTTS_INTELLIGENT_SCREENING_OVERWRITE_SAME_TRADE_DATE",
+        description="是否允许智能选股同一交易日重跑时覆盖推荐池和推荐批次结果",
+    )
     screening_history_throttle_every: int = Field(default=4, alias="OCTTS_SCREENING_HISTORY_THROTTLE_EVERY")
     screening_history_throttle_sleep_seconds: float = Field(default=1.5, alias="OCTTS_SCREENING_HISTORY_THROTTLE_SLEEP_SECONDS")
 

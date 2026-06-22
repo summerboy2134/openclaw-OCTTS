@@ -198,10 +198,27 @@ def _normalize_intelligent_item(item: Any) -> Any:
     return normalized
 
 
+def _is_st_excluded_intelligent_item(item: Dict[str, Any]) -> bool:
+    selection_stage = str((item or {}).get("selection_stage") or "").lower()
+    components = (item or {}).get("selection_reason_components") or {}
+    if not isinstance(components, dict):
+        components = {}
+    name = str((item or {}).get("name") or "").strip().upper().replace(" ", "")
+    return (
+        bool(components.get("top3_st_excluded", False))
+        or "st_veto" in selection_stage
+        or "st_refill_excluded" in selection_stage
+        or bool(name and (name.startswith("ST") or name.startswith("*ST") or "退" in name[:3]))
+    )
+
+
 def _normalize_intelligent_item_list(items: Any) -> List[Dict[str, Any]]:
     if not isinstance(items, list):
         return []
-    return [item for item in (_normalize_intelligent_item(entry) for entry in items) if isinstance(item, dict)]
+    return [
+        item for item in (_normalize_intelligent_item(entry) for entry in items)
+        if isinstance(item, dict) and not _is_st_excluded_intelligent_item(item)
+    ]
 
 
 def _normalize_intelligent_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1378,6 +1395,7 @@ def _build_intelligent_overview_payload(payload: Dict[str, Any]) -> Dict[str, An
             "selection_stage": item.get("selection_stage"),
             "selection_reason_components": item.get("selection_reason_components") or {},
             "fusion_70_30": item.get("fusion_70_30"),
+            "final_selection_score": item.get("final_selection_score"),
             "stage3_final_score": item.get("stage3_final_score"),
         }
 
@@ -1412,12 +1430,14 @@ def _build_intelligent_overview_payload(payload: Dict[str, Any]) -> Dict[str, An
         structured_rank = _stage_rank_value(item, "structured_rank_position")
         return (
             0 if is_top3 else 1,
+            _stage_rank_value(item, "recommend_rank"),
+            _stage_rank_value(item, "frontlist_rank"),
             stage3_rank,
             stage2_rank,
-            rerank_rank,
             structured_rank,
+            -_score_value(item, "final_selection_score", "stage3_final_score", "structured_rank_score"),
+            rerank_rank,
             -_score_value(item, "fusion_70_30"),
-            -_score_value(item, "stage3_final_score", "score"),
             -_score_value(item, "recommendation_score"),
             str(item.get("ts_code") or ""),
         )

@@ -801,15 +801,12 @@ def _forward_return(
         if len(trading_dates) <= horizon:
             return {"return": None, "fillable": None}
         entry_trade_date = trading_dates[1]
-        target_trade_date = trading_dates[horizon]
     else:
         if len(trading_dates) <= horizon:
             return {"return": None, "fillable": None}
         entry_trade_date = trading_dates[0]
-        target_trade_date = trading_dates[horizon]
     entry = repo.get_daily(ts_code=ts_code, trade_date=entry_trade_date)
-    target = repo.get_daily(ts_code=ts_code, trade_date=target_trade_date)
-    if not entry or not target:
+    if not entry:
         return {"return": None, "fillable": None}
     if entry_mode == "next_open":
         fillable = not _looks_unfillable_limit_up(
@@ -821,14 +818,29 @@ def _forward_return(
         if require_fillable_entry and not fillable:
             return {"return": None, "fillable": False}
         entry_price = entry.get("open")
+        entry_close = entry.get("close")
+        if entry_price in (None, 0) or entry_close is None:
+            return {"return": None, "fillable": fillable}
+        compounded = float(entry_close) / float(entry_price)
+        pct_dates = trading_dates[2:horizon + 1]
     else:
         fillable = None
         entry_price = entry.get("close")
-    target_close = target.get("close")
-    if entry_price in (None, 0) or target_close is None:
-        return {"return": None, "fillable": fillable}
+        if entry_price in (None, 0):
+            return {"return": None, "fillable": fillable}
+        compounded = 1.0
+        pct_dates = trading_dates[1:horizon + 1]
+    for trade_date_text in pct_dates:
+        row = repo.get_daily(ts_code=ts_code, trade_date=trade_date_text)
+        if not row:
+            return {"return": None, "fillable": fillable}
+        try:
+            pct_chg = float(row.get("pct_chg"))
+        except (TypeError, ValueError):
+            return {"return": None, "fillable": fillable}
+        compounded *= 1.0 + pct_chg / 100.0
     return {
-        "return": round((float(target_close) - float(entry_price)) / float(entry_price), 6),
+        "return": round(compounded - 1.0, 6),
         "fillable": fillable,
     }
 

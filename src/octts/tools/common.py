@@ -26,6 +26,15 @@ def configure_tool_logging(settings: Settings, tool_name: str) -> logging.Logger
         stream_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
         logger.addHandler(stream_handler)
+
+        # Also attach the same handlers to the package logger so lower-level modules
+        # like octts.clients.tushare_client can surface their INFO logs during tools.
+        package_logger = logging.getLogger("octts")
+        package_logger.setLevel(logging.INFO)
+        package_logger.propagate = False
+        if not package_logger.handlers:
+            package_logger.addHandler(file_handler)
+            package_logger.addHandler(stream_handler)
     return logger
 
 

@@ -125,16 +125,47 @@ def build_rows(picks, bars, tds, sell_offsets, require_fillable):
         fillable = None if not eb else not _looks_unfillable_limit_up(entry_bar=eb, ts_code=c, name=p.get("name"), market=p.get("market"))
         if require_fillable and fillable is False:
             continue
-        rets = {str(h): ret(entry, _safe_float(((bars.get(c) or {}).get(tds[h]) or {}).get("close"))) for h in HORIZONS}
+        rets = {str(h): ret_from_open(c, bars, tds, 1, h, entry) for h in HORIZONS}
         target_closes = {str(h): _safe_float(((bars.get(c) or {}).get(tds[h]) or {}).get("close")) for h in HORIZONS}
         sells = {str(o): {"date": tds[o], "open": _safe_float(((bars.get(c) or {}).get(tds[o]) or {}).get("open"))} for o in sell_offsets}
-        sell_returns = {str(o): ret(entry, sells[str(o)]["open"]) for o in sell_offsets}
-        refill_returns = {str(o): {str(h): ret(sells[str(o)]["open"], target_closes[str(h)]) for h in HORIZONS} for o in sell_offsets}
+        sell_returns = {str(o): ret_from_open(c, bars, tds, 1, o, entry, exit_at="open") for o in sell_offsets}
+        refill_returns = {str(o): {str(h): ret_from_open(c, bars, tds, o, h, sells[str(o)]["open"]) for h in HORIZONS} for o in sell_offsets}
         rows.append({**p, "ts_code": c, "entry_date": tds[1], "entry_open": entry, "fillable": fillable, "returns": rets, "target_close_by_horizon": target_closes, "sell_open_by_offset": sells, "sell_return_by_offset": sell_returns, "refill_return_by_offset": refill_returns})
     return rows
 
 
 def ret(a, b): return None if a in (None, 0.0) or b is None else round((float(b) - float(a)) / float(a), 6)
+def ret_from_open(code, bars, tds, entry_idx, exit_idx, entry_open, exit_at="close"):
+    if entry_open in (None, 0.0) or exit_idx < entry_idx:
+        return None
+    code_bars = bars.get(code) or {}
+    entry_bar = code_bars.get(tds[entry_idx]) or {}
+    entry_close = _safe_float(entry_bar.get("close"))
+    if entry_close is None:
+        return None
+    value = entry_close / float(entry_open)
+    for idx in range(entry_idx + 1, exit_idx):
+        row = code_bars.get(tds[idx]) or {}
+        pct = _safe_float(row.get("pct_chg"))
+        if pct is None:
+            return None
+        value *= 1.0 + pct / 100.0
+    exit_bar = code_bars.get(tds[exit_idx]) or {}
+    if exit_at == "open":
+        pre_close = _safe_float(exit_bar.get("pre_close"))
+        exit_open = _safe_float(exit_bar.get("open"))
+        if pre_close in (None, 0.0) or exit_open is None:
+            return None
+        if exit_idx == entry_idx:
+            return ret(entry_open, exit_open)
+        value *= exit_open / pre_close
+    else:
+        if exit_idx > entry_idx:
+            pct = _safe_float(exit_bar.get("pct_chg"))
+            if pct is None:
+                return None
+            value *= 1.0 + pct / 100.0
+    return round(value - 1.0, 6)
 def avg(xs): return round(mean(xs), 6) if xs else None
 def metric(xs):
     vals = [x for x in xs if x is not None]; return {"position_count": len(vals), "portfolio_return": avg(vals), "positive_rate": None if not vals else round(sum(1 for x in vals if x > 0) / len(vals), 4)}

@@ -981,10 +981,6 @@ def render_intelligent_screening_dashboard(
         continuation_sources = [
             item for item in list((_lookup(report_context, "yesterday_top3_review", []) or [])) if isinstance(item, dict)
         ]
-    if not continuation_sources:
-        continuation_sources = recommendation_pool.get("yesterday_continuations") or [
-            item for item in frontlist if item.get("source_tag") == "昨日延续"
-        ]
     continuations = _merge_card_items(continuation_sources, report_blocks.get("yesterday_reviews") or [])
 
     total_stocks = screening_results.get("total_stocks")

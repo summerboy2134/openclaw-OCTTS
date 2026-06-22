@@ -22,6 +22,7 @@ from octts.services.screening_store import ScreeningStore
 from octts.services.stock_screener import StockScreener
 from octts.prompts.report_prompt import build_today_screening_report_prompt, build_yesterday_review_report_prompt
 from octts.services.intelligent_report_generator import IntelligentReport, IntelligentReportGenerator
+from octts.services.regression_rerank_service import RegressionRerankService
 
 
 def _build_daily_rows(
@@ -641,27 +642,468 @@ def test_model_top3_selection_only_vetoes_extreme_risk(tmp_path) -> None:
         news_aggregator=Mock(),
         report_generator=Mock(),
     )
+    scheduler._stock_name_cache = {}
     recommendations = {
         "000001.SZ": {"weighted_score": 50, "candidate_risk_blocked": True},
         "000002.SZ": {"weighted_score": 10, "distribution_risk_score": 2.9},
         "000003.SZ": {"weighted_score": 5, "relay_candidate_veto": True},
         "000004.SZ": {"weighted_score": 1, "distribution_risk_score": 0.0},
         "000005.SZ": {"weighted_score": 99, "distribution_risk_score": 3.49},
+        "000006.SZ": {"weighted_score": 98, "distribution_risk_score": 1.2},
+        "000007.SZ": {"weighted_score": 97, "distribution_risk_score": 0.8},
     }
 
     selected = scheduler._select_model_top3_with_extreme_risk_veto(
-        model_candidate_codes=["000001.SZ", "000002.SZ", "000003.SZ", "000004.SZ", "000005.SZ"],
+        model_candidate_codes=["000001.SZ", "000002.SZ", "000003.SZ", "000004.SZ", "000005.SZ", "000006.SZ", "000007.SZ"],
+        recommendations=recommendations,
+        stock_name_map={code: f"测试票{index}" for index, code in enumerate(recommendations, start=1)},
+    )
+
+    assert selected == ["000004.SZ", "000006.SZ", "000007.SZ"]
+    assert recommendations["000001.SZ"]["selection_stage"] == "model_top100_extreme_risk_veto"
+    assert recommendations["000001.SZ"]["top3_extreme_risk_reason"] == "candidate_risk_blocked"
+    assert recommendations["000002.SZ"]["top3_extreme_risk_reason"] == "distribution_risk_score_block"
+    assert recommendations["000005.SZ"]["top3_extreme_risk_reason"] == "distribution_risk_score_block"
+    assert recommendations["000004.SZ"]["selection_stage"] == "stage3_final_top3"
+
+
+def test_near_limit_up_stock_is_vetoed_from_top3() -> None:
+    reason = EnhancedScreeningScheduler._get_top3_extreme_risk_reason(
+        {"pct_change": 9.2, "distribution_risk_score": 0.0}
+    )
+
+    assert reason == "near_limit_up_pct_change"
+
+
+def test_recent_runup_uses_partial_rows_when_history_sparse(tmp_path) -> None:
+    settings = Settings(
+        OCTTS_HISTORY_DIR_PATH=str(tmp_path / "history"),
+        OCTTS_MEMORY_BACKEND="file",
+        OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+    )
+    scheduler = EnhancedScreeningScheduler(
+        settings=settings,
+        screener=Mock(),
+        store=Mock(),
+        analyzer=Mock(),
+        news_aggregator=Mock(),
+        report_generator=Mock(),
+    )
+
+    runup = scheduler._build_recent_runup_5d([
+        {"trade_date": "20260401", "pct_chg": 2.0},
+        {"trade_date": "20260402", "pct_chg": 3.0},
+        {"trade_date": "20260403", "pct_chg": 4.0},
+    ])
+
+    assert runup == 9.0
+
+
+def test_distribution_risk_near_limit_up_exceeds_block_threshold(tmp_path) -> None:
+    settings = Settings(
+        OCTTS_HISTORY_DIR_PATH=str(tmp_path / "history"),
+        OCTTS_MEMORY_BACKEND="file",
+        OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+    )
+    scheduler = EnhancedScreeningScheduler(
+        settings=settings,
+        screener=Mock(),
+        store=Mock(),
+        analyzer=Mock(),
+        news_aggregator=Mock(),
+        report_generator=Mock(),
+    )
+    scheduler._build_stock_moneyflow_summary = Mock(return_value={"recent_3d_net_inflow": -500})
+    stock = StockScreenItem(
+        ts_code="000001.SZ",
+        name="测试股",
+        close=11.0,
+        pct_change=9.2,
+        volume_ratio=2.6,
+        turnover_rate=15.0,
+        price_position_20d=0.91,
+    )
+    daily_rows = [
+        {"trade_date": "20260407", "open": 10.1, "high": 11.0, "low": 10.0, "close": 11.0, "pct_chg": 9.2, "turnover_rate": 15.0},
+        {"trade_date": "20260406", "close": 10.1, "pct_chg": 2.0, "turnover_rate": 7.0},
+        {"trade_date": "20260403", "close": 9.9, "pct_chg": 1.5, "turnover_rate": 7.1},
+        {"trade_date": "20260402", "close": 9.75, "pct_chg": 1.2, "turnover_rate": 6.8},
+        {"trade_date": "20260401", "close": 9.63, "pct_chg": 1.1, "turnover_rate": 6.9},
+    ]
+
+    risk = scheduler._evaluate_distribution_risk(stock, daily_rows=daily_rows)
+
+    assert "当日涨幅接近涨停" in risk["distribution_risk_flags"]
+    assert risk["distribution_risk_score"] >= 2.8
+    assert risk["candidate_risk_blocked"] is True
+
+
+def test_theme_support_absent_fires_without_turnover_exemption(tmp_path) -> None:
+    settings = Settings(
+        OCTTS_HISTORY_DIR_PATH=str(tmp_path / "history"),
+        OCTTS_MEMORY_BACKEND="file",
+        OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+    )
+    scheduler = EnhancedScreeningScheduler(
+        settings=settings,
+        screener=Mock(),
+        store=Mock(),
+        analyzer=Mock(),
+        news_aggregator=Mock(),
+        report_generator=Mock(),
+    )
+    scheduler._build_stock_moneyflow_summary = Mock(return_value={"recent_3d_net_inflow": 1000})
+    stock = StockScreenItem(
+        ts_code="000002.SZ",
+        name="高位股",
+        close=11.0,
+        pct_change=2.0,
+        volume_ratio=1.8,
+        turnover_rate=18.0,
+        price_position_20d=0.90,
+    )
+    daily_rows = [
+        {"trade_date": "20260407", "open": 10.8, "high": 11.1, "low": 10.7, "close": 11.0, "pct_chg": 2.0, "turnover_rate": 18.0},
+        {"trade_date": "20260406", "close": 10.8, "pct_chg": 3.0, "turnover_rate": 7.0},
+        {"trade_date": "20260403", "close": 10.5, "pct_chg": 2.5, "turnover_rate": 7.1},
+        {"trade_date": "20260402", "close": 10.2, "pct_chg": 2.0, "turnover_rate": 6.8},
+        {"trade_date": "20260401", "close": 10.0, "pct_chg": 1.0, "turnover_rate": 6.9},
+    ]
+
+    risk = scheduler._evaluate_distribution_risk(stock, daily_rows=daily_rows)
+
+    assert risk["turnover_spike_ratio"] >= 2.1
+    assert risk["theme_support_absent_flag"] is True
+
+
+def test_rule_rank_penalizes_near_limit_up_candidate(tmp_path) -> None:
+    settings = Settings(
+        OCTTS_HISTORY_DIR_PATH=str(tmp_path / "history"),
+        OCTTS_MEMORY_BACKEND="file",
+        OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+    )
+    service = RegressionRerankService(settings)
+    service.market_raw_data_repo.get_moneyflow_summaries_by_trade_date = Mock(return_value={})
+    result = ScreenResult(
+        screen_id="rule-rank",
+        criteria=ScreenCriteria(limit=10),
+        stocks=[
+            StockScreenItem(
+                ts_code="000001.SZ",
+                name="近涨停",
+                close=11.0,
+                pct_change=9.3,
+                volume_ratio=2.0,
+                turnover_rate=8.0,
+                recommendation_score=80,
+                technical_score=80,
+            ),
+            StockScreenItem(
+                ts_code="000002.SZ",
+                name="温和上涨",
+                close=10.3,
+                pct_change=3.0,
+                volume_ratio=2.0,
+                turnover_rate=8.0,
+                recommendation_score=80,
+                technical_score=80,
+            ),
+        ],
+        total_count=2,
+        execution_time=0.1,
+    )
+
+    ranked = service._build_rule_ranked_candidates(
+        {"test": result},
+        trade_date=date(2026, 4, 8),
+        coarse_limit=2,
+        exclude_bj=True,
+    )
+
+    assert [item["ts_code"] for item in ranked] == ["000002.SZ", "000001.SZ"]
+    assert ranked[1]["near_limit_penalty"] > 0
+
+
+def test_model_soft_filter_does_not_blanket_demote_near_limit_up_candidate() -> None:
+    penalty, reasons = RegressionRerankService._compute_soft_filter_penalty_with_reasons(
+        {
+            "pct_change": 9.3,
+            "model_score": 1.0,
+            "recent_3d_net_inflow": 1000.0,
+            "recent_large_order_net_inflow": 1000.0,
+            "recent_super_large_order_net_inflow": 1000.0,
+            "moneyflow_summary_rows": 3,
+        }
+    )
+
+    assert penalty == 0.04
+    assert reasons == ["moneyflow_good__model_good"]
+
+
+def test_model_top3_selection_vetoes_late_stage_weak_moneyflow(tmp_path) -> None:
+    settings = Settings(
+        OCTTS_HISTORY_DIR_PATH=str(tmp_path / "history"),
+        OCTTS_MEMORY_BACKEND="file",
+        OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+    )
+    scheduler = EnhancedScreeningScheduler(
+        settings=settings,
+        screener=Mock(),
+        store=Mock(),
+        analyzer=Mock(),
+        news_aggregator=Mock(),
+        report_generator=Mock(),
+    )
+    scheduler._stock_name_cache = {}
+    recommendations = {
+        "000001.SZ": {
+            "weighted_score": 99,
+            "distribution_risk_score": 1.8,
+            "late_stage_momentum_flag": True,
+            "moneyflow_3d_value": -1200,
+            "recent_large_order_net_inflow": -100,
+            "recent_super_large_order_net_inflow": 0,
+        },
+        "000002.SZ": {"weighted_score": 80, "distribution_risk_score": 0.5},
+        "000003.SZ": {"weighted_score": 79, "distribution_risk_score": 0.4},
+        "000004.SZ": {"weighted_score": 78, "distribution_risk_score": 0.3},
+    }
+
+    selected = scheduler._select_model_top3_with_extreme_risk_veto(
+        model_candidate_codes=["000001.SZ", "000002.SZ", "000003.SZ", "000004.SZ"],
+        recommendations=recommendations,
+        stock_name_map={code: f"测试票{index}" for index, code in enumerate(recommendations, start=1)},
+    )
+
+    assert selected == ["000002.SZ", "000003.SZ", "000004.SZ"]
+    assert recommendations["000001.SZ"]["top3_extreme_risk_reason"] == "late_stage_momentum_top3_veto"
+    assert recommendations["000001.SZ"]["late_stage_risk_veto_reason"] == "late_stage_momentum_top3_veto"
+
+
+def test_model_top3_selection_allows_one_strong_limit_up_continuation(tmp_path) -> None:
+    settings = Settings(
+        OCTTS_HISTORY_DIR_PATH=str(tmp_path / "history"),
+        OCTTS_MEMORY_BACKEND="file",
+        OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+    )
+    scheduler = EnhancedScreeningScheduler(
+        settings=settings,
+        screener=Mock(),
+        store=Mock(),
+        analyzer=Mock(),
+        news_aggregator=Mock(),
+        report_generator=Mock(),
+    )
+    recommendations = {
+        "000001.SZ": {
+            "weighted_score": 99,
+            "pct_change": 9.8,
+            "distribution_risk_score": 2.7,
+            "rerank_pool_rank": 30,
+            "moneyflow_3d_value": 3000,
+            "recent_large_order_net_inflow": 500,
+            "recent_super_large_order_net_inflow": 100,
+            "relay_open_times": 1,
+            "relay_limit_last_time": "103000",
+            "one_word_limit_flag": False,
+        },
+        "000002.SZ": {"weighted_score": 80, "distribution_risk_score": 0.5},
+        "000003.SZ": {"weighted_score": 79, "distribution_risk_score": 0.4},
+        "000004.SZ": {"weighted_score": 78, "distribution_risk_score": 0.3},
+    }
+
+    selected = scheduler._select_model_top3_with_extreme_risk_veto(
+        model_candidate_codes=["000001.SZ", "000002.SZ", "000003.SZ", "000004.SZ"],
+        recommendations=recommendations,
+        stock_name_map={code: f"测试票{index}" for index, code in enumerate(recommendations, start=1)},
+    )
+
+    assert selected == ["000001.SZ", "000002.SZ", "000003.SZ"]
+    assert recommendations["000001.SZ"]["limit_up_continuation_allowed"] is True
+    assert recommendations["000001.SZ"]["top3_extreme_risk_blocked"] is False
+
+
+def test_model_top3_selection_limits_limit_up_continuation_to_one(tmp_path) -> None:
+    settings = Settings(
+        OCTTS_HISTORY_DIR_PATH=str(tmp_path / "history"),
+        OCTTS_MEMORY_BACKEND="file",
+        OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+    )
+    scheduler = EnhancedScreeningScheduler(
+        settings=settings,
+        screener=Mock(),
+        store=Mock(),
+        analyzer=Mock(),
+        news_aggregator=Mock(),
+        report_generator=Mock(),
+    )
+    strong_limit_payload = {
+        "pct_change": 9.8,
+        "distribution_risk_score": 2.7,
+        "moneyflow_3d_value": 3000,
+        "recent_large_order_net_inflow": 500,
+        "recent_super_large_order_net_inflow": 100,
+        "relay_open_times": 1,
+        "relay_limit_last_time": "103000",
+        "one_word_limit_flag": False,
+    }
+    recommendations = {
+        "100001.SZ": {"weighted_score": 99, "rerank_pool_rank": 30, **strong_limit_payload},
+        "100002.SZ": {"weighted_score": 98, "rerank_pool_rank": 31, **strong_limit_payload},
+        "100003.SZ": {"weighted_score": 80, "distribution_risk_score": 0.4},
+        "100004.SZ": {"weighted_score": 79, "distribution_risk_score": 0.3},
+    }
+
+    selected = scheduler._select_model_top3_with_extreme_risk_veto(
+        model_candidate_codes=["100001.SZ", "100002.SZ", "100003.SZ", "100004.SZ"],
+        recommendations=recommendations,
+        stock_name_map={code: f"测试票{index}" for index, code in enumerate(recommendations, start=1)},
+    )
+
+    assert selected == ["100001.SZ", "100003.SZ", "100004.SZ"]
+    assert recommendations["100001.SZ"]["limit_up_continuation_allowed"] is True
+    assert recommendations["100002.SZ"]["top3_extreme_risk_reason"] == "near_limit_up_pct_change"
+
+
+def test_stage3_ranking_soft_penalizes_distribution_risk_top3_cap() -> None:
+    recommendations = {
+        "000001.SZ": {"stage3_final_score": 70.0, "distribution_risk_score": 2.9},
+        "000002.SZ": {"stage3_final_score": 60.0, "distribution_risk_score": 0.4},
+        "000003.SZ": {"stage3_final_score": 55.0, "distribution_risk_score": 0.3},
+    }
+
+    ranked = EnhancedScreeningScheduler._rank_stage3_candidates_by_score(
+        candidate_codes=["000001.SZ", "000002.SZ", "000003.SZ"],
         recommendations=recommendations,
     )
 
-    assert selected == ["000002.SZ", "000004.SZ", "000005.SZ"]
-    assert recommendations["000001.SZ"]["selection_stage"] == "model_top100_extreme_risk_veto"
-    assert recommendations["000001.SZ"]["top3_extreme_risk_reason"] == "candidate_risk_blocked"
-    assert recommendations["000002.SZ"]["selection_stage"] == "stage3_final_top3"
-    assert recommendations["000005.SZ"]["selection_stage"] == "stage3_final_top3"
+    assert EnhancedScreeningScheduler._get_top3_extreme_risk_reason(recommendations["000001.SZ"]) == "distribution_risk_score_block"
+    assert ranked == ["000002.SZ", "000003.SZ", "000001.SZ"]
 
 
-def test_model_top3_selection_keeps_st_stock_when_not_extreme_risk(tmp_path) -> None:
+def test_top3_extreme_risk_still_hard_blocks_distribution_risk_block_score() -> None:
+    payload = {"stage3_final_score": 90.0, "distribution_risk_score": 3.5}
+
+    assert EnhancedScreeningScheduler._get_top3_extreme_risk_reason(payload) == "distribution_risk_score_block"
+
+
+def test_model_top3_selection_vetoes_deep_drawdown_limit_rebound(tmp_path) -> None:
+    settings = Settings(
+        OCTTS_HISTORY_DIR_PATH=str(tmp_path / "history"),
+        OCTTS_MEMORY_BACKEND="file",
+        OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+    )
+    scheduler = EnhancedScreeningScheduler(
+        settings=settings,
+        screener=Mock(),
+        store=Mock(),
+        analyzer=Mock(),
+        news_aggregator=Mock(),
+        report_generator=Mock(),
+    )
+    scheduler._stock_name_cache = {}
+    recommendations = {
+        "000001.SZ": {
+            "weighted_score": 99,
+            "distribution_risk_score": 1.7,
+            "deep_drawdown_rebound_flag": True,
+            "deep_drawdown_rebound_signal": {
+                "deep_drawdown_rebound_drawdown_from_high_pct": 30.0,
+                "deep_drawdown_rebound_from_low_pct": 17.0,
+            },
+        },
+        "000002.SZ": {"weighted_score": 80, "distribution_risk_score": 0.5},
+        "000003.SZ": {"weighted_score": 79, "distribution_risk_score": 0.4},
+        "000004.SZ": {"weighted_score": 78, "distribution_risk_score": 0.3},
+    }
+
+    selected = scheduler._select_model_top3_with_extreme_risk_veto(
+        model_candidate_codes=["000001.SZ", "000002.SZ", "000003.SZ", "000004.SZ"],
+        recommendations=recommendations,
+        stock_name_map={code: f"正常股{index}" for index, code in enumerate(recommendations, start=1)},
+    )
+
+    assert selected == ["000002.SZ", "000003.SZ", "000004.SZ"]
+    assert recommendations["000001.SZ"]["top3_extreme_risk_reason"] == "deep_drawdown_rebound_top3_veto"
+
+
+def test_model_top3_selection_degrades_quality_floor_without_hard_veto(tmp_path) -> None:
+    settings = Settings(
+        OCTTS_HISTORY_DIR_PATH=str(tmp_path / "history"),
+        OCTTS_MEMORY_BACKEND="file",
+        OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+    )
+    scheduler = EnhancedScreeningScheduler(
+        settings=settings,
+        screener=Mock(),
+        store=Mock(),
+        analyzer=Mock(),
+        news_aggregator=Mock(),
+        report_generator=Mock(),
+    )
+    scheduler._stock_name_cache = {}
+    recommendations = {
+        "000001.SZ": {
+            "weighted_score": 99,
+            "distribution_risk_score": 0.5,
+            "risk_adjusted_fusion_score": 45.0,
+            "overall_score_norm": 80.0,
+        },
+        "000002.SZ": {"weighted_score": 80, "distribution_risk_score": 0.5},
+        "000003.SZ": {"weighted_score": 79, "distribution_risk_score": 0.4},
+    }
+
+    selected = scheduler._select_model_top3_with_extreme_risk_veto(
+        model_candidate_codes=["000001.SZ", "000002.SZ", "000003.SZ"],
+        recommendations=recommendations,
+        stock_name_map={code: f"正常股{index}" for index, code in enumerate(recommendations, start=1)},
+    )
+
+    assert selected == ["000001.SZ", "000002.SZ", "000003.SZ"]
+    assert recommendations["000001.SZ"]["selection_stage"] == "stage3_final_top3"
+    assert recommendations["000001.SZ"]["selection_reason_components"]["top3_quality_floor_degraded"] is True
+    assert recommendations["000001.SZ"]["selection_reason_components"]["top3_quality_floor_reason"] == "low_risk_adjusted_fusion_quality"
+    assert scheduler._get_top3_quality_floor_penalty({
+        "risk_adjusted_fusion_score": 0.0,
+        "overall_score_norm": 24.839744,
+    }) > 50.0
+
+
+def test_structured_metadata_preserves_penalized_final_selection_score(tmp_path) -> None:
+    settings = Settings(
+        OCTTS_HISTORY_DIR_PATH=str(tmp_path / "history"),
+        OCTTS_MEMORY_BACKEND="file",
+        OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+    )
+    scheduler = EnhancedScreeningScheduler(
+        settings=settings,
+        screener=Mock(),
+        store=Mock(),
+        analyzer=Mock(),
+        news_aggregator=Mock(),
+        report_generator=Mock(),
+    )
+    recommendations = {
+        "000001.SZ": {
+            "score": 65.0,
+            "stage3_final_score": 62.0,
+            "final_selection_score": 9.0,
+            "structured_rank_score": 9.0,
+        }
+    }
+
+    updated = scheduler._build_structured_stage_selection_metadata(
+        recommendations=recommendations,
+        rerank_metadata={},
+        stage2_top20_codes=["000001.SZ"],
+        stage3_top3_codes=["000001.SZ"],
+    )
+
+    assert updated["000001.SZ"]["final_selection_score"] == 9.0
+    assert updated["000001.SZ"]["structured_rank_score"] == 9.0
+
+
+def test_model_top3_selection_excludes_st_stock_even_when_not_extreme_risk(tmp_path) -> None:
     settings = Settings(
         OCTTS_HISTORY_DIR_PATH=str(tmp_path / "history"),
         OCTTS_MEMORY_BACKEND="file",
@@ -686,9 +1128,9 @@ def test_model_top3_selection_keeps_st_stock_when_not_extreme_risk(tmp_path) -> 
         recommendations=recommendations,
     )
 
-    assert selected == ["000001.SZ", "000002.SZ", "000003.SZ"]
-    assert recommendations["000001.SZ"]["selection_stage"] == "stage3_final_top3"
-    assert recommendations["000001.SZ"]["top3_st_excluded"] is False
+    assert selected == ["000002.SZ", "000003.SZ"]
+    assert recommendations["000001.SZ"]["selection_stage"] == "model_top100_st_veto"
+    assert recommendations["000001.SZ"]["top3_st_excluded"] is True
 
 
 def test_rank_stage1_candidates_by_fusion_uses_model_and_overall_scores() -> None:
@@ -713,10 +1155,248 @@ def test_rank_stage1_candidates_by_fusion_uses_model_and_overall_scores() -> Non
         rerank_metadata=rerank_metadata,
     )
 
-    assert ranked_codes == ["000002.SZ", "000001.SZ", "000003.SZ", "000004.SZ"]
+    assert ranked_codes == ["000002.SZ", "000001.SZ", "000003.SZ", "000004.SZ", "000005.SZ"]
     assert recommendations["000002.SZ"]["fusion_70_30"] > recommendations["000001.SZ"]["fusion_70_30"]
-    assert recommendations["000002.SZ"]["top3_ranking_strategy"] == "stage1_fusion_70_30"
-    assert recommendations["000005.SZ"].get("fusion_70_30") is None
+    assert recommendations["000002.SZ"]["top3_ranking_strategy"] == "stage1_risk_adjusted_fusion_0.70_0.30_risk_1.00"
+    assert recommendations["000005.SZ"]["candidate_risk_blocked"] is True
+    assert "candidate_risk_blocked" in recommendations["000005.SZ"]["stage1_fusion_risk_flags"]
+
+
+def test_rank_stage1_candidates_by_fusion_penalizes_high_position_risk() -> None:
+    recommendations = {
+        "000001.SZ": {
+            "overall_score": 100.0,
+            "distribution_risk_score": 2.0,
+            "price_position_20d": 0.95,
+            "recent_runup_5d": 12.0,
+            "turnover_spike_ratio": 1.8,
+            "late_stage_momentum_flag": True,
+            "moneyflow_3d_value": -500,
+        },
+        "000002.SZ": {"overall_score": 80.0, "distribution_risk_score": 0.1, "price_position_20d": 0.55},
+        "000003.SZ": {"overall_score": 60.0, "distribution_risk_score": 0.0, "price_position_20d": 0.45},
+    }
+    rerank_metadata = {
+        "000001.SZ": {"blend_score": 1.00, "rerank_pool_rank": 1},
+        "000002.SZ": {"blend_score": 0.99, "rerank_pool_rank": 2},
+        "000003.SZ": {"blend_score": 0.90, "rerank_pool_rank": 3},
+    }
+
+    ranked_codes = EnhancedScreeningScheduler._rank_stage1_candidates_by_fusion(
+        candidate_codes=["000001.SZ", "000002.SZ", "000003.SZ"],
+        recommendations=recommendations,
+        rerank_metadata=rerank_metadata,
+    )
+
+    assert ranked_codes == ["000002.SZ", "000001.SZ", "000003.SZ"]
+    assert recommendations["000001.SZ"]["fusion_70_30"] > recommendations["000002.SZ"]["fusion_70_30"]
+    assert recommendations["000001.SZ"]["risk_adjusted_fusion_score"] < recommendations["000002.SZ"]["risk_adjusted_fusion_score"]
+    assert "late_stage_momentum" in recommendations["000001.SZ"]["stage1_fusion_risk_flags"]
+
+
+def test_rank_stage1_candidates_by_fusion_does_not_promote_zero_fusion_by_structured_score() -> None:
+    recommendations = {
+        "000001.SZ": {"overall_score": 100.0, "score": 95.0, "distribution_risk_score": 10.0},
+        "000002.SZ": {"overall_score": 80.0, "score": 60.0, "distribution_risk_score": 10.0},
+        "000003.SZ": {"overall_score": 60.0, "score": 50.0, "distribution_risk_score": 10.0},
+    }
+    rerank_metadata = {
+        "000001.SZ": {"blend_score": 0.1, "rerank_pool_rank": 97},
+        "000002.SZ": {"blend_score": 0.9, "rerank_pool_rank": 5},
+        "000003.SZ": {"blend_score": 0.8, "rerank_pool_rank": 6},
+    }
+
+    ranked_codes = EnhancedScreeningScheduler._rank_stage1_candidates_by_fusion(
+        candidate_codes=["000001.SZ", "000002.SZ", "000003.SZ"],
+        recommendations=recommendations,
+        rerank_metadata=rerank_metadata,
+    )
+
+    assert ranked_codes == ["000002.SZ", "000003.SZ", "000001.SZ"]
+    assert recommendations["000001.SZ"]["risk_adjusted_fusion_score"] < recommendations["000002.SZ"]["risk_adjusted_fusion_score"]
+    assert recommendations["000001.SZ"]["score"] > recommendations["000002.SZ"]["score"]
+
+
+def test_close_auction_signal_vetoes_fake_tail_strength() -> None:
+    signal = EnhancedScreeningScheduler._build_close_auction_signal(
+        {"close": 10.0, "pct_change": 4.2, "amount": 100000.0},
+        {"price": 9.97, "amount": 3000.0, "vol": 1200.0},
+    )
+
+    assert signal["stage3_close_auction_veto"] is True
+    assert signal["stage3_close_auction_score"] < 0
+    assert "close_auction_fake_strength_veto" in signal["stage3_close_auction_risks"]
+
+
+def test_close_auction_signal_prefers_vwap_for_tail_pressure() -> None:
+    signal = EnhancedScreeningScheduler._build_close_auction_signal(
+        {"close": 10.0, "pct_change": 3.8, "amount": 100000.0},
+        {"close": 10.0, "vwap": 9.97, "amount": 3000.0},
+    )
+
+    assert signal["close_auction_price"] == 10.0
+    assert signal["close_auction_vwap"] == 9.97
+    assert signal["close_auction_price_deviation_pct"] == pytest.approx(-0.3)
+    assert signal["stage3_close_auction_veto"] is True
+
+
+def test_stage3_close_auction_rerank_penalizes_weak_tail(tmp_path) -> None:
+    settings = Settings(
+        OCTTS_HISTORY_DIR_PATH=str(tmp_path / "history"),
+        OCTTS_MEMORY_BACKEND="file",
+        OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+    )
+    client = Mock()
+    client.fetch_close_auction_batch.return_value = {
+        "000001.SZ": {"price": 9.97, "amount": 3000.0},
+        "000002.SZ": {"price": 10.02, "amount": 2600.0},
+    }
+    screener = Mock()
+    screener.client = client
+    scheduler = EnhancedScreeningScheduler(
+        settings=settings,
+        screener=screener,
+        store=Mock(),
+        analyzer=Mock(),
+        news_aggregator=Mock(),
+        report_generator=Mock(),
+    )
+    recommendations = {
+        "000001.SZ": {"score": 90.0, "stage3_final_score": 90.0, "close": 10.0, "pct_change": 4.2, "amount": 100000.0},
+        "000002.SZ": {"score": 89.0, "stage3_final_score": 89.0, "close": 10.0, "pct_change": 1.0, "amount": 100000.0},
+    }
+
+    updated = scheduler._apply_stage3_close_auction_rerank(
+        trade_date=date(2026, 3, 16),
+        stage3_recommendations=recommendations,
+        stage2_top20_codes=["000001.SZ", "000002.SZ"],
+    )
+    ranked = EnhancedScreeningScheduler._rank_stage3_candidates_by_score(
+        candidate_codes=["000001.SZ", "000002.SZ"],
+        recommendations=updated,
+    )
+
+    assert updated["000001.SZ"]["stage3_close_auction_veto"] is True
+    assert ranked[0] == "000002.SZ"
+
+
+def test_stage3_moneyflow_rerank_changes_final_score_for_weak_high_position(tmp_path) -> None:
+    settings = Settings(
+        OCTTS_HISTORY_DIR_PATH=str(tmp_path / "history"),
+        OCTTS_MEMORY_BACKEND="file",
+        OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+    )
+    scheduler = EnhancedScreeningScheduler(
+        settings=settings,
+        screener=Mock(),
+        store=Mock(),
+        analyzer=Mock(),
+        news_aggregator=Mock(),
+        report_generator=Mock(),
+    )
+    scheduler.market_raw_data_repo = Mock()
+    scheduler.market_raw_data_repo.get_moneyflow_summaries_by_trade_date.return_value = {
+        "000001.SZ": {
+            "recent_3d_net_inflow": -1000,
+            "recent_large_order_net_inflow": -200,
+            "recent_super_large_order_net_inflow": -100,
+        },
+        "000002.SZ": {
+            "recent_3d_net_inflow": 5000,
+            "recent_large_order_net_inflow": 1200,
+            "recent_super_large_order_net_inflow": 800,
+        },
+    }
+    recommendations = {
+        "000001.SZ": {
+            "score": 90.0,
+            "distribution_risk_score": 1.9,
+            "price_position_20d": 0.94,
+            "recent_runup_5d": 13.0,
+            "turnover_spike_ratio": 1.9,
+            "late_stage_momentum_flag": True,
+        },
+        "000002.SZ": {
+            "score": 86.0,
+            "distribution_risk_score": 0.2,
+            "price_position_20d": 0.55,
+            "recent_runup_5d": 3.0,
+            "turnover_spike_ratio": 1.0,
+        },
+    }
+
+    updated = scheduler._apply_stage3_moneyflow_rerank(
+        trade_date=date(2026, 3, 16),
+        stage2_recommendations=recommendations,
+        stage2_top20_codes=["000001.SZ", "000002.SZ"],
+    )
+    ranked = EnhancedScreeningScheduler._rank_stage3_candidates_by_score(
+        candidate_codes=["000001.SZ", "000002.SZ"],
+        recommendations=updated,
+    )
+
+    assert updated["000001.SZ"]["stage3_final_score"] < recommendations["000001.SZ"]["score"]
+    assert updated["000002.SZ"]["stage3_final_score"] > recommendations["000002.SZ"]["score"]
+    assert "high_position_weak_moneyflow" in updated["000001.SZ"]["stage3_late_risk_flags"]
+    assert ranked[0] == "000002.SZ"
+
+
+def test_today_screening_prompt_includes_close_auction_guidance() -> None:
+    _, user_prompt = build_today_screening_report_prompt(
+        market_data={},
+        news_clusters=[],
+        screening_context={
+            "today_top3": [
+                {
+                    "ts_code": "000001.SZ",
+                    "close_auction_price_deviation_pct": -0.25,
+                    "stage3_close_auction_score": -5.7,
+                    "stage3_close_auction_veto": True,
+                }
+            ]
+        },
+    )
+
+    assert "close_auction_price_deviation_pct" in user_prompt
+    assert "收盘集合竞价" in user_prompt
+    assert "次日延续" in user_prompt
+
+
+def test_distribution_risk_flags_low_turnover_one_word_limit_gets_top3_risk_block(tmp_path) -> None:
+    settings = Settings(
+        OCTTS_HISTORY_DIR_PATH=str(tmp_path / "history"),
+        OCTTS_MEMORY_BACKEND="file",
+        OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+    )
+    scheduler = EnhancedScreeningScheduler(
+        settings=settings,
+        screener=Mock(),
+        store=Mock(),
+        analyzer=Mock(),
+        news_aggregator=Mock(),
+        report_generator=Mock(),
+    )
+    scheduler._build_stock_moneyflow_summary = Mock(return_value={"recent_3d_net_inflow": 8000})
+
+    risk = scheduler._evaluate_distribution_risk(
+        {
+            "ts_code": "000001.SZ",
+            "pct_change": 10.0,
+            "turnover_rate": 1.2,
+            "volume_ratio": 1.0,
+            "price_position_20d": 0.8,
+        },
+        daily_rows=[{"open": 10.0, "high": 10.0, "low": 9.99, "close": 10.0}],
+        relay_limit={"open_times": 0, "first_time": "093000", "last_time": "093000", "limit": "U"},
+        relay_top_rows=[],
+        trade_date="20260512",
+    )
+
+    assert risk["one_word_limit_flag"] is True
+    assert risk["relay_candidate_veto"] is False
+    assert risk["candidate_risk_blocked"] is True
+    assert "当日涨幅接近涨停" in risk["distribution_risk_flags"]
+    assert "一字封死且换手偏低，次日可买性待确认" in risk["distribution_risk_flags"]
 
 
 def test_build_dashboard_ai_payload_separates_scores_and_keeps_names() -> None:
@@ -1472,9 +2152,9 @@ def test_build_recommendation_pool_states_only_assigns_rank_to_real_today_top3(t
         )
     }
     final_recommendations = {
-        "300692.SZ": {"overall_score": 82.31, "base_score": 82.49, "weighted_score": 54.01, "distribution_risk_score": 0.7, "technical_score": 98, "overall_confidence": 0.75, "summary": "真实一分析"},
-        "600613.SH": {"overall_score": 70.6, "base_score": 70.83, "weighted_score": 48.68, "distribution_risk_score": 1.3, "technical_score": 87, "overall_confidence": 0.76, "summary": "真实二分析"},
-        "300086.SZ": {"overall_score": 74.54, "base_score": 74.46, "weighted_score": 47.61, "distribution_risk_score": 1.2, "technical_score": 87, "overall_confidence": 0.77, "summary": "真实三分析"},
+        "300692.SZ": {"overall_score": 82.31, "base_score": 82.49, "weighted_score": 54.01, "distribution_risk_score": 0.7, "technical_score": 98, "overall_confidence": 0.75, "summary": "真实一分析", "selection_stage": "stage2_top20_pre_moneyflow"},
+        "600613.SH": {"overall_score": 70.6, "base_score": 70.83, "weighted_score": 48.68, "distribution_risk_score": 1.3, "technical_score": 87, "overall_confidence": 0.76, "summary": "真实二分析", "selection_stage": "stage2_top20_pre_moneyflow"},
+        "300086.SZ": {"overall_score": 74.54, "base_score": 74.46, "weighted_score": 47.61, "distribution_risk_score": 1.2, "technical_score": 87, "overall_confidence": 0.77, "summary": "真实三分析", "selection_stage": "stage2_top20_pre_moneyflow"},
     }
 
     states = scheduler._build_recommendation_pool_states(
@@ -1503,6 +2183,168 @@ def test_build_recommendation_pool_states_only_assigns_rank_to_real_today_top3(t
     assert state_map["300086.SZ"].recommendation_score == 32.41
     assert state_map["300086.SZ"].top3_risk_penalty == 14.4
     assert state_map["300086.SZ"].short_term_contradiction_penalty == 0.8
+
+
+def test_build_recommendation_pool_states_fallback_only_uses_clean_stage2_candidates(tmp_path) -> None:
+    settings = Settings(
+        OCTTS_HISTORY_DIR_PATH=str(tmp_path / "history"),
+        OCTTS_MEMORY_BACKEND="file",
+        OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+    )
+    scheduler = EnhancedScreeningScheduler(
+        settings=settings,
+        screener=Mock(),
+        store=Mock(),
+        analyzer=Mock(),
+        news_aggregator=Mock(),
+        report_generator=Mock(),
+    )
+    scheduler.store.get_previous_recommendation_pool_trade_date.return_value = None
+    scheduler.store.load_recommendation_pool_state.return_value = []
+    scheduler.store.list_recommendation_pool.return_value = []
+
+    screening_results = {
+        "s1": ScreenResult(
+            screen_id="s1",
+            criteria=ScreenCriteria(limit=10),
+            stocks=[
+                StockScreenItem(ts_code="000001.SZ", name="一号高分", close=10, pct_change=1, volume_ratio=1.5, turnover_rate=1.1, recommendation_score=90, recommendation="monitor", confidence="high", technical_score=90),
+                StockScreenItem(ts_code="000002.SZ", name="二号合格", close=11, pct_change=1, volume_ratio=1.5, turnover_rate=1.1, recommendation_score=70, recommendation="monitor", confidence="high", technical_score=88),
+                StockScreenItem(ts_code="000003.SZ", name="三号风险", close=12, pct_change=1, volume_ratio=1.5, turnover_rate=1.1, recommendation_score=69, recommendation="monitor", confidence="high", technical_score=87),
+            ],
+            total_count=3,
+            execution_time=0.1,
+        )
+    }
+    final_recommendations = {
+        "000001.SZ": {"weighted_score": 90, "overall_score": 90, "selection_stage": "stage1_candidate_pool", "structured_rank_position": 1},
+        "000002.SZ": {"weighted_score": 70, "overall_score": 80, "selection_stage": "stage2_top20_pre_moneyflow", "structured_rank_position": 2},
+        "000003.SZ": {"weighted_score": 69, "overall_score": 79, "selection_stage": "stage2_top20_pre_moneyflow", "structured_rank_position": 3, "top3_extreme_risk_blocked": True},
+    }
+
+    states = scheduler._build_recommendation_pool_states(
+        trade_date=date(2026, 5, 27),
+        screening_results=screening_results,
+        final_recommendations=final_recommendations,
+        candidate_codes=["000001.SZ", "000002.SZ", "000003.SZ"],
+    )
+
+    rank_map = {state.ts_code: state.recommend_rank for state in states}
+    assert rank_map["000001.SZ"] is None
+    assert rank_map["000002.SZ"] == 1
+    assert rank_map["000003.SZ"] is None
+
+
+def test_build_recommendation_pool_states_never_refills_top3_with_st_excluded_stock(tmp_path) -> None:
+    settings = Settings(
+        OCTTS_HISTORY_DIR_PATH=str(tmp_path / "history"),
+        OCTTS_MEMORY_BACKEND="file",
+        OCTTS_MEMORY_FILE_PATH=str(tmp_path / "memory.json"),
+    )
+    scheduler = EnhancedScreeningScheduler(
+        settings=settings,
+        screener=Mock(),
+        store=Mock(),
+        analyzer=Mock(),
+        news_aggregator=Mock(),
+        report_generator=Mock(),
+    )
+    scheduler.store.get_previous_recommendation_pool_trade_date.return_value = None
+    scheduler.store.load_recommendation_pool_state.return_value = []
+    scheduler.store.list_recommendation_pool.return_value = []
+
+    screening_results = {
+        "s1": ScreenResult(
+            screen_id="s1",
+            criteria=ScreenCriteria(limit=10),
+            stocks=[
+                StockScreenItem(ts_code="600265.SH", name="*ST景谷", close=10, pct_change=1, volume_ratio=1.5, turnover_rate=1.1, recommendation_score=80, recommendation="monitor", confidence="high", technical_score=90),
+                StockScreenItem(ts_code="688498.SH", name="源杰科技", close=20, pct_change=1, volume_ratio=1.5, turnover_rate=1.1, recommendation_score=70, recommendation="monitor", confidence="high", technical_score=88),
+                StockScreenItem(ts_code="001400.SZ", name="江顺科技", close=30, pct_change=1, volume_ratio=1.5, turnover_rate=1.1, recommendation_score=65, recommendation="monitor", confidence="high", technical_score=87),
+                StockScreenItem(ts_code="002971.SZ", name="和远气体", close=40, pct_change=1, volume_ratio=1.5, turnover_rate=1.1, recommendation_score=60, recommendation="monitor", confidence="high", technical_score=86),
+            ],
+            total_count=4,
+            execution_time=0.1,
+        )
+    }
+    final_recommendations = {
+        "600265.SH": {
+            "name": "*ST景谷",
+            "weighted_score": 80,
+            "overall_score": 90,
+            "selection_stage": "model_top100_st_refill_excluded",
+            "top3_st_excluded": True,
+            "selection_reason_components": {"top3_st_excluded": True},
+            "structured_rank_position": 1,
+            "final_selection_score": 90,
+        },
+        "688498.SH": {"weighted_score": 70, "overall_score": 80, "selection_stage": "stage2_top20_pre_moneyflow", "structured_rank_position": 2, "final_selection_score": 80},
+        "001400.SZ": {"weighted_score": 65, "overall_score": 75, "selection_stage": "stage2_top20_pre_moneyflow", "structured_rank_position": 3, "final_selection_score": 75},
+        "002971.SZ": {"weighted_score": 60, "overall_score": 70, "selection_stage": "stage2_top20_pre_moneyflow", "structured_rank_position": 4, "final_selection_score": 70},
+    }
+
+    states = scheduler._build_recommendation_pool_states(
+        trade_date=date(2026, 5, 27),
+        screening_results=screening_results,
+        final_recommendations=final_recommendations,
+        candidate_codes=["600265.SH", "688498.SH", "001400.SZ", "002971.SZ"],
+    )
+
+    rank_map = {state.ts_code: state.recommend_rank for state in states}
+    frontlist_rank_map = {state.ts_code: state.frontlist_rank for state in states}
+    assert "600265.SH" not in rank_map
+    assert "600265.SH" not in frontlist_rank_map
+    assert rank_map["688498.SH"] == 1
+    assert rank_map["001400.SZ"] == 2
+    assert rank_map["002971.SZ"] == 3
+
+
+def test_authoritative_today_top_states_skip_persisted_st_excluded_rows() -> None:
+    selected = EnhancedScreeningScheduler._select_authoritative_today_top_states([
+        {
+            "ts_code": "600265.SH",
+            "source_tag": "今日Top3",
+            "recommend_rank": 1,
+            "overall_score": 90,
+            "base_score": 90,
+            "selection_stage": "model_top100_st_refill_excluded",
+            "selection_reason_components": {"top3_st_excluded": True},
+        },
+        {"ts_code": "688498.SH", "source_tag": "今日Top3", "recommend_rank": 2, "overall_score": 80, "base_score": 80},
+    ])
+
+    assert [item["ts_code"] for item in selected] == ["688498.SH"]
+
+
+def test_authoritative_today_top_states_accept_stage3_top3_without_llm_scores() -> None:
+    selected = EnhancedScreeningScheduler._select_authoritative_today_top_states([
+        {
+            "ts_code": "300317.SZ",
+            "source_tag": "今日Top3",
+            "recommend_rank": 1,
+            "overall_score": None,
+            "selection_stage": "stage3_final_top3",
+            "structured_rank_position": 1,
+            "final_selection_score": 83.2,
+        },
+        {
+            "ts_code": "600906.SH",
+            "source_tag": "今日Top3",
+            "recommend_rank": 2,
+            "overall_score": None,
+            "selection_stage": "stage3_final_top3",
+            "structured_rank_position": 2,
+            "final_selection_score": 82.7,
+        },
+        {
+            "ts_code": "000001.SZ",
+            "source_tag": "今日Top3",
+            "recommend_rank": 3,
+            "overall_score": None,
+        },
+    ])
+
+    assert [item["ts_code"] for item in selected] == ["300317.SZ", "600906.SH"]
 
 
 

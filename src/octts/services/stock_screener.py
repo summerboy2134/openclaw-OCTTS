@@ -46,6 +46,11 @@ _RISK_LEVEL_ORDER = {
 }
 
 
+def _name_indicates_st(name: Any) -> bool:
+    text = str(name or "").strip().upper().replace(" ", "")
+    return bool(text) and (text.startswith("ST") or text.startswith("*ST") or "退" in text[:3])
+
+
 class StockScreener:
     """股票筛选服务"""
 
@@ -277,7 +282,7 @@ class StockScreener:
 
         for stock in stocks:
             ts_code = str(stock.get("ts_code") or "").upper()
-            if criteria.exclude_st and ("ST" in stock.get("name", "")):
+            if criteria.exclude_st and _name_indicates_st(stock.get("name", "")):
                 continue
             if criteria.exclude_bj and ts_code.endswith(".BJ"):
                 continue

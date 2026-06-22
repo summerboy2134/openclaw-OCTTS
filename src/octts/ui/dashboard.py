@@ -1449,11 +1449,21 @@ def _overview_script(
       return `<div class="recommendation-list">${items.map(item => {
         const sourceTag = item.source_tag || "今日Top3";
         const repeatTag = item.is_repeat_pick ? ' · 连续入选' : '';
+        const finalScore = Number(item.final_selection_score || item.stage3_final_score || item.structured_rank_score || 0);
+        const executionScore = Number(item.final_display_recommendation_score || item.recommendation_score || item.score || 0);
+        const overallScore = Number(item.overall_score || item.priority_score || 0);
+        const riskPenalty = Number(item.top3_risk_penalty || 0) + Number(item.short_term_contradiction_penalty || 0);
+        const scoreText = [
+          Number.isFinite(finalScore) && finalScore > 0 ? `最终 ${finalScore.toFixed(1)}` : null,
+          Number.isFinite(executionScore) && executionScore > 0 ? `执行 ${executionScore.toFixed(1)}` : null,
+          Number.isFinite(overallScore) && overallScore > 0 ? `综合 ${overallScore.toFixed(1)}` : null,
+          Number.isFinite(riskPenalty) && riskPenalty > 0 ? `风险扣 ${riskPenalty.toFixed(1)}` : null
+        ].filter(Boolean).join(" · ");
         return `
         <div class="recommendation-item">
           <div class="row">
             <strong>${escapeHtml(item.ts_code)}${item.name ? ` · ${escapeHtml(item.name)}` : ""}</strong>
-            <span class="badge hold">${escapeHtml(Number(item.recommendation_score || item.score || 0).toFixed(1))} 分</span>
+            <span class="badge hold">${escapeHtml(scoreText || `${executionScore.toFixed(1)} 分`)}</span>
           </div>
           <div class="subtle">${escapeHtml(sourceTag + repeatTag)} · 技术信号：${escapeHtml(item.technical_signal || "信号待确认")} · 置信度 ${escapeHtml(formatConfidencePercent(item.confidence))}</div>
           <div>${escapeHtml(item.recommendation || "建议继续观察")}</div>
